@@ -1,0 +1,12 @@
+Megatron-Bridge -- Sphere AI Lab fork
+Copyright 2026 Sphere AI Lab
+
+This product is a fork of NVIDIA Megatron-Bridge
+(https://github.com/NVIDIA-NeMo/Megatron-Bridge),
+Copyright (c) NVIDIA CORPORATION & AFFILIATES, licensed under the
+Apache License, Version 2.0.
+
+Sphere AI Lab modifications relative to the upstream base
+(NVIDIA-NeMo/Megatron-Bridge @ fad15ab2, upstream main) are contained in the
+single release commit on top of that base and are likewise licensed under the
+Apache License, Version 2.0.

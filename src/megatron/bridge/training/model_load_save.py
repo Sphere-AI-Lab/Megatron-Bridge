@@ -48,6 +48,31 @@ HF_BASED_TOKENIZERS = [
 ]
 
 
+def _sanitize_generation_config_targets(node: Any) -> Any:
+    """Drop ``None`` entries from serialized ``GenerationConfig`` payloads.
+
+    Older checkpoints may contain full ``GenerationConfig.to_dict()`` outputs
+    with many keys explicitly set to ``null``. Newer Transformers releases
+    validate some of those fields more strictly during ``from_dict()``, so we
+    strip ``None`` values before instantiation and let HF defaults fill them in.
+    """
+    if isinstance(node, dict):
+        sanitized = {key: _sanitize_generation_config_targets(value) for key, value in node.items()}
+        target = sanitized.get("_target_")
+        if isinstance(target, str) and target.endswith("GenerationConfig.from_dict"):
+            config_dict = sanitized.get("config_dict")
+            if isinstance(config_dict, dict):
+                sanitized["config_dict"] = {
+                    key: value for key, value in config_dict.items() if value is not None
+                }
+        return sanitized
+
+    if isinstance(node, list):
+        return [_sanitize_generation_config_targets(value) for value in node]
+
+    return node
+
+
 def torch_dtype_from_mcore_config(config: Any) -> torch.dtype:
     """Convert Megatron-Core config dtype settings to torch dtype.
 
@@ -216,6 +241,7 @@ def load_model_config(
 
     if file_exists(run_config_filename):
         run_config = read_run_config(run_config_filename)
+        run_config["model"] = _sanitize_generation_config_targets(run_config["model"])
         mbridge_ckpt = True
         mlm_args = None
 
@@ -538,6 +564,8 @@ def save_megatron_model(
             save_rng=False,
             ckpt_format=ckpt_format,
             dist_ckpt_optim_fully_reshardable=True,
+            fully_parallel_save=False,
+            storage_writers_per_rank=16,
         ),
         dist=None,
     )

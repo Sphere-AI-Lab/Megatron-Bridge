@@ -319,10 +319,23 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
             be recursively moved to the specified device.
     """
 
+    def _is_modelopt_qtensor_wrapper(tensor: torch.Tensor) -> bool:
+        return type(tensor).__name__ == "QTensorWrapper"
+
+    def _unwrap_modelopt_qtensor_wrapper(tensor: torch.Tensor) -> torch.Tensor:
+        if _is_modelopt_qtensor_wrapper(tensor) and hasattr(tensor, "as_subclass"):
+            return tensor.as_subclass(torch.Tensor)
+        return tensor
+
     def _empty_like_if_meta(tensor: torch.Tensor, *, device: torch.device):
         if tensor.device == torch.device("meta"):
-            return torch.empty_like(tensor, device=device)
+            materialized = torch.empty_like(tensor, device=device)
         else:
-            return tensor.to(device)
+            materialized = tensor.to(device)
+        # ModelOpt's RealQuantLinear._apply() re-wraps QTensorWrapper parameters itself.
+        # Passing it a tensor subclass causes PyTorch Parameter construction to reject
+        # the wrapper because detach() returns a plain Tensor in this ModelOpt/PyTorch
+        # combination.
+        return _unwrap_modelopt_qtensor_wrapper(materialized)
 
     return module._apply(lambda t: _empty_like_if_meta(t, device=device), recurse=recurse)

@@ -22,7 +22,9 @@ import torch
 import torch.nn as nn
 from megatron.core.transformer.module import MegatronModule
 
+from megatron.bridge.peft.param_names import is_peft_adapter_param_name
 from megatron.bridge.peft.recompute import maybe_enable_recompute_inputs_grad
+from megatron.bridge.peft.utils import normalize_disabled_bias_placeholders
 from megatron.bridge.peft.walk_utils import walk
 
 
@@ -95,6 +97,8 @@ class PEFT(ABC):
         Returns:
             The same type as the input model, transformed with PEFT applied.
         """
+        self._walk_model(model, normalize_disabled_bias_placeholders)
+
         self.freeze_model(model, training=training)
 
         self._walk_model(model, self.transform)
@@ -228,4 +232,4 @@ class PEFT(ABC):
             return key[1].requires_grad
 
         # Handle regular string keys
-        return key in self.params_to_save or ".adapter." in key or key.endswith(".adapters")
+        return key in self.params_to_save or is_peft_adapter_param_name(key)

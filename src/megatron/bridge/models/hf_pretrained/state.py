@@ -435,6 +435,19 @@ class DictStateSource(StateSource):
         return {key: self._dict[key] for key in keys if key in self._dict}
 
 
+@lru_cache(maxsize=3)
+def _read_safetensors_shard(file_path_str: str) -> Dict[str, "torch.Tensor"]:
+    """Read an entire safetensors shard into RAM without mmap.
+
+    Avoids the per-tensor `safe_open` mmap pattern, which exhausts
+    `vm.max_map_count` (default 65530) on multi-shard checkpoints.
+    Cache size 3 covers typical sequential layer-by-layer access.
+    """
+    from safetensors.torch import load as st_load
+    with open(file_path_str, "rb") as fh:
+        return st_load(fh.read())
+
+
 class SafeTensorsStateSource(StateSource):
     """
     A state source backed by a directory of .safetensors files.
@@ -586,8 +599,6 @@ class SafeTensorsStateSource(StateSource):
 
         from glob import glob as file_glob
 
-        from safetensors import safe_open
-
         loaded_tensors = {}
         remaining_keys = set(keys_to_load)
         key_to_filename_map = self.key_to_filename_map
@@ -602,11 +613,11 @@ class SafeTensorsStateSource(StateSource):
             for filename, keys_in_file in file_to_keys_map.items():
                 file_path = self.path / filename
                 if file_path.exists():
-                    with safe_open(file_path, framework="pt", device="cpu") as f:
-                        for key in keys_in_file:
-                            if key in f.keys():
-                                loaded_tensors[key] = f.get_tensor(key)
-                                remaining_keys.discard(key)
+                    shard = _read_safetensors_shard(str(file_path))
+                    for key in keys_in_file:
+                        if key in shard:
+                            loaded_tensors[key] = shard[key]
+                            remaining_keys.discard(key)
 
         if remaining_keys:
             safetensor_files = file_glob(str(self.path / "*.safetensors"))
@@ -617,12 +628,11 @@ class SafeTensorsStateSource(StateSource):
             for safetensor_file_path in safetensor_files:
                 if not remaining_keys:
                     break
-                with safe_open(safetensor_file_path, framework="pt", device="cpu") as f:
-                    current_file_keys = f.keys()
-                    for key in list(remaining_keys):
-                        if key in current_file_keys:
-                            loaded_tensors[key] = f.get_tensor(key)
-                            remaining_keys.remove(key)
+                shard = _read_safetensors_shard(safetensor_file_path)
+                for key in list(remaining_keys):
+                    if key in shard:
+                        loaded_tensors[key] = shard[key]
+                        remaining_keys.remove(key)
 
         if remaining_keys:
             raise KeyError(f"Keys not found in safetensors from {self.model_name_or_path}: {remaining_keys}")

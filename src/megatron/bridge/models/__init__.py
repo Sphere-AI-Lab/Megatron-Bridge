@@ -12,10 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+
 # Import model providers for easy access
-from megatron.bridge.models.bailing import (
-    BailingMoeV2Bridge,
-)
+try:
+    from megatron.bridge.models.bailing import (
+        BailingMoeV2Bridge,
+    )
+except ImportError as exc:
+    warnings.warn(
+        "Skipping optional Bailing bridge registration because its dependencies "
+        f"are unavailable in the current environment: {exc}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 from megatron.bridge.models.conversion.auto_bridge import AutoBridge
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
@@ -31,6 +41,7 @@ from megatron.bridge.models.conversion.param_mapping import (
 from megatron.bridge.models.deepseek import (
     DeepSeekV2Bridge,
     DeepSeekV3Bridge,
+    DeepSeekV4Bridge,
 )
 from megatron.bridge.models.gemma import (
     CodeGemmaModelProvider2B,
@@ -70,6 +81,7 @@ from megatron.bridge.models.kimi import (
 from megatron.bridge.models.kimi_vl import (
     KimiK25VLBridge,
     KimiK25VLModel,
+    KimiK25VLNVFP4Bridge,
     KimiK25VLModelProvider,
 )
 from megatron.bridge.models.llama import (
@@ -155,10 +167,10 @@ __all__ = [
     "ReplicatedMapping",
     "RowParallelMapping",
     "AutoMapping",
-    "BailingMoeV2Bridge",
     # DeepSeek Models
     "DeepSeekV2Bridge",
     "DeepSeekV3Bridge",
+    "DeepSeekV4Bridge",
     "Gemma3ModelProvider",
     "Gemma3ModelProvider1B",
     "Gemma3ModelProvider4B",
@@ -182,6 +194,7 @@ __all__ = [
     "KimiK2Bridge",
     "KimiK25VLModel",
     "KimiK25VLBridge",
+    "KimiK25VLNVFP4Bridge",
     "KimiK25VLModelProvider",
     "LlamaBridge",
     "LlamaNemotronHeterogeneousProvider",
@@ -233,3 +246,6 @@ __all__ = [
     "SarvamMLABridge",
     "SarvamMoEBridge",
 ]
+
+if "BailingMoeV2Bridge" in globals():
+    __all__.insert(10, "BailingMoeV2Bridge")

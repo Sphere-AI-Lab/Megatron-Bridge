@@ -21,6 +21,11 @@ from typing import Any, Generator, Optional
 import yaml
 
 
+def _drop_none_values(data: dict[str, Any]) -> dict[str, Any]:
+    """Return a shallow copy without ``None`` values."""
+    return {key: value for key, value in data.items() if value is not None}
+
+
 @contextmanager
 def safe_yaml_representers() -> Generator[None, None, None]:
     """
@@ -199,7 +204,7 @@ def _generation_config_representer(dumper, data):
     value = {
         "_target_": f"{inspect.getmodule(cls).__name__}.{cls.__qualname__}.from_dict",
         "_call_": True,
-        "config_dict": data.to_dict(),
+        "config_dict": _drop_none_values(data.to_dict()),
     }
 
     return dumper.represent_data(value)

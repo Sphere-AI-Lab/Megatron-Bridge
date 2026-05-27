@@ -10,6 +10,14 @@
 [Documentation](https://docs.nvidia.com/nemo/megatron-bridge/latest/) | [Supported Models](#supported-models) | [Examples](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples) | [Contributing](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/CONTRIBUTING.md)
 </div>
 
+> **Fork notice -- Sphere AI Lab.** This repository is a fork of
+> [NVIDIA Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge),
+> maintained by [Sphere AI Lab](https://github.com/Sphere-AI-Lab). All Sphere AI
+> Lab changes are contained in the single release commit on top of the upstream
+> base `fad15ab2` (see `git log` and [`NOTICE`](./NOTICE)). This fork is pinned
+> for use with [Orbit](https://github.com/Sphere-AI-Lab/orbit) and is not an
+> official NVIDIA/NeMo release.
+
 ## 📣 News
 
 - [04/09/2026] [**Bailing MoE V2**](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/models/bailing) is now supported! Checkpoint conversion and inference for the Bailing MoE V2 model are available on **main**. Thank you to [@ccclyu](https://github.com/ccclyu) for the community contribution!

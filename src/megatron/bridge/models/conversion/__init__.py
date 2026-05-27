@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # Import model providers for easy access
+from . import low_precision
 from megatron.bridge.models.conversion.auto_bridge import AutoBridge
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
@@ -43,5 +44,6 @@ __all__ = [
     "ReplicatedMapping",
     "RowParallelMapping",
     "AutoMapping",
+    "low_precision",
     "weights_verification_table",
 ]

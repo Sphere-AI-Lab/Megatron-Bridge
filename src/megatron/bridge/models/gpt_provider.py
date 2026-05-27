@@ -115,7 +115,9 @@ def modelopt_transformer_layer_spec(config: "GPTModelProvider") -> ModuleSpec:
 
 def default_layer_spec(config: "GPTModelProvider") -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
-    if config.use_transformer_engine_full_layer_spec:
+    if config.restore_modelopt_state:
+        return modelopt_transformer_layer_spec(config)
+    elif config.use_transformer_engine_full_layer_spec:
         return transformer_engine_full_layer_spec(config)
     else:
         return transformer_engine_layer_spec(config)

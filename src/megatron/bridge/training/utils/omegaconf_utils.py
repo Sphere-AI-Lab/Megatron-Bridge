@@ -43,6 +43,11 @@ _EXCLUDE_FIELD = object()
 _SERIALIZABLE_CALLABLE_FIELDS: frozenset[str] = frozenset({"activation_func"})
 
 
+def _drop_none_values(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a shallow copy without ``None`` values."""
+    return {key: value for key, value in data.items() if value is not None}
+
+
 def create_omegaconf_dict_config(config_container: Any) -> Tuple[DictConfig, Dict[str, Any]]:
     """Create OmegaConf while tracking excluded fields for later restoration.
 
@@ -252,10 +257,13 @@ def _dataclass_to_omegaconf_dict(val_to_convert: Any, path: str = "") -> Any:
             cfg_class = val_to_convert.__class__
             target = f"{inspect.getmodule(cfg_class).__name__}.{cfg_class.__qualname__}.from_dict"
             logger.debug(f"Converting {cfg_class.__qualname__} at {current_path} to callable dict")
+            config_dict = val_to_convert.to_dict()
+            if isinstance(val_to_convert, GenerationConfig):
+                config_dict = _drop_none_values(config_dict)
             return {
                 "_target_": target,
                 "_call_": True,
-                "config_dict": val_to_convert.to_dict(),
+                "config_dict": config_dict,
             }
     except ModuleNotFoundError:
         # transformers is optional; if unavailable, fall through to other handlers

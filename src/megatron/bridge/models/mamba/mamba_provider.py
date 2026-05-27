@@ -24,7 +24,7 @@ from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec as def
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
 
@@ -42,6 +42,34 @@ try:
 except ImportError:
     # TODO(yuya): remove fallback once MCore pin includes get_hybrid_total_layer_count
     _mcore_get_hybrid_total_layer_count = None
+
+try:
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern as _mcore_parse_hybrid_pattern
+except ImportError:
+    # TODO(yuya): remove fallback once MCore pin includes parse_hybrid_pattern
+    _mcore_parse_hybrid_pattern = None
+
+_MTP_SEPARATOR = getattr(Symbols, "MTP_SEPARATOR", "/")
+
+
+@dataclass(frozen=True)
+class _ParsedHybridPattern:
+    main_pattern: str
+    mtp_pattern: Optional[str]
+    mtp_num_depths: int
+
+
+def parse_hybrid_pattern(pattern: str):
+    if _mcore_parse_hybrid_pattern is not None:
+        return _mcore_parse_hybrid_pattern(pattern)
+
+    main_pattern, *mtp_patterns = pattern.split(_MTP_SEPARATOR)
+    nonempty_mtp_patterns = [mtp_pattern for mtp_pattern in mtp_patterns if mtp_pattern]
+    return _ParsedHybridPattern(
+        main_pattern=main_pattern,
+        mtp_pattern=nonempty_mtp_patterns[0] if nonempty_mtp_patterns else None,
+        mtp_num_depths=len(nonempty_mtp_patterns),
+    )
 
 # MCore renamed `hybrid_override_pattern` → `hybrid_layer_pattern` in the dev branch.
 # Support both main and dev branch submodule by detecting which parameter is present at import time.
@@ -212,7 +240,7 @@ class MambaModelProvider(TransformerConfig, ModelProviderMixin[MCoreMambaModel])
         # This must happen before num_layers derivation so the count reflects
         # only the main decoder layers (get_hybrid_total_layer_count strips MTP).
         if self.hybrid_layer_pattern is not None and self.mtp_hybrid_override_pattern:
-            sep = Symbols.MTP_SEPARATOR
+            sep = _MTP_SEPARATOR
             main_pattern = self.hybrid_layer_pattern.split(sep)[0]
             # When mtp_use_repeated_layer=True, the shared MTP layer always exists
             # in the model and mtp_num_layers controls forward pass repetitions.

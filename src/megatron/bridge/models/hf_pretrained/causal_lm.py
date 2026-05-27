@@ -51,6 +51,7 @@ class _ConfigOnlyPretrainedShim:
     def __init__(self, config: PretrainedConfig):
         self.config = config
         self.model_name_or_path = getattr(config, "name_or_path", None)
+        self._model_name_or_path = self.model_name_or_path
         self.trust_remote_code = getattr(config, "trust_remote_code", False)
         self.generation_config = self._build_generation_config(config)
 

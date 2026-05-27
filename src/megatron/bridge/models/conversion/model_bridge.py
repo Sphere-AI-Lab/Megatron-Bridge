@@ -195,12 +195,12 @@ def _megatron_local_name_to_global(
 
         def _update_expert_number(param_name: str, param_type: str) -> str:
             """Update expert number from local to global for weight or bias parameters."""
-            local_expert_number = int(param_name.split(f".{param_type}")[-1])
+            match = re.search(rf"\.{param_type}(\d+)(?=\D|$)", param_name)
+            if match is None:
+                return param_name
+            local_expert_number = int(match.group(1))
             global_expert_number = num_experts_per_rank * ep_group.rank() + local_expert_number
-            return param_name.replace(
-                f".{param_type}{local_expert_number}",
-                f".{param_type}{global_expert_number}",
-            )
+            return f"{param_name[: match.start(1)]}{global_expert_number}{param_name[match.end(1) :]}"
 
         # Handle weight and bias parameters
         if ".weight" in param_name:
@@ -909,7 +909,7 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
         _hf_import_cache: Dict[str, torch.Tensor] = {}
         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
             # None means megatron module not on current rank, skip if this task is not going to happen
-            if task.megatron_module is None:
+            if task is None or task.megatron_module is None:
                 continue
             # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
             hf_param_key = str(task.mapping.hf_param)
@@ -1029,7 +1029,7 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
 
         for task in conversion_tasks:
             # None means megatron module not on current rank, skip if this task is not going to happen
-            if task.megatron_module is None:
+            if task is None or task.megatron_module is None:
                 continue
             hf_state_dict: Mapping[str, torch.Tensor] = hf_pretrained.state
             if isinstance(task.mapping.hf_param, str):
@@ -1130,6 +1130,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
         _grouped_buffers: Dict[str, Dict[int, torch.Tensor]] = {}
 
         for task in self._with_progress_tracking(megatron_to_hf_tasks, "Converting to HuggingFace", show_progress):
+            if task is None:
+                continue
             megatron_weights = task.param_weight
             megatron_module = task.megatron_module
             if self._should_skip_mtp_duplicate_embedding_export(task, megatron_model):
@@ -1839,7 +1841,18 @@ def stream_adapter_weights_megatron_to_hf(
     cpu: bool = True,
     show_progress: bool = True,
 ) -> Iterable[HFWeightTuple]:
-    """Bridge only adapter weights from Megatron to HuggingFace format."""
+    """Bridge only LoRA adapter weights from Megatron to HuggingFace format."""
+    ...
+
+
+@dispatch
+def stream_oft_adapter_weights_megatron_to_hf(
+    dispatch_instance: MegatronModel,
+    megatron_model: Union[MegatronModel, List[MegatronModel]],
+    cpu: bool = True,
+    show_progress: bool = True,
+) -> Iterable[HFWeightTuple]:
+    """Bridge only OFT adapter weights from Megatron to HuggingFace format."""
     ...
 
 
@@ -1905,10 +1918,25 @@ def register_bridge_implementation(
             show_progress=show_progress,
         )
 
+    @stream_oft_adapter_weights_megatron_to_hf.impl((source, target))
+    def _oft_adapter_stream_registered_impl(
+        _,
+        megatron_model: Union[MegatronModel, List[MegatronModel]],
+        cpu: bool = True,
+        show_progress: bool = True,
+    ) -> Iterable[HFWeightTuple]:
+        bridge = bridge_class()
+        return bridge.stream_oft_adapter_weights_megatron_to_hf(
+            megatron_model,
+            cpu=cpu,
+            show_progress=show_progress,
+        )
+
     # Set meaningful names for debugging
     _get_model_bridge_impl.__name__ = f"_bridge_with_{bridge_class_name}"
     _megatron_to_hf_registered_impl.__name__ = f"_megatron_to_hf_with_{bridge_class_name}"
     _adapter_stream_registered_impl.__name__ = f"_adapter_stream_with_{bridge_class_name}"
+    _oft_adapter_stream_registered_impl.__name__ = f"_oft_adapter_stream_with_{bridge_class_name}"
 
 
 def create_bridge_decorator(

@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Callable, Generic, TypedDict, TypeVar, Union
 
-from megatron.bridge.models.common.unimodal import _ddp_wrap, _print_num_params
+from megatron.bridge.models.common.unimodal import _ddp_wrap, _print_num_params, to_empty_if_meta_device
 
 
 try:
@@ -542,8 +542,9 @@ def get_model(
     if bf16:
         model_provider.bf16 = bf16
 
+    requested_meta_init = bool(init_model_with_meta_device)
     model_provider.use_cpu_initialization = use_cpu_initialization if use_cpu_initialization else False
-    if init_model_with_meta_device:
+    if requested_meta_init:
         model_provider.init_model_with_meta_device = True
         with torch.device("meta"):
             model = _create_model(model_provider, model_type, pg_collection=pg_collection)
@@ -575,6 +576,8 @@ def get_model(
     _print_num_params(model, pg_collection=pg_collection)
 
     model_config = get_model_config(model[0])
+    if requested_meta_init:
+        model_config.init_model_with_meta_device = True
 
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
@@ -602,6 +605,12 @@ def get_model(
         # Restore expert bias to float32
         for submodule, fp32_data in keep_in_fp32:
             submodule.expert_bias.data = fp32_data
+
+    if requested_meta_init and not use_torch_fsdp2 and not use_megatron_fsdp:
+        model = [
+            to_empty_if_meta_device(model_module, device=torch.device("cuda"))
+            for model_module in model
+        ]
 
     if correct_amax_history_if_needed is not None:
         correct_amax_history_if_needed(model)

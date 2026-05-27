@@ -330,6 +330,7 @@ class KimiK25VLModel(MegatronModule):
         *,
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: PackedSeqParams = None,
+        **kwargs,
     ) -> Tensor:
         r"""
         Args:
@@ -402,6 +403,7 @@ class KimiK25VLModel(MegatronModule):
             loss_mask=loss_mask,
             runtime_gather_output=runtime_gather_output,
             packed_seq_params=packed_seq_params,
+            **kwargs,
         )
         return outputs
 

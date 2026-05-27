@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
 import transformers
+from transformers import AutoConfig, PretrainedConfig
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
@@ -59,6 +60,93 @@ except ImportError:
     _TRANSFORMERS_HAS_QWEN3_5 = False
     Qwen3_5VisionConfig = None  # type: ignore[assignment,misc]
 
+
+class _Qwen35FallbackVisionConfig(PretrainedConfig):
+    model_type = "qwen3_5"
+    base_config_key = "vision_config"
+
+
+class _Qwen35FallbackTextConfig(PretrainedConfig):
+    model_type = "qwen3_5_text"
+    base_config_key = "text_config"
+
+    def __init__(self, **kwargs):
+        rope_parameters = kwargs.pop("rope_parameters", None)
+        if kwargs.get("rope_scaling") is None and rope_parameters is not None:
+            kwargs["rope_scaling"] = rope_parameters
+        super().__init__(**kwargs)
+        if getattr(self, "rope_scaling", None) is None:
+            self.rope_scaling = rope_parameters or {}
+        self.rope_parameters = rope_parameters or self.rope_scaling
+
+
+class _Qwen35FallbackConfig(PretrainedConfig):
+    model_type = "qwen3_5"
+    sub_configs = {
+        "vision_config": _Qwen35FallbackVisionConfig,
+        "text_config": _Qwen35FallbackTextConfig,
+    }
+    keys_to_ignore_at_inference = ["past_key_values"]
+
+    def __init__(
+        self,
+        text_config=None,
+        vision_config=None,
+        image_token_id=151655,
+        video_token_id=151656,
+        vision_start_token_id=151652,
+        vision_end_token_id=151653,
+        tie_word_embeddings=False,
+        **kwargs,
+    ):
+        if isinstance(vision_config, dict):
+            self.vision_config = self.sub_configs["vision_config"](**vision_config)
+        elif vision_config is None:
+            self.vision_config = self.sub_configs["vision_config"]()
+        else:
+            self.vision_config = vision_config
+
+        if isinstance(text_config, dict):
+            self.text_config = self.sub_configs["text_config"](**text_config)
+        elif text_config is None:
+            self.text_config = self.sub_configs["text_config"]()
+        else:
+            self.text_config = text_config
+
+        self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.vision_start_token_id = vision_start_token_id
+        self.vision_end_token_id = vision_end_token_id
+        super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
+
+
+class _Qwen35MoeFallbackVisionConfig(_Qwen35FallbackVisionConfig):
+    model_type = "qwen3_5_moe"
+
+
+class _Qwen35MoeFallbackTextConfig(_Qwen35FallbackTextConfig):
+    model_type = "qwen3_5_moe_text"
+
+
+class _Qwen35MoeFallbackConfig(_Qwen35FallbackConfig):
+    model_type = "qwen3_5_moe"
+    sub_configs = {
+        "vision_config": _Qwen35MoeFallbackVisionConfig,
+        "text_config": _Qwen35MoeFallbackTextConfig,
+    }
+
+
+if Qwen3_5VisionConfig is None:
+    Qwen3_5VisionConfig = _Qwen35FallbackVisionConfig  # type: ignore[assignment,misc]
+
+if Qwen3_5MoeVisionConfig is None:
+    Qwen3_5MoeVisionConfig = _Qwen35MoeFallbackVisionConfig  # type: ignore[assignment,misc]
+
+AutoConfig.register("qwen3_5", _Qwen35FallbackConfig, exist_ok=True)
+AutoConfig.register("qwen3_5_text", _Qwen35FallbackTextConfig, exist_ok=True)
+AutoConfig.register("qwen3_5_moe", _Qwen35MoeFallbackConfig, exist_ok=True)
+AutoConfig.register("qwen3_5_moe_text", _Qwen35MoeFallbackTextConfig, exist_ok=True)
+
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import Qwen3VLSelfAttention
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
@@ -66,7 +154,7 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
 
 def _check_qwen3_5_available() -> None:
     """Raise a clear error if transformers doesn't have qwen3_5 (dense) support."""
-    if not _TRANSFORMERS_HAS_QWEN3_5:
+    if Qwen3_5VisionConfig is None:
         raise ImportError(
             f"Qwen3.5 VL (dense) requires transformers with qwen3_5 model support, "
             f"but found {transformers.__version__}. "
@@ -76,7 +164,7 @@ def _check_qwen3_5_available() -> None:
 
 def _check_qwen3_5_moe_available() -> None:
     """Raise a clear error if transformers doesn't have qwen3_5_moe support."""
-    if not _TRANSFORMERS_HAS_QWEN3_5_MOE:
+    if Qwen3_5MoeVisionConfig is None:
         raise ImportError(
             f"Qwen3.5 VL (MoE) requires transformers >= 5.2.0, but found {transformers.__version__}. "
             "Please upgrade: pip install --upgrade transformers"

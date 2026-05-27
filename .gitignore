@@ -185,3 +185,8 @@ slurm*.out
 
 # UV package manager
 .uv/
+
+checkpoints
+benchmark
+orbit_ckpts
+results

@@ -531,6 +531,38 @@ class AutoBridge(Generic[MegatronModelT]):
             show_progress=show_progress,
         )
 
+    def export_oft_adapter_weights(
+        self,
+        model: list[MegatronModelT],
+        cpu: bool = False,
+        show_progress: bool = True,
+    ) -> Iterable["HFWeightTuple"]:
+        """
+        Export only OFT adapter weights from a Megatron model without merging them into base tensors.
+
+        This is useful when you want to save or inspect OFT adapters independently from the
+        underlying pretrained weights. Unlike LoRA which has ``lora_A``/``lora_B`` matrices,
+        OFT adapters consist of a single ``oft_r`` parameter per adapted layer.
+
+        For fused Megatron layers (e.g. QKV, gate/up), the same ``oft_r`` is emitted once
+        per sub-projection in HuggingFace format.
+
+        Args:
+            model: Megatron model instance or list of instances
+            cpu: Whether to move tensors to CPU before yielding
+            show_progress: Display progress bar during export
+
+        Yields:
+            HFWeightTuple: Named tuples of (param_name, weight_tensor) for OFT adapter parameters
+        """
+        dispatch_instance = (self._causal_lm_architecture, self._get_model_instance(model))
+        return model_bridge.stream_oft_adapter_weights_megatron_to_hf(
+            dispatch_instance,
+            model,
+            cpu=cpu,
+            show_progress=show_progress,
+        )
+
     def save_hf_adapter(
         self,
         model: list[MegatronModelT],
@@ -539,17 +571,24 @@ class AutoBridge(Generic[MegatronModelT]):
         base_model_name_or_path: Optional[str] = None,
         show_progress: bool = True,
     ) -> None:
-        """Save LoRA adapter weights as a HuggingFace PEFT-compatible directory.
+        """Save adapter weights (LoRA / DoRA / OFT) as a HuggingFace PEFT-compatible directory.
 
         The output directory contains ``adapter_config.json`` and
         ``adapter_model.safetensors`` and can be loaded directly with
         ``peft.PeftModel.from_pretrained(base_model, path)``.
 
+        For LoRA / DoRA, weights are gathered via :meth:`export_adapter_weights`
+        and stored under the ``base_model.model.`` prefix that PEFT expects.
+        For OFT, weights are gathered via :meth:`export_oft_adapter_weights`
+        and the rotation parameters (``oft_R``) are stored at the same prefix.
+
         Args:
             model: Megatron model instance or list of instances.
             path: Directory path where the adapter files will be saved.
-            peft_config: The LoRA / DoRA config used during training (provides
-                ``dim``, ``alpha``, ``dropout``, etc.).
+            peft_config: The PEFT config used during training (LoRA / DoRA / OFT).
+                For LoRA / DoRA this provides ``dim``, ``alpha``, ``dropout``;
+                for OFT this provides ``block_size``, ``r``, ``coft``, ``eps``,
+                ``block_share``.
             base_model_name_or_path: HuggingFace model identifier or local path
                 of the base model this adapter was trained on.  If *None*, the
                 value is inferred from ``hf_pretrained.model_name_or_path``.
@@ -581,22 +620,41 @@ class AutoBridge(Generic[MegatronModelT]):
             build_adapter_config_dict,
             infer_target_modules_from_adapter_weights,
         )
+        from megatron.bridge.peft.oft import OFT
 
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
-        adapter_state: dict[str, torch.Tensor] = {}
-        for name, tensor in self.export_adapter_weights(model, cpu=True, show_progress=show_progress):
-            adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+        is_oft = isinstance(peft_config, OFT)
+        is_distributed = dist.is_available() and dist.is_initialized()
+        is_rank0 = (not is_distributed) or dist.get_rank() == 0
 
-        if not adapter_state:
-            raise RuntimeError(
-                "No adapter weights were found on the model. "
-                "Ensure the model has PEFT adapters applied before calling save_hf_adapter()."
+        # OFT exporter keeps tensors on GPU during the per-rank gather
+        # because it relies on collective broadcasts; LoRA exporter can
+        # safely move to CPU as it streams.
+        if is_oft:
+            generator = self.export_oft_adapter_weights(
+                model, cpu=False, show_progress=show_progress
+            )
+        else:
+            generator = self.export_adapter_weights(
+                model, cpu=True, show_progress=show_progress
             )
 
-        is_rank0 = not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+        adapter_state: dict[str, torch.Tensor] = {}
+        for name, tensor in generator:
+            # Non-rank0 ranks must still consume the generator to participate
+            # in the distributed (TP/PP/EP) gather collectives.
+            if is_rank0:
+                adapter_state[f"base_model.model.{name}"] = tensor.detach().cpu()
+
         if is_rank0:
+            if not adapter_state:
+                raise RuntimeError(
+                    "No adapter weights were found on the model. "
+                    "Ensure the model has PEFT adapters applied before calling save_hf_adapter()."
+                )
+
             save_dir = Path(path)
             save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -606,7 +664,9 @@ class AutoBridge(Generic[MegatronModelT]):
                     or getattr(self.hf_pretrained, "name_or_path", "")
                 )
 
-            target_modules = infer_target_modules_from_adapter_weights(adapter_state.keys())
+            target_modules = infer_target_modules_from_adapter_weights(
+                adapter_state.keys(), peft_config=peft_config
+            )
             adapter_config = build_adapter_config_dict(
                 peft_config,
                 target_modules=target_modules,
@@ -620,7 +680,7 @@ class AutoBridge(Generic[MegatronModelT]):
             weights_path = save_dir / "adapter_model.safetensors"
             save_file(adapter_state, str(weights_path))
 
-        if dist.is_available() and dist.is_initialized():
+        if is_distributed:
             dist.barrier()
 
     def save_hf_pretrained(

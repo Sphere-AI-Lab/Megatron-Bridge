@@ -45,6 +45,32 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# torch.distributed's NCCL backend (PyTorch's ``to_nccl_data_type`` dispatcher)
+# is missing entries for several 1-byte sub-IEEE dtypes used by MX/NVFP4
+# quantization — packed FP4 weights (``float4_e2m1fn_x2``, two FP4 elements
+# per byte) and FP8 block scales (``float8_e8m0fnu``). NCCL transports them
+# fine as raw bytes; only the PyTorch dispatcher lacks the mapping. We view
+# such tensors as uint8 (same shape, shared storage) for the collective and
+# let the receiver read the bytes back through the original typed view —
+# bit-exact, no copy, no scratch buffer.
+_NCCL_BYTE_VIEW_DTYPES: set = set()
+for _name in ("float8_e8m0fnu", "float4_e2m1fn_x2"):
+    _dt = getattr(torch, _name, None)
+    if _dt is not None:
+        _NCCL_BYTE_VIEW_DTYPES.add(_dt)
+
+
+def _maybe_byte_view_for_nccl(t: torch.Tensor) -> torch.Tensor:
+    """Return a uint8 view if ``t``'s dtype is in :data:`_NCCL_BYTE_VIEW_DTYPES`.
+
+    Storage is shared, so writes to the returned view are visible through ``t``.
+    Caller keeps ``t`` and returns it after the collective — no restore needed.
+    """
+    if t.dtype in _NCCL_BYTE_VIEW_DTYPES:
+        return t.view(torch.uint8)
+    return t
+
+
 class MegatronParamMapping(ABC, Generic[WeightType]):
     """
     Abstract base class for weight conversion between Megatron and external formats.
@@ -122,8 +148,14 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
 
     @property
     def tp_group(self):
-        """Get the tensor model parallel group."""
-        if self.is_expert:
+        """Get the tensor model parallel group.
+
+        Routes routed-expert AND shared-expert mappings through the
+        expert-tensor-parallel (ETP) group; everything else uses the regular
+        TP group. See :attr:`uses_expert_tp_group` for why shared experts
+        belong here even though they are not EP-sharded.
+        """
+        if self.uses_expert_tp_group:
             return self._etp_group
         return self._tp_group
 
@@ -169,12 +201,54 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
 
     @property
     def is_expert(self) -> bool:
-        """Check if this mapping is for an expert parameter.
+        """Whether this mapping is for a *routed* expert parameter.
 
-        Matches both TEGroupedMLP (.mlp.experts.linear_fc) and
-        SequentialMLP (.mlp.experts.local_experts.*.linear_fc) patterns.
+        Routed experts have a per-expert numeric id (``experts.<N>``) and live
+        on a single EP rank, so they participate in EP gather/scatter during
+        HF export (:meth:`gather_from_ep_ranks`).
+
+        Matches:
+        - TEGroupedMLP             (``.mlp.experts.linear_fc``)
+        - SequentialMLP            (``.mlp.experts.local_experts.*.linear_fc``)
+        - DeepSeek V4 native MoE   (``.mlp.experts.<i>.w{1,2,3}``)
+
+        Note ``shared_experts`` are intentionally excluded here — they are
+        replicated across EP ranks (no numeric id, no EP gather), but they
+        DO use the expert-tensor-parallel group for TP sharding. See
+        :attr:`uses_expert_tp_group` for the TP-group selector concept.
         """
-        return ".mlp.experts.linear_fc" in self.megatron_param or ".mlp.experts.local_experts." in self.megatron_param
+        if ".mlp.experts.linear_fc" in self.megatron_param:
+            return True
+        if ".mlp.experts.local_experts." in self.megatron_param:
+            return True
+        # V4 native MoE: ``decoder.layers.<L>.mlp.experts.<i>.w{1,2,3}.{weight,scale}``.
+        if ".mlp.experts." in self.megatron_param and (
+            ".w1" in self.megatron_param
+            or ".w2" in self.megatron_param
+            or ".w3" in self.megatron_param
+        ):
+            return True
+        return False
+
+    @property
+    def uses_expert_tp_group(self) -> bool:
+        """Whether this mapping should route TP collectives through the
+        expert-tensor-parallel (ETP) group rather than the regular TP group.
+
+        Both routed experts and *shared* experts in DeepSeek V4 shard their
+        ``w{1,2,3}`` matrices over ETP, even though shared experts are not
+        EP-sharded. Decoupling this from :attr:`is_expert` keeps the EP-gather
+        path (which assumes a per-expert numeric id) safe for shared experts.
+        """
+        if self.is_expert:
+            return True
+        if ".mlp.shared_experts." in self.megatron_param and (
+            ".w1" in self.megatron_param
+            or ".w2" in self.megatron_param
+            or ".w3" in self.megatron_param
+        ):
+            return True
+        return False
 
     @property
     def is_adapter(self) -> bool:
@@ -471,7 +545,7 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
             return tensor
 
         global_src = torch.distributed.get_global_rank(group=self.tp_group, group_rank=src_rank)
-        torch.distributed.broadcast(tensor, src=global_src, group=self.tp_group)
+        torch.distributed.broadcast(_maybe_byte_view_for_nccl(tensor), src=global_src, group=self.tp_group)
         return tensor
 
     def scatter_to_tp_ranks(
@@ -506,9 +580,12 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
         if self.tp_rank == src_rank and splits:
             scatter_list = [s.to(device=device, dtype=dtype).contiguous() for s in splits]
 
+        scatter_list_for_nccl = (
+            [_maybe_byte_view_for_nccl(s) for s in scatter_list] if scatter_list is not None else None
+        )
         torch.distributed.scatter(
-            output,
-            scatter_list,
+            _maybe_byte_view_for_nccl(output),
+            scatter_list_for_nccl,
             src=global_src,
             group=self.tp_group,
         )
@@ -528,7 +605,11 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
             return [tensor]
 
         gathered = [torch.empty_like(tensor) for _ in range(self.tp_size)]
-        torch.distributed.all_gather(gathered, tensor, group=self.tp_group)
+        torch.distributed.all_gather(
+            [_maybe_byte_view_for_nccl(g) for g in gathered],
+            _maybe_byte_view_for_nccl(tensor),
+            group=self.tp_group,
+        )
         return gathered
 
     @staticmethod
@@ -2952,3 +3033,119 @@ def split_kv_weights(provider: TransformerConfig, kv: torch.Tensor) -> Tuple[tor
     k = kv_reshaped[k_slice].reshape(-1, hidden_size)
     v = kv_reshaped[v_slice].reshape(-1, hidden_size)
     return k, v
+
+
+class QuantScaleMapping(MegatronParamMapping[torch.Tensor]):
+    """Mapping for FP4/FP8 quantization scale tensors that live as siblings to a quant weight.
+
+    The scale parameter typically has shape (ceil(out/B), ceil(in/B)) for FP8
+    (B=128) or (out, in//32) for FP4 — the dim-0 sharding dimension is
+    out_features (in scale-block units for FP8). This mapping treats TP semantics
+    the same as ColumnParallelMapping (when ``parent_kind="column"``) but DOES
+    NOT cast dtypes. FP8 E8M0 (``torch.float8_e8m0fnu``) is a non-IEEE dtype;
+    ``.to(target.dtype)`` on it produces garbage. The mapping therefore raises
+    if the source and target dtypes don't already match.
+
+    Lookup contract: the second arg passed by ``load_weights_hf_to_megatron`` is
+    the *parent* module of the target Parameter. For ``decoder.layers.0.self_attention.wq_a.scale``
+    the parent is the ``DSV4Linear`` named ``wq_a`` and ``.scale`` is its
+    registered :class:`torch.nn.Parameter`.
+
+    For TP=1 this is a direct copy, identical to :class:`DirectMapping` except
+    for the strict no-cast assertion. For TP>1 with ``parent_kind="column"`` the
+    sharding rule is the same as the parent weight's :class:`ColumnParallelMapping`
+    (split dim 0). Row-parallel and replicated scales are NOT split: for FP8
+    block-scaling, the scale block index along the input dim is local to each
+    rank's input shard already.
+    """
+
+    def __init__(self, megatron_param: str, hf_param: str, parent_kind: str = "column"):
+        super().__init__(megatron_param, hf_param)
+        assert parent_kind in ("column", "row", "replicated"), (
+            f"parent_kind must be one of 'column', 'row', 'replicated'; got {parent_kind!r}"
+        )
+        self.parent_kind = parent_kind
+
+    def resolve(self, captures: Tuple[str, ...]) -> "MegatronParamMapping":
+        """Return a new resolved QuantScaleMapping preserving parent_kind."""
+        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+        return type(self)(resolved_megatron_param, resolved_hf_param, self.parent_kind)
+
+    def hf_to_megatron(
+        self,
+        hf_weights: torch.Tensor,
+        megatron_module: nn.Module,
+    ) -> torch.Tensor:
+        """Direct copy with optional dim-0 sharding for column-parallel parents.
+
+        Refuses to cast non-IEEE scale dtypes (FP8 E8M0). Raises on dtype mismatch.
+        """
+        if hf_weights is None:
+            raise ValueError(f"hf_weights must not be None for {self.megatron_param}")
+
+        target_param = getattr(megatron_module, "scale", None)
+        if target_param is None:
+            raise ValueError(
+                f"QuantScaleMapping target module {type(megatron_module).__name__} has no `.scale` attribute "
+                f"(megatron_param={self.megatron_param})"
+            )
+
+        # No dtype cast: FP8 E8M0 is non-IEEE; preserve byte-exact value.
+        if hf_weights.dtype != target_param.dtype:
+            raise ValueError(
+                f"Scale dtype mismatch for {self.megatron_param}: HF {hf_weights.dtype} vs Megatron "
+                f"{target_param.dtype}; casting non-IEEE scale dtypes is unsafe"
+            )
+
+        if self.tp_size == 1 or self.parent_kind == "replicated":
+            return hf_weights.to(device=target_param.device)
+
+        # TP > 1, parent is column- or row-parallel: shard the corresponding axis.
+        # column-parallel parent → out_features sharded → scale dim 0 sharded.
+        # row-parallel parent    → in_features  sharded → scale dim 1 sharded
+        # (each rank holds the scale-block columns covering its input shard).
+        shard_dim = 0 if self.parent_kind == "column" else 1
+        if self.tp_rank == 0:
+            full_size = hf_weights.shape[shard_dim]
+            if full_size % self.tp_size != 0:
+                raise ValueError(
+                    f"Scale tensor dim-{shard_dim} size {full_size} not divisible by tp_size "
+                    f"{self.tp_size} for {self.megatron_param}"
+                )
+            splits = list(torch.chunk(hf_weights, self.tp_size, dim=shard_dim))
+        else:
+            splits = None
+        return self.scatter_to_tp_ranks(
+            splits,
+            target_param.shape,
+            target_param.dtype,
+            target_param.device,
+        )
+
+    def megatron_to_hf(
+        self,
+        megatron_weights: Optional[torch.Tensor],
+        megatron_module: Optional[nn.Module],
+    ) -> Dict[str, torch.Tensor]:
+        """Gather scale shards across TP ranks and emit under the HF name.
+
+        Mirrors :class:`ColumnParallelMapping` but skips the dequantize step
+        (scales are already non-IEEE FP8 E8M0; don't touch them).
+        """
+        # Handle cross-PP broadcast first.
+        megatron_weights = self.broadcast_from_pp_rank(megatron_weights, cache_key=str(self.hf_param))
+
+        if megatron_weights is None:
+            return {}
+
+        if self.tp_size == 1 or self.parent_kind == "replicated":
+            full_weights = megatron_weights
+        else:
+            gather_dim = 0 if self.parent_kind == "column" else 1
+            gathered = self.gather_from_tp_ranks(megatron_weights)
+            full_weights = torch.cat(gathered, dim=gather_dim)
+
+        if self.is_expert and not self.is_adapter:
+            return self.gather_from_ep_ranks(full_weights, megatron_module, self.hf_param)
+
+        return {str(self.hf_param): full_weights}
