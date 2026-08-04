@@ -1788,6 +1788,21 @@ class MegatronPeftBridge:
                         name for name in base_hf_weight_names if f".{leaf}." in name
                     ]
 
+                # Legacy shared-R OFT on a GROUPED MoE expert fused gate/up:
+                # the serve side (sglang FusedMoE) stores ONE fused ``w13_oft_r``
+                # rotation per expert and detects the fused layout as
+                # ``gate_proj.oft_R`` present + ``up_proj.oft_R`` ABSENT. Emit
+                # only the gate projection (the shared rotation, applied to the
+                # fused gate/up input); sending both gate+up would be read as the
+                # split layout and mis-route to the unregistered w1/w3 buffers.
+                # Scoped to grouped experts so dense/QKV fan-out is unchanged.
+                if is_grouped_expert and task.slice_name is None:
+                    _gate_only = [
+                        name for name in base_hf_weight_names if ".up_proj." not in name
+                    ]
+                    if _gate_only:
+                        base_hf_weight_names = _gate_only
+
                 # For fused Megatron layers (QKV or gate/up) with the legacy
                 # shared-R OFT, the same rotation applies to every
                 # sub-projection – emit oft_r for each.
