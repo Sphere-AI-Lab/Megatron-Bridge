@@ -57,7 +57,7 @@ set -euo pipefail
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_NVLS_ENABLE=0
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}/3rdparty/Megatron-LM:${PYTHONPATH:-}"
 
 MEGATRON_CKPT="${MEGATRON_CKPT:-${SCRIPT_DIR}/checkpoints/Moonlight-16B-A3B-INT4}"

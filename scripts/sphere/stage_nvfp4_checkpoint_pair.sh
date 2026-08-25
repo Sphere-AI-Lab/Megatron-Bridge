@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 DEFAULT_HF_MODEL="${HF_MODEL_ROOT:-${HOME}/hf_models}/Kimi-K2.5-NVFP4"
 DEFAULT_MEGATRON_DIST="${SCRIPT_DIR}/checkpoints/Kimi-K2.5-NVFP4"

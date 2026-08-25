@@ -1,26 +1,21 @@
 #!/bin/bash
-# Kimi-K2.5 QOFT finetuning — NVFP4 base weights + BF16 OFT adapters
+# Kimi-K2.5 QOFT finetuning — INT4 base weights + BF16 OFT adapters
 #
-# NVFP4 sibling of run_qoft_finetune_kimi_k25_int4.sh. Two steps:
-#   1. Convert HF NVFP4 checkpoint to Megatron format:
-#        bash convert_nvfp4_checkpoint_direct.sh \
-#            ${HF_MODEL_ROOT:-${HOME}/hf_models}/Kimi-K2.5-NVFP4 \
-#            ./checkpoints/Kimi-K2.5-NVFP4
+# Two steps:
+#   1. Convert HF INT4 checkpoint to Megatron format:
+#        bash convert_int4_checkpoint_direct.sh \
+#            /path/to/Kimi-K2.5 \
+#            ./checkpoints/Kimi-K2.5-INT4
 #
 #   2. Finetune (this script):
-#        bash run_qoft_finetune_kimi_k25_nvfp4.sh
-#
-# Note: requires examples/models/kimi_k25/finetune_qoft_nvfp4.py (NVFP4
-# entrypoint) — mirrors the structure of finetune_qoft_int4.py but loads
-# NVFP4 buffers instead of INT4 triplets. Override the entrypoint via
-# FINETUNE_ENTRY=<path> if needed.
+#        bash run_qoft_finetune_kimi_k25_int4.sh
 #
 # Environment variables:
-#   MEGATRON_CKPT  - Path to NVFP4 Megatron checkpoint (from step 1)
+#   MEGATRON_CKPT  - Path to INT4 Megatron checkpoint (from step 1)
 #   NUM_GPUS       - Number of GPUs (default: 8)
 #   TP / EP        - Tensor / Expert parallel size (default: 2 / 4)
 #   PP             - Pipeline parallel size (default: 1)
-#   HF_MODEL_PATH  - HF NVFP4 model/tokenizer path
+#   HF_MODEL_PATH  - HF model/tokenizer path (default: moonshotai/Kimi-K2.5)
 #   TRAIN_ITERS    - Training iterations (default: 2000)
 #   SEQ_LENGTH     - Sequence length / packed sequence size (default: 16384)
 #   GLOBAL_BATCH_SIZE - Global batch size (default: 32)
@@ -38,7 +33,6 @@
 #   PROFILE_MEMORY_STEPS - Number of initial training steps to profile (default: 1)
 #   SKIP_TRAIN     - Set to 1 to load/setup the model and exit without training
 #   SKIP_EVAL      - Set to 1 to disable validation/evaluation after training
-#   FINETUNE_ENTRY - Override the Python entrypoint (default: finetune_qoft_nvfp4.py)
 
 # 1. CUDA setup
 if command -v module >/dev/null 2>&1; then
@@ -70,7 +64,7 @@ export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_NVLS_ENABLE=0
 
 # Ensure megatron.legacy is importable from the submodule source tree
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}/3rdparty/Megatron-LM:${PYTHONPATH:-}"
 
 is_true() {
@@ -188,28 +182,23 @@ stage_megatron_checkpoint_if_requested() {
     MEGATRON_CKPT="${STAGE_MEGATRON_CKPT_TO}"
 }
 
-MEGATRON_CKPT="${MEGATRON_CKPT:-${MEGATRON_CKPT_ROOT:-${PWD}/checkpoints}/Kimi-K2.5-NVFP4}"
+MEGATRON_CKPT="${MEGATRON_CKPT:-${MEGATRON_CKPT_ROOT:-${PWD}/checkpoints}/Kimi-K2.5}"
 NUM_GPUS="${NUM_GPUS:-8}"
-# ModelOpt's QuantSequentialMLP forbids TP>1 AND EP>1 simultaneously for
-# quantized MoE — must set one to 1. INT4 sibling uses TP=2/EP=8 (works
-# because INT4 doesn't go through ModelOpt's QuantSequentialMLP), but NVFP4
-# needs the constraint. TP=1/EP=8 matches the SGLang rollout layout used by
-# the orbit launcher (run_kimi_k25_nvfp4_math_megatron_oft.sh).
-TP="${TP:-1}"
+TP="${TP:-2}"
 EP="${EP:-8}"
 PP="${PP:-1}"
-HF_MODEL_PATH="${HF_MODEL_PATH:-${HF_MODEL_ROOT:-${HOME}/hf_models}/Kimi-K2.5-NVFP4}"
+HF_MODEL_PATH="${HF_MODEL_PATH:-${HF_MODEL_ROOT:-${HOME}/hf_models}/Kimi-K2.5}"
 TRAIN_ITERS="${TRAIN_ITERS:-2000}"
 SEQ_LENGTH="${SEQ_LENGTH:-16384}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-60}"
-OUTPUT_DIR="${OUTPUT_DIR:-./results/kimi_k25_qoft_nvfp4}"
+OUTPUT_DIR="${OUTPUT_DIR:-./results/kimi_k25_qoft_int4}"
 BLOCK_SIZE="${BLOCK_SIZE:-32}"
 TARGET_MODULES="${TARGET_MODULES:-linear_q_down_proj,linear_q_up_proj,linear_kv_down_proj,linear_kv_up_proj,linear_proj,linear_fc1,linear_fc2}"
 LOCAL_STAGE_ROOT="${LOCAL_STAGE_ROOT:-$(resolve_local_stage_root)}"
-STAGE_HF_MODEL_TO="${STAGE_HF_MODEL_TO-${LOCAL_STAGE_ROOT}/Kimi-K2.5-NVFP4}"
-STAGE_MEGATRON_CKPT_TO="${STAGE_MEGATRON_CKPT_TO-${LOCAL_STAGE_ROOT}/Megatron-Bridge/checkpoints/Kimi-K2.5-NVFP4}"
+STAGE_HF_MODEL_TO="${STAGE_HF_MODEL_TO-${LOCAL_STAGE_ROOT}/Kimi-K2.5}"
+STAGE_MEGATRON_CKPT_TO="${STAGE_MEGATRON_CKPT_TO-${LOCAL_STAGE_ROOT}/Megatron-Bridge/checkpoints/Kimi-K2.5}"
 FORCE_STAGE_HF_MODEL="${FORCE_STAGE_HF_MODEL:-0}"
 FORCE_STAGE_MEGATRON_CKPT="${FORCE_STAGE_MEGATRON_CKPT:-0}"
 SAVE_CHECKPOINTS="${SAVE_CHECKPOINTS:-0}"
@@ -218,7 +207,6 @@ PROFILE_MEMORY="${PROFILE_MEMORY:-0}"
 PROFILE_MEMORY_STEPS="${PROFILE_MEMORY_STEPS:-1}"
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
 SKIP_EVAL="${SKIP_EVAL:-0}"
-FINETUNE_ENTRY="${FINETUNE_ENTRY:-examples/models/kimi_k25/finetune_qoft_nvfp4.py}"
 
 EXTRA_ARGS=()
 if [ "${SAVE_CHECKPOINTS}" = "1" ]; then
@@ -234,19 +222,12 @@ if [ "${SKIP_EVAL}" = "1" ]; then
     EXTRA_ARGS+=(--skip-eval)
 fi
 
-if [[ ! -f "${SCRIPT_DIR}/${FINETUNE_ENTRY}" ]]; then
-    echo "Finetune entrypoint not found: ${SCRIPT_DIR}/${FINETUNE_ENTRY}" >&2
-    echo "Create finetune_qoft_nvfp4.py for kimi_k25 (mirror finetune_qoft_int4.py + NVFP4 load)," >&2
-    echo "or override with FINETUNE_ENTRY=<path>." >&2
-    exit 1
-fi
-
 stage_hf_model_if_requested
 stage_megatron_checkpoint_if_requested
 
 echo "======================================"
 echo "Kimi-K2.5 QOFT Fine-Tuning"
-echo "  NVFP4 base weights (no BF16 alloc)"
+echo "  INT4 base weights (no BF16 alloc)"
 echo "  GPUs: ${NUM_GPUS}, TP: ${TP}, EP: ${EP}, PP: ${PP}"
 echo "  Seq Length: ${SEQ_LENGTH}"
 echo "  Global Batch Size: ${GLOBAL_BATCH_SIZE}"
@@ -266,11 +247,10 @@ echo "  Local Stage Root: ${LOCAL_STAGE_ROOT}"
 echo "  Stage HF Model To: ${STAGE_HF_MODEL_TO:-<disabled>}"
 echo "  Stage Megatron Checkpoint To: ${STAGE_MEGATRON_CKPT_TO:-<disabled>}"
 echo "  Output: ${OUTPUT_DIR}"
-echo "  Finetune Entry: ${FINETUNE_ENTRY}"
 echo "======================================"
 
 torchrun --nproc_per_node="${NUM_GPUS}" \
-    "${FINETUNE_ENTRY}" \
+    examples/models/kimi_k25/finetune_qoft_int4.py \
     --pretrained-checkpoint "${MEGATRON_CKPT}" \
     --hf-model-path "${HF_MODEL_PATH}" \
     --tp "${TP}" --ep "${EP}" --pp "${PP}" \

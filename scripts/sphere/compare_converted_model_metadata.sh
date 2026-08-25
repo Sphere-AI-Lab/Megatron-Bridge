@@ -20,7 +20,7 @@ if [[ -n "${CUDNN_HOME:-}" ]]; then
     export LD_LIBRARY_PATH="${CUDNN_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}/src:${SCRIPT_DIR}/3rdparty/Megatron-LM:${PYTHONPATH:-}"
 
 # modelopt / megatron dependencies live in the rl_infra uv project.

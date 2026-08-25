@@ -1,14 +1,44 @@
 #!/bin/bash
-# Qwen3-30B-A3B QOFT finetuning — NVFP4 base weights + BF16 OFT adapters
+# Kimi-K2.5 QOFT finetuning — NVFP4 base weights + BF16 OFT adapters
 #
-# Smaller-scale companion to run_qoft_finetune_kimi_k25_nvfp4.sh for fast
-# iteration on the NVFP4 + grouped-MoE codepath. Two steps:
-#   1. Convert HF NVFP4 -> Megatron checkpoint:
+# NVFP4 sibling of run_qoft_finetune_kimi_k25_int4.sh. Two steps:
+#   1. Convert HF NVFP4 checkpoint to Megatron format:
 #        bash convert_nvfp4_checkpoint_direct.sh \
-#            ${HF_MODEL_ROOT:-${HOME}/hf_models}/Qwen3-30B-A3B-NVFP4 \
-#            ./checkpoints/Qwen3-30B-A3B-NVFP4
+#            ${HF_MODEL_ROOT:-${HOME}/hf_models}/Kimi-K2.5-NVFP4 \
+#            ./checkpoints/Kimi-K2.5-NVFP4
+#
 #   2. Finetune (this script):
-#        bash run_qoft_finetune_qwen3_30b_a3b_nvfp4.sh
+#        bash run_qoft_finetune_kimi_k25_nvfp4.sh
+#
+# Note: requires examples/models/kimi_k25/finetune_qoft_nvfp4.py (NVFP4
+# entrypoint) — mirrors the structure of finetune_qoft_int4.py but loads
+# NVFP4 buffers instead of INT4 triplets. Override the entrypoint via
+# FINETUNE_ENTRY=<path> if needed.
+#
+# Environment variables:
+#   MEGATRON_CKPT  - Path to NVFP4 Megatron checkpoint (from step 1)
+#   NUM_GPUS       - Number of GPUs (default: 8)
+#   TP / EP        - Tensor / Expert parallel size (default: 2 / 4)
+#   PP             - Pipeline parallel size (default: 1)
+#   HF_MODEL_PATH  - HF NVFP4 model/tokenizer path
+#   TRAIN_ITERS    - Training iterations (default: 2000)
+#   SEQ_LENGTH     - Sequence length / packed sequence size (default: 16384)
+#   GLOBAL_BATCH_SIZE - Global batch size (default: 32)
+#   MICRO_BATCH_SIZE  - Micro batch size per GPU (default: 1)
+#   DISTRIBUTED_TIMEOUT_MINUTES - Process-group timeout for slow first-time dataset packing (default: 60)
+#   OUTPUT_DIR     - Output directory
+#   BLOCK_SIZE     - OFT block size (default: 32)
+#   TARGET_MODULES - Comma/space separated OFT target modules
+#   STAGE_HF_MODEL_TO - Local staged HF model path (set empty to disable)
+#   STAGE_MEGATRON_CKPT_TO - Local staged Megatron checkpoint path (set empty to disable)
+#   FORCE_STAGE_HF_MODEL / FORCE_STAGE_MEGATRON_CKPT - Set to 1 to refresh staged copies
+#   SAVE_CHECKPOINTS - Set to 1 to save/resume run checkpoints (default: 0)
+#   SAVE_INTERVAL  - Checkpoint save interval when SAVE_CHECKPOINTS=1 (default: 500)
+#   PROFILE_MEMORY - Set to 1 to print model storage and CUDA memory around training steps
+#   PROFILE_MEMORY_STEPS - Number of initial training steps to profile (default: 1)
+#   SKIP_TRAIN     - Set to 1 to load/setup the model and exit without training
+#   SKIP_EVAL      - Set to 1 to disable validation/evaluation after training
+#   FINETUNE_ENTRY - Override the Python entrypoint (default: finetune_qoft_nvfp4.py)
 
 # 1. CUDA setup
 if command -v module >/dev/null 2>&1; then
@@ -39,7 +69,8 @@ fi
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_NVLS_ENABLE=0
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Ensure megatron.legacy is importable from the submodule source tree
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}/3rdparty/Megatron-LM:${PYTHONPATH:-}"
 
 is_true() {
@@ -157,39 +188,44 @@ stage_megatron_checkpoint_if_requested() {
     MEGATRON_CKPT="${STAGE_MEGATRON_CKPT_TO}"
 }
 
-MEGATRON_CKPT="${MEGATRON_CKPT:-${MEGATRON_CKPT_ROOT:-${PWD}/checkpoints}/Qwen3-30B-A3B-NVFP4}"
+MEGATRON_CKPT="${MEGATRON_CKPT:-${MEGATRON_CKPT_ROOT:-${PWD}/checkpoints}/Kimi-K2.5-NVFP4}"
 NUM_GPUS="${NUM_GPUS:-8}"
 # ModelOpt's QuantSequentialMLP forbids TP>1 AND EP>1 simultaneously for
-# quantized MoE — must set one to 1. We default to TP=1/EP=8 since:
-#  * it matches the SGLang rollout layout used by the orbit launcher
-#    (run_qwen3_30b_a3b_nvfp4_math_megatron_oft.sh), and
-#  * EP-only sharding is the standard Megatron MoE layout.
+# quantized MoE — must set one to 1. INT4 sibling uses TP=2/EP=8 (works
+# because INT4 doesn't go through ModelOpt's QuantSequentialMLP), but NVFP4
+# needs the constraint. TP=1/EP=8 matches the SGLang rollout layout used by
+# the orbit launcher (run_kimi_k25_nvfp4_math_megatron_oft.sh).
 TP="${TP:-1}"
 EP="${EP:-8}"
 PP="${PP:-1}"
-HF_MODEL_PATH="${HF_MODEL_PATH:-${HF_MODEL_ROOT:-${HOME}/hf_models}/Qwen3-30B-A3B-NVFP4}"
+HF_MODEL_PATH="${HF_MODEL_PATH:-${HF_MODEL_ROOT:-${HOME}/hf_models}/Kimi-K2.5-NVFP4}"
 TRAIN_ITERS="${TRAIN_ITERS:-2000}"
-SEQ_LENGTH="${SEQ_LENGTH:-4096}"
+SEQ_LENGTH="${SEQ_LENGTH:-16384}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
-DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-30}"
-OUTPUT_DIR="${OUTPUT_DIR:-./results/qwen3_30b_a3b_qoft_nvfp4}"
+DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-60}"
+OUTPUT_DIR="${OUTPUT_DIR:-./results/kimi_k25_qoft_nvfp4}"
 BLOCK_SIZE="${BLOCK_SIZE:-32}"
-TARGET_MODULES="${TARGET_MODULES:-linear_qkv,linear_proj,linear_fc1,linear_fc2}"
+TARGET_MODULES="${TARGET_MODULES:-linear_q_down_proj,linear_q_up_proj,linear_kv_down_proj,linear_kv_up_proj,linear_proj,linear_fc1,linear_fc2}"
 LOCAL_STAGE_ROOT="${LOCAL_STAGE_ROOT:-$(resolve_local_stage_root)}"
-STAGE_HF_MODEL_TO="${STAGE_HF_MODEL_TO-${LOCAL_STAGE_ROOT}/Qwen3-30B-A3B-NVFP4}"
-STAGE_MEGATRON_CKPT_TO="${STAGE_MEGATRON_CKPT_TO-${LOCAL_STAGE_ROOT}/Megatron-Bridge/checkpoints/Qwen3-30B-A3B-NVFP4}"
+STAGE_HF_MODEL_TO="${STAGE_HF_MODEL_TO-${LOCAL_STAGE_ROOT}/Kimi-K2.5-NVFP4}"
+STAGE_MEGATRON_CKPT_TO="${STAGE_MEGATRON_CKPT_TO-${LOCAL_STAGE_ROOT}/Megatron-Bridge/checkpoints/Kimi-K2.5-NVFP4}"
 FORCE_STAGE_HF_MODEL="${FORCE_STAGE_HF_MODEL:-0}"
 FORCE_STAGE_MEGATRON_CKPT="${FORCE_STAGE_MEGATRON_CKPT:-0}"
 SAVE_CHECKPOINTS="${SAVE_CHECKPOINTS:-0}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-500}"
+PROFILE_MEMORY="${PROFILE_MEMORY:-0}"
+PROFILE_MEMORY_STEPS="${PROFILE_MEMORY_STEPS:-1}"
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
 SKIP_EVAL="${SKIP_EVAL:-0}"
-FINETUNE_ENTRY="${FINETUNE_ENTRY:-examples/models/qwen3_moe/finetune_qoft_nvfp4.py}"
+FINETUNE_ENTRY="${FINETUNE_ENTRY:-examples/models/kimi_k25/finetune_qoft_nvfp4.py}"
 
 EXTRA_ARGS=()
 if [ "${SAVE_CHECKPOINTS}" = "1" ]; then
     EXTRA_ARGS+=(--save-checkpoints --save-interval "${SAVE_INTERVAL}")
+fi
+if [ "${PROFILE_MEMORY}" = "1" ]; then
+    EXTRA_ARGS+=(--profile-memory --profile-memory-steps "${PROFILE_MEMORY_STEPS}")
 fi
 if [ "${SKIP_TRAIN}" = "1" ]; then
     EXTRA_ARGS+=(--skip-train)
@@ -200,6 +236,8 @@ fi
 
 if [[ ! -f "${SCRIPT_DIR}/${FINETUNE_ENTRY}" ]]; then
     echo "Finetune entrypoint not found: ${SCRIPT_DIR}/${FINETUNE_ENTRY}" >&2
+    echo "Create finetune_qoft_nvfp4.py for kimi_k25 (mirror finetune_qoft_int4.py + NVFP4 load)," >&2
+    echo "or override with FINETUNE_ENTRY=<path>." >&2
     exit 1
 fi
 
@@ -207,7 +245,7 @@ stage_hf_model_if_requested
 stage_megatron_checkpoint_if_requested
 
 echo "======================================"
-echo "Qwen3-30B-A3B QOFT Fine-Tuning"
+echo "Kimi-K2.5 QOFT Fine-Tuning"
 echo "  NVFP4 base weights (no BF16 alloc)"
 echo "  GPUs: ${NUM_GPUS}, TP: ${TP}, EP: ${EP}, PP: ${PP}"
 echo "  Seq Length: ${SEQ_LENGTH}"
@@ -218,6 +256,8 @@ echo "  OFT Block Size: ${BLOCK_SIZE}"
 echo "  OFT Target Modules: ${TARGET_MODULES}"
 echo "  Save Checkpoints: ${SAVE_CHECKPOINTS}"
 echo "  Save Interval: ${SAVE_INTERVAL}"
+echo "  Profile Memory: ${PROFILE_MEMORY}"
+echo "  Profile Memory Steps: ${PROFILE_MEMORY_STEPS}"
 echo "  Skip Train: ${SKIP_TRAIN}"
 echo "  Skip Eval: ${SKIP_EVAL}"
 echo "  Megatron Checkpoint: ${MEGATRON_CKPT}"
