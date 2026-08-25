@@ -12,11 +12,11 @@ and ``AutoBridge.export_oft_adapter_weights``.
 
 from __future__ import annotations
 
+import itertools
 import math
 import re
 from dataclasses import dataclass
-import itertools
-from typing import Dict, Iterable, List, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, TypeVar, Union
 
 import torch
 from megatron.core import parallel_state
@@ -24,11 +24,16 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, unwrap_model
 
 from megatron.bridge.models.conversion.utils import (
-    HFWeightTuple,
     extract_sort_key,
     get_module_and_param_from_name,
     persistent_buffers,
 )
+
+if TYPE_CHECKING:
+    # Runtime code lazy-imports HFWeightTuple inside the stream method;
+    # importing model_bridge at module level here would be circular
+    # (peft_bridge -> oft_export -> model_bridge -> peft_bridge).
+    from megatron.bridge.models.conversion.model_bridge import HFWeightTuple  # noqa: F401
 
 MegatronModel = TypeVar("MegatronModel", bound=MegatronModule)
 
