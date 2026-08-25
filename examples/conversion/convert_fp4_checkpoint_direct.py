@@ -200,11 +200,11 @@ def _install_transformer_engine_stub() -> None:
 
 _install_transformer_engine_stub()
 
-from megatron.bridge.models.conversion.low_precision.common import (
+from megatron.bridge.sphere.low_precision.common import (
     build_single_rank_meta_provider,
     patch_meta_init_for_te_modules,
 )
-from megatron.bridge.models.conversion.low_precision.fp4 import build_fp4_direct_model_state_dict
+from megatron.bridge.sphere.low_precision.fp4 import build_fp4_direct_model_state_dict
 from megatron.bridge.training.checkpointing import (
     get_checkpoint_name,
     save_checkpoint,

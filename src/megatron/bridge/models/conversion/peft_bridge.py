@@ -1376,8 +1376,8 @@ class MegatronPeftBridge:
         ``adapter_up``; ``slice_name`` selects which one to return.
         """
 
-        from megatron.bridge.peft.canonical_oft import GroupedOFTRotation
-        from megatron.bridge.peft.oft_layers import OFTRotationModule
+        from megatron.bridge.sphere.oft.canonical_oft import GroupedOFTRotation
+        from megatron.bridge.sphere.oft.oft_layers import OFTRotationModule
 
         _, wrapper = get_module_and_param_from_name(megatron_model, local_base_prefix, vp_stage)
         if slice_name is not None:
@@ -1926,7 +1926,7 @@ def infer_target_modules_from_adapter_weights(
     inference is unambiguous when both adapter types coexist on disk. When
     ``peft_config`` is omitted, both families are matched.
     """
-    from megatron.bridge.peft.oft import OFT
+    from megatron.bridge.sphere.oft.oft import OFT
 
     if peft_config is not None and isinstance(peft_config, OFT):
         suffixes = _HF_OFT_SUFFIXES
@@ -1971,7 +1971,7 @@ def build_adapter_config_dict(
     import dataclasses
 
     from megatron.bridge.peft.dora import DoRA
-    from megatron.bridge.peft.oft import OFT
+    from megatron.bridge.sphere.oft.oft import OFT
 
     # ------------------------------------------------------------------
     # 1. Inherit everything we can from the dataclass.

@@ -22,7 +22,7 @@ from typing import Iterable, Set
 import torch
 from megatron.core.utils import unwrap_model
 
-from megatron.bridge.peft.param_names import (
+from megatron.bridge.sphere.oft.param_names import (
     is_peft_adapter_param_name,
     is_trainable_base_param_name,
 )

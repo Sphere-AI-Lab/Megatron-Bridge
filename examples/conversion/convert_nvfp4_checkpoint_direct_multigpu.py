@@ -107,7 +107,7 @@ _mp.to_empty_if_meta_device = _to_empty_if_meta_device_cpu
 from megatron.core.optimizer import OptimizerConfig
 
 from megatron.bridge import AutoBridge
-from megatron.bridge.models.conversion.low_precision.common import (
+from megatron.bridge.sphere.low_precision.common import (
     TensorSpillManager,
     patch_meta_init_for_te_modules,
 )
@@ -194,14 +194,14 @@ def _bucketed_spill_tensor(self, key, tensor):
 
 
 TensorSpillManager.spill_tensor = _bucketed_spill_tensor
-from megatron.bridge.models.conversion.low_precision.nvfp4 import (
+from megatron.bridge.sphere.low_precision.nvfp4 import (
     apply_modelopt_nvfp4_to_meta_model,
     build_nvfp4_direct_model_state_dict,
     collect_nvfp4_target_module_names,
     is_nvfp4_source,
 )
 from megatron.bridge.models.decorators import torchrun_main
-from megatron.bridge.models.kimi_vl.kimi_k25_vl_nvfp4_bridge import KimiK25VLNVFP4Bridge
+from megatron.bridge.sphere.model_bridges.kimi_k25_vl_nvfp4_bridge import KimiK25VLNVFP4Bridge
 from megatron.bridge.training.checkpointing import (
     get_checkpoint_name,
     save_checkpoint,

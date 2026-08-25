@@ -35,7 +35,7 @@ Architecture:
     flow through PyTorch autograd automatically).
 """
 
-from megatron.bridge.peft.te_oft.te_oft_layernorm_linear import TEOFTLayerNormColumnParallelLinear
+from megatron.bridge.sphere.oft.te_oft.te_oft_layernorm_linear import TEOFTLayerNormColumnParallelLinear
 
 
 __all__ = ["TEOFTLayerNormColumnParallelLinear"]

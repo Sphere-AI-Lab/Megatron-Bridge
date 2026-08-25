@@ -10,8 +10,8 @@ for both forward and backward passes:
 
 import torch
 
-from megatron.bridge.peft.triton_oft.sgemm_oft_r import sgemm_oft_r_fwd
-from megatron.bridge.peft.triton_oft.sgemm_oft_r_bwd import sgemm_oft_r_grad_R
+from megatron.bridge.sphere.oft.triton_oft.sgemm_oft_r import sgemm_oft_r_fwd
+from megatron.bridge.sphere.oft.triton_oft.sgemm_oft_r_bwd import sgemm_oft_r_grad_R
 
 
 class OFTRotationFunction(torch.autograd.Function):

@@ -119,7 +119,7 @@ class LoRALinear(AdapterWrapper):
     def _base_linear_forward_int4(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        from megatron.bridge.models.conversion.low_precision.int4 import dequantize_int4
+        from megatron.bridge.sphere.low_precision.int4 import dequantize_int4
         from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
         layernorm_output = _apply_layernorm_if_present(self.to_wrap, x)

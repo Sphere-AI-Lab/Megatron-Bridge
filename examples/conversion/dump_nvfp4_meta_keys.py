@@ -29,11 +29,11 @@ def _dc_save_with_mcore(*args, **kwargs):
 
 _dc.save = _dc_save_with_mcore
 
-from megatron.bridge.models.conversion.low_precision.common import (
+from megatron.bridge.sphere.low_precision.common import (
     build_single_rank_meta_provider,
     patch_meta_init_for_te_modules,
 )
-from megatron.bridge.models.conversion.low_precision.nvfp4 import (
+from megatron.bridge.sphere.low_precision.nvfp4 import (
     apply_modelopt_nvfp4_to_meta_model,
     collect_nvfp4_target_module_names,
     is_nvfp4_source,

@@ -37,7 +37,7 @@ Usage:
 import argparse
 import os
 
-from megatron.bridge.peft.oft import OFT
+from megatron.bridge.sphere.oft.oft import OFT
 from megatron.bridge.recipes.gpt_oss import gpt_oss_20b_peft_config
 from megatron.bridge.training.finetune import finetune
 from megatron.bridge.training.gpt_step import forward_step

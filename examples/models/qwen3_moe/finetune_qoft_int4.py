@@ -41,7 +41,7 @@ _EXPECTED_EXPERT_INT4_MISSING_KEY_RE = re.compile(
 
 
 def make_oft(**kwargs):
-    from megatron.bridge.peft.oft import OFT
+    from megatron.bridge.sphere.oft.oft import OFT
 
     return OFT(**kwargs)
 
@@ -53,19 +53,19 @@ def build_qwen3_moe_peft_config(peft_scheme):
 
 
 def transform_sharded_state_dict_for_int4_experts(*args, **kwargs):
-    from megatron.bridge.peft.int4_utils import transform_sharded_state_dict_for_int4 as _impl
+    from megatron.bridge.sphere.quant.int4_utils import transform_sharded_state_dict_for_int4 as _impl
 
     return _impl(*args, **kwargs)
 
 
 def register_int4_expert_buffers_after_load(*args, **kwargs):
-    from megatron.bridge.peft.int4_utils import register_int4_buffers_after_load as _impl
+    from megatron.bridge.sphere.quant.int4_utils import register_int4_buffers_after_load as _impl
 
     return _impl(*args, **kwargs)
 
 
 def transform_sharded_state_dict_for_int4_dense(*args, **kwargs):
-    from megatron.bridge.models.conversion.low_precision.int4 import (
+    from megatron.bridge.sphere.low_precision.int4 import (
         transform_sharded_state_dict_for_int4_dense as _impl,
     )
 
@@ -73,7 +73,7 @@ def transform_sharded_state_dict_for_int4_dense(*args, **kwargs):
 
 
 def register_int4_dense_buffers_after_load(*args, **kwargs):
-    from megatron.bridge.models.conversion.low_precision.int4 import (
+    from megatron.bridge.sphere.low_precision.int4 import (
         register_int4_buffers_after_load_dense as _impl,
     )
 

@@ -16,7 +16,7 @@
 import argparse
 import os
 
-from megatron.bridge.peft.oft import OFT
+from megatron.bridge.sphere.oft.oft import OFT
 from megatron.bridge.recipes.qwen import qwen3_14b_peft_config
 from megatron.bridge.training.finetune import finetune
 from megatron.bridge.training.gpt_step import forward_step

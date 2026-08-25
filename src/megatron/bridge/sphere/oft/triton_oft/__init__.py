@@ -8,25 +8,25 @@ Provides fwd/bwd triton kernels and an autograd Function for OFT rotation:
 Ported from sglang.srt.oft.triton_ops.
 """
 
-from megatron.bridge.peft.triton_oft.sgemm_oft_r import sgemm_oft_r_fwd
-from megatron.bridge.peft.triton_oft.sgemm_oft_r_bwd import sgemm_oft_r_grad_R
-from megatron.bridge.peft.triton_oft.oft_rotation import OFTRotationFunction, oft_rotation
-from megatron.bridge.peft.triton_oft.cayley_neumann import (
+from megatron.bridge.sphere.oft.triton_oft.sgemm_oft_r import sgemm_oft_r_fwd
+from megatron.bridge.sphere.oft.triton_oft.sgemm_oft_r_bwd import sgemm_oft_r_grad_R
+from megatron.bridge.sphere.oft.triton_oft.oft_rotation import OFTRotationFunction, oft_rotation
+from megatron.bridge.sphere.oft.triton_oft.cayley_neumann import (
     cayley_neumann_fwd,
     cayley_neumann_bwd,
     CayleyNeumannFunction,
     cayley_neumann,
 )
-from megatron.bridge.peft.triton_oft.sgemm_oft_r_single import (
+from megatron.bridge.sphere.oft.triton_oft.sgemm_oft_r_single import (
     oft_r_single_fwd,
     oft_r_single_grad_R,
     OFTRotationSingleFunction,
     oft_r_single,
 )
-from megatron.bridge.peft.triton_oft.sgemm_oft_r_by_expert import (
+from megatron.bridge.sphere.oft.triton_oft.sgemm_oft_r_by_expert import (
     OFTRotationByExpertFunction,
     oft_r_by_expert,
     oft_r_by_expert_fwd,
     oft_r_by_expert_grad_R,
 )
-from megatron.bridge.peft.triton_oft.dequant_fp8 import dequant_fp8_block_triton
+from megatron.bridge.sphere.oft.triton_oft.dequant_fp8 import dequant_fp8_block_triton

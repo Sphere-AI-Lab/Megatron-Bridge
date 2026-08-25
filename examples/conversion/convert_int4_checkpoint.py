@@ -38,7 +38,7 @@ import sys
 from functools import partial
 
 from megatron.bridge import AutoBridge
-from megatron.bridge.models.deepseek.deepseek_v3_int4_bridge import DeepSeekV3INT4Bridge
+from megatron.bridge.sphere.model_bridges.deepseek_v3_int4_bridge import DeepSeekV3INT4Bridge
 
 # Register Kimi-K2.5 VL bridge (only if the model uses that architecture).
 try:

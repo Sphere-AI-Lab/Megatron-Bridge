@@ -43,7 +43,7 @@ import re
 
 import torch
 
-from megatron.bridge.peft.oft import OFT
+from megatron.bridge.sphere.oft.oft import OFT
 from megatron.bridge.recipes.qwen.qwen3_moe import qwen3_30b_a3b_peft_config
 from megatron.bridge.training.finetune import finetune
 from megatron.bridge.training.gpt_step import forward_step

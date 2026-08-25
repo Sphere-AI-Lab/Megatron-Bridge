@@ -14,7 +14,7 @@
 
 from megatron.bridge.models.deepseek.deepseek_v2_bridge import DeepSeekV2Bridge  # noqa: F401
 from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge  # noqa: F401
-from megatron.bridge.models.deepseek.deepseek_v4_bridge import DeepSeekV4Bridge  # noqa: F401
+from megatron.bridge.sphere.model_bridges.deepseek_v4_bridge import DeepSeekV4Bridge  # noqa: F401
 
 
 __all__ = [

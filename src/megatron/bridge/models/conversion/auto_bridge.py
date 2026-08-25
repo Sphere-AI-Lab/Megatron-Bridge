@@ -620,7 +620,7 @@ class AutoBridge(Generic[MegatronModelT]):
             build_adapter_config_dict,
             infer_target_modules_from_adapter_weights,
         )
-        from megatron.bridge.peft.oft import OFT
+        from megatron.bridge.sphere.oft.oft import OFT
 
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
