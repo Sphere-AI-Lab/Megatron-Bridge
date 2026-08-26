@@ -958,8 +958,8 @@ def save_checkpoint(
             if model:
                 # cfg.dist can be None during checkpoint conversion (save_megatron_model)
                 if not (cfg.dist and cfg.dist.use_decentralized_pg):
-                    # sphere-seam(modelopt): honor non-nvrx async strategies.
-                    from megatron.bridge.sphere.training.modelopt_checkpoint import (
+                    # orbit-seam(modelopt): honor non-nvrx async strategies.
+                    from megatron.bridge.orbit.training.modelopt_checkpoint import (
                         _save_sharded_modelopt_state_with_async_strategy,
                     )
 
@@ -1875,8 +1875,8 @@ def _load_checkpoint_from_path(
             if ckpt_tp_pp != run_tp_pp:
                 print_rank_0("{}: Rerun state will be ignored".format(mismatch_msg))
 
-        # sphere-seam(modelopt): restore ModelOpt state before sharded-load schema.
-        from megatron.bridge.sphere.training.modelopt_checkpoint import (
+        # orbit-seam(modelopt): restore ModelOpt state before sharded-load schema.
+        from megatron.bridge.orbit.training.modelopt_checkpoint import (
             _maybe_restore_modelopt_state_for_sharded_load,
         )
 

@@ -523,8 +523,8 @@ def _apply_peft_transformation(peft, base_model: list[MegatronModule]) -> list[M
     print_rank_0(f"  Frozen percentage: {100 * frozen_params / total_params:.2f}%")
 
     if get_rank_safe() == 0:
-        # sphere-seam(peft): parameter-partition TSV reports live in the sphere package.
-        from megatron.bridge.sphere.training.peft_reports import _write_peft_parameter_reports
+        # orbit-seam(peft): parameter-partition TSV reports live in the orbit package.
+        from megatron.bridge.orbit.training.peft_reports import _write_peft_parameter_reports
 
         report_paths = _write_peft_parameter_reports(model_to_analyze, report_dir="/tmp")
         print_rank_0(f"  Trainable parameter report: {report_paths['trainable']}")

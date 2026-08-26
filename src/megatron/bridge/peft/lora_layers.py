@@ -22,8 +22,8 @@ from megatron.core.transformer.moe.moe_utils import apply_random_logits
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 
-# sphere-seam(quant): INT4-dequant base forward lives in the sphere package.
-from megatron.bridge.sphere.peft_ext.int4_lora_forward import _base_linear_forward_int4
+# orbit-seam(quant): INT4-dequant base forward lives in the orbit package.
+from megatron.bridge.orbit.peft_ext.int4_lora_forward import _base_linear_forward_int4
 from megatron.bridge.utils.import_utils import safe_import
 
 

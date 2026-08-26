@@ -14,7 +14,7 @@
 
 """Compatibility shim for INT4 helpers moved to `models.conversion.low_precision`."""
 
-from megatron.bridge.sphere.low_precision.int4 import (
+from megatron.bridge.orbit.low_precision.int4 import (
     dequantize_int4,
     quantize_to_int4,
 )

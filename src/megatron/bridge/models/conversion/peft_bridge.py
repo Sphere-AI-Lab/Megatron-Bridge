@@ -41,11 +41,11 @@ from megatron.bridge.models.conversion.utils import (
 )
 from megatron.bridge.peft.canonical_lora import ModuleDict
 
-# sphere-seam(oft): OFT export lives in the sphere package; the mixin adds the
+# orbit-seam(oft): OFT export lives in the orbit package; the mixin adds the
 # stream/export methods every bridge inherits.
-from megatron.bridge.sphere.conversion.oft_export import (
+from megatron.bridge.orbit.conversion.oft_export import (
     _CANONICAL_OFT_SLICE_TO_HF_LEAF,
-    SphereOFTExportMixin,
+    OrbitOFTExportMixin,
 )
 from megatron.bridge.peft.lora import LoRAMerge
 from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attributes_from_linear, is_expert_linear
@@ -125,7 +125,7 @@ def _select_hf_base_param_name(base_mapping, adapter_key: Optional[str], expecte
     return None
 
 
-class MegatronPeftBridge(SphereOFTExportMixin):
+class MegatronPeftBridge(OrbitOFTExportMixin):
     """Mixin providing adapter-aware utilities for Megatron model bridges."""
 
     def _get_lora_unwrapped_name(self, megatron_param: str) -> str:
@@ -1198,7 +1198,7 @@ def infer_target_modules_from_adapter_weights(
     inference is unambiguous when both adapter types coexist on disk. When
     ``peft_config`` is omitted, both families are matched.
     """
-    from megatron.bridge.sphere.oft.oft import OFT
+    from megatron.bridge.orbit.oft.oft import OFT
 
     if peft_config is not None and isinstance(peft_config, OFT):
         suffixes = _HF_OFT_SUFFIXES
@@ -1243,7 +1243,7 @@ def build_adapter_config_dict(
     import dataclasses
 
     from megatron.bridge.peft.dora import DoRA
-    from megatron.bridge.sphere.oft.oft import OFT
+    from megatron.bridge.orbit.oft.oft import OFT
 
     # ------------------------------------------------------------------
     # 1. Inherit everything we can from the dataclass.

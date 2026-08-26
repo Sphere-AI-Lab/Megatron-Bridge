@@ -26,7 +26,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from megatron.bridge.sphere.low_precision.int4 import quantize_to_int4
+from megatron.bridge.orbit.low_precision.int4 import quantize_to_int4
 
 
 def should_quantize(key: str) -> bool:

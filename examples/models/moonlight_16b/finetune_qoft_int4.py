@@ -39,12 +39,12 @@ import torch.distributed as dist
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
-from megatron.bridge.sphere.quant.int4_utils import (
+from megatron.bridge.orbit.quant.int4_utils import (
     register_int4_buffers_after_load,
     transform_sharded_state_dict_for_int4,
 )
-from megatron.bridge.sphere.oft.oft import OFT
-from megatron.bridge.sphere.oft.oft_layers import (
+from megatron.bridge.orbit.oft.oft import OFT
+from megatron.bridge.orbit.oft.oft_layers import (
     OFTLinear,
     OFTRotationModule,
     OFTTopKRouter,

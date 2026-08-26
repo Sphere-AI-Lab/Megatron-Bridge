@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from megatron.bridge.models.kimi_vl.kimi_k25_vl_bridge import KimiK25VLBridge
-from megatron.bridge.sphere.model_bridges.kimi_k25_vl_nvfp4_bridge import KimiK25VLNVFP4Bridge
+from megatron.bridge.orbit.model_bridges.kimi_k25_vl_nvfp4_bridge import KimiK25VLNVFP4Bridge
 from megatron.bridge.models.kimi_vl.kimi_k25_vl_provider import KimiK25VLModelProvider
 from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import KimiK25VLModel
 

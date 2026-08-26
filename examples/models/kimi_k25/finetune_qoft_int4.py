@@ -45,13 +45,13 @@ import torch
 import torch.distributed as dist
 
 from megatron.bridge import AutoBridge
-from megatron.bridge.sphere.oft.oft import OFT
+from megatron.bridge.orbit.oft.oft import OFT
 from megatron.bridge.recipes.common import _peft_common
 from megatron.bridge.recipes.kimi.kimi_k2 import _get_kimi_k2_pipeline_layout
 from megatron.bridge.recipes.utils.finetune_utils import default_peft_config
 from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
 from megatron.bridge.training.comm_overlap import CommOverlapConfig
-from megatron.bridge.sphere.quant.int4_utils import (
+from megatron.bridge.orbit.quant.int4_utils import (
     register_int4_buffers_after_load,
     transform_sharded_state_dict_for_int4,
 )

@@ -44,7 +44,7 @@ FP8_WEIGHT_BLOCK_SIZE = 128
 
 
 def make_oft(**kwargs):
-    from megatron.bridge.sphere.oft.oft import OFT
+    from megatron.bridge.orbit.oft.oft import OFT
 
     return OFT(**kwargs)
 
@@ -56,13 +56,13 @@ def build_qwen3_moe_peft_config(peft_scheme):
 
 
 def transform_sharded_state_dict_for_fp8(*args, **kwargs):
-    from megatron.bridge.sphere.quant.fp8_utils import transform_sharded_state_dict_for_fp8 as _impl
+    from megatron.bridge.orbit.quant.fp8_utils import transform_sharded_state_dict_for_fp8 as _impl
 
     return _impl(*args, **kwargs)
 
 
 def register_fp8_scale_inv_buffers_after_load(*args, **kwargs):
-    from megatron.bridge.sphere.quant.fp8_utils import register_fp8_scale_inv_buffers_after_load as _impl
+    from megatron.bridge.orbit.quant.fp8_utils import register_fp8_scale_inv_buffers_after_load as _impl
 
     return _impl(*args, **kwargs)
 

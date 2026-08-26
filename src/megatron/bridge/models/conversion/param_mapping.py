@@ -29,8 +29,8 @@ from megatron.core.utils import (
     get_pg_size,
 )
 
-# sphere-seam(quant): NCCL byte-view workaround lives in the sphere package.
-from megatron.bridge.sphere.conversion.nccl_byte_view import _maybe_byte_view_for_nccl
+# orbit-seam(quant): NCCL byte-view workaround lives in the orbit package.
+from megatron.bridge.orbit.conversion.nccl_byte_view import _maybe_byte_view_for_nccl
 from megatron.bridge.models.conversion.utils import (
     get_module_and_param_from_name,
     is_modelopt_dynamic_module,

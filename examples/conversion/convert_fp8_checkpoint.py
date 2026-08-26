@@ -38,7 +38,7 @@ import sys
 from functools import partial
 
 from megatron.bridge import AutoBridge
-from megatron.bridge.sphere.model_bridges.qwen3_moe_fp8_bridge import Qwen3MoEFP8Bridge
+from megatron.bridge.orbit.model_bridges.qwen3_moe_fp8_bridge import Qwen3MoEFP8Bridge
 
 
 def main():

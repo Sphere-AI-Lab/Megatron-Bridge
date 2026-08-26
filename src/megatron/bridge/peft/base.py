@@ -22,9 +22,9 @@ import torch
 import torch.nn as nn
 from megatron.core.transformer.module import MegatronModule
 
-from megatron.bridge.sphere.oft.param_names import is_peft_adapter_param_name
+from megatron.bridge.orbit.oft.param_names import is_peft_adapter_param_name
 from megatron.bridge.peft.recompute import maybe_enable_recompute_inputs_grad
-from megatron.bridge.sphere.peft_ext.bias_normalization import normalize_disabled_bias_placeholders
+from megatron.bridge.orbit.peft_ext.bias_normalization import normalize_disabled_bias_placeholders
 from megatron.bridge.peft.walk_utils import walk
 
 

@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Compatibility shim package: moved to ``megatron.bridge.sphere.low_precision``.
+"""Compatibility shim package: moved to ``megatron.bridge.orbit.low_precision``.
 
-Submodules alias their sphere counterparts; import from the new path.
+Submodules alias their orbit counterparts; import from the new path.
 """
 
-from megatron.bridge.sphere.low_precision import *  # noqa: F401,F403
+from megatron.bridge.orbit.low_precision import *  # noqa: F401,F403

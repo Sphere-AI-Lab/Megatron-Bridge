@@ -40,18 +40,18 @@ _dc.save = _dc_save_with_mcore
 
 from megatron.core.optimizer import OptimizerConfig
 
-from megatron.bridge.sphere.low_precision.common import (
+from megatron.bridge.orbit.low_precision.common import (
     TensorSpillManager,
     build_single_rank_meta_provider,
     patch_meta_init_for_te_modules,
 )
-from megatron.bridge.sphere.low_precision.nvfp4 import (
+from megatron.bridge.orbit.low_precision.nvfp4 import (
     apply_modelopt_nvfp4_to_meta_model,
     build_nvfp4_direct_model_state_dict,
     collect_nvfp4_target_module_names,
     is_nvfp4_source,
 )
-from megatron.bridge.sphere.model_bridges.kimi_k25_vl_nvfp4_bridge import KimiK25VLNVFP4Bridge
+from megatron.bridge.orbit.model_bridges.kimi_k25_vl_nvfp4_bridge import KimiK25VLNVFP4Bridge
 from megatron.bridge.training.checkpointing import (
     get_checkpoint_name,
     save_checkpoint,

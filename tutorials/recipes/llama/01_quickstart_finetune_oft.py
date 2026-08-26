@@ -50,7 +50,7 @@ import argparse
 import os
 
 from megatron.bridge.models.gpt_provider import local_layer_spec
-from megatron.bridge.sphere.oft.oft import OFT
+from megatron.bridge.orbit.oft.oft import OFT
 from megatron.bridge.recipes.llama import llama32_1b_peft_config
 from megatron.bridge.training.finetune import finetune
 from megatron.bridge.training.gpt_step import forward_step

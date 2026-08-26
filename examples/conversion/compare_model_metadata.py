@@ -8,7 +8,7 @@ from pathlib import Path
 
 from megatron.bridge.models.conversion.auto_bridge import AutoBridge
 from megatron.bridge.training.model_load_save import load_model_config
-from megatron.bridge.sphere.conversion.model_metadata_compare import (
+from megatron.bridge.orbit.conversion.model_metadata_compare import (
     compare_config_fields,
     compare_logical_tensor_summaries,
     compare_tensor_summaries,

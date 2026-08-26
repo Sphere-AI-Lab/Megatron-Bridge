@@ -214,7 +214,7 @@ Generation step 1
 ======== GENERATED TEXT OUTPUT ========
 Image: https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg
 Prompt: Describe this image.
-Generated: This image shows a cozy indoor scene with a wooden table, some books, a cup of coffee, and warm lighting creating a comfortable reading atmosphere.
+Generated: This image shows a cozy indoor scene with a wooden table, some books, a cup of coffee, and warm lighting creating a comfortable reading atmoorbit.
 =======================================
 ```
 
