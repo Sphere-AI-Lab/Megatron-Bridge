@@ -27,8 +27,7 @@ if [[ -n "${CUDNN_HOME:-}" ]]; then
     export LD_LIBRARY_PATH="${CUDNN_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
-# W&B API key (set your key here or run `wandb login` beforehand)
-export WANDB_API_KEY="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"
+# W&B API key: set WANDB_API_KEY in the environment or run wandb login beforehand.
 
 HF_MODEL="${HF_MODEL:-meta-llama/Llama-3.2-1B}"
 MEGATRON_CKPT="${MEGATRON_CKPT:-./checkpoints/Llama-3.2-1B}"

@@ -1,15 +1,19 @@
 #!/bin/bash
 # Moonlight-16B-A3B QOFT finetuning - INT4 base weights + BF16 OFT adapters.
 #
-# Suggested flow:
+# Suggested flow (run from the repository root):
 #   1. Quantize BF16 HF experts to INT4 triplets:
-#        bash test_to_kimi_int4_conversion.sh
+#        bash scripts/orbit/quantize_to_int4.sh \
+#            "${HF_MODEL_ROOT:-${HOME}/hf_models}/Moonlight-16B-A3B" \
+#            "${HF_MODEL_ROOT:-${HOME}/hf_models}/Moonlight-16B-A3B-INT4"
 #   2. Convert HF INT4 checkpoint to Megatron INT4:
-#        bash convert_int4_checkpoint_direct.sh \
-#            ${HF_MODEL_ROOT:-${HOME}/hf_models}/Moonlight-16B-A3B-INT4 \
+#        uv run python examples/conversion/convert_int4_checkpoint_direct.py \
+#            --hf-model-path \
+#            "${HF_MODEL_ROOT:-${HOME}/hf_models}/Moonlight-16B-A3B-INT4" \
+#            --megatron-path \
 #            ./checkpoints/Moonlight-16B-A3B-INT4
 #   3. Finetune with this script:
-#        bash run_qoft_finetune_moonlight_16b_int4.sh
+#        bash scripts/orbit/run_qoft_finetune_moonlight_16b_int4.sh
 #
 # Environment variables:
 #   MEGATRON_CKPT      - Path to INT4 Megatron checkpoint
