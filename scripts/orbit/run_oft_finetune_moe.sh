@@ -32,7 +32,7 @@ if [[ -n "${CUDNN_HOME:-}" ]]; then
 fi
 
 # W&B API key
-# export WANDB_API_KEY="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"
+# W&B API key: set WANDB_API_KEY in the environment or run wandb login beforehand.
 
 # NCCL optimizations
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
