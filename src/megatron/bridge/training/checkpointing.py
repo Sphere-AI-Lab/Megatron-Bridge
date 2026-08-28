@@ -1407,17 +1407,22 @@ def save_checkpoint(
             if model:
                 # cfg.dist can be None during checkpoint conversion (save_megatron_model)
                 if not (cfg.dist and cfg.dist.use_decentralized_pg):
-                    # orbit-seam(modelopt): honor non-nvrx async strategies.
-                    from megatron.bridge.orbit.training.modelopt_checkpoint import (
-                        _save_sharded_modelopt_state_with_async_strategy,
-                    )
+                    # orbit-seam(modelopt): honor explicitly configured non-nvrx
+                    # async strategies; the default path stays on the module-level
+                    # symbol so tests can patch it.
+                    if isinstance(ckpt_cfg.async_strategy, str) and ckpt_cfg.async_strategy != "nvrx":
+                        from megatron.bridge.orbit.training.modelopt_checkpoint import (
+                            _save_sharded_modelopt_state_with_async_strategy,
+                        )
 
-                    _save_sharded_modelopt_state_with_async_strategy(
-                        model,
-                        checkpoint_name,
-                        (ckpt_cfg.ckpt_format, 1),
-                        async_strategy=ckpt_cfg.async_strategy,
-                    )
+                        _save_sharded_modelopt_state_with_async_strategy(
+                            model,
+                            checkpoint_name,
+                            (ckpt_cfg.ckpt_format, 1),
+                            async_strategy=ckpt_cfg.async_strategy,
+                        )
+                    else:
+                        save_sharded_modelopt_state(model, checkpoint_name, (ckpt_cfg.ckpt_format, 1))
             if pending_hf_save_dir is not None and not ckpt_cfg.async_save:
                 _save_hf_weights(state, model, pending_hf_save_dir)
                 pending_hf_save_dir = None

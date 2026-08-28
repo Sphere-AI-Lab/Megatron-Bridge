@@ -881,12 +881,21 @@ def build_oft_adapter_config_dict(
     """
     import dataclasses as _dataclasses
 
+    def _json_sanitize(value):
+        # JSON has no sets/tuples; normalize them anywhere in the tree.
+        if isinstance(value, (set, frozenset)):
+            return sorted(value)
+        if isinstance(value, tuple):
+            return [_json_sanitize(v) for v in value]
+        if isinstance(value, list):
+            return [_json_sanitize(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _json_sanitize(v) for k, v in value.items()}
+        return value
+
     config: Dict[str, object] = {}
     if _dataclasses.is_dataclass(peft_config):
         config.update(_dataclasses.asdict(peft_config))
-        for k, v in list(config.items()):
-            if isinstance(v, (set, frozenset)):
-                config[k] = sorted(v)
 
     config["base_model_name_or_path"] = base_model_name_or_path or ""
     # ``target_modules`` must be the HF-format names (q_proj, gate_proj, ...).
@@ -907,7 +916,7 @@ def build_oft_adapter_config_dict(
     config.setdefault("fan_in_fan_out", False)
     config.setdefault("layers_pattern", None)
     config.setdefault("layers_to_transform", None)
-    return config
+    return _json_sanitize(config)
 
 
 def save_hf_oft_adapter(
