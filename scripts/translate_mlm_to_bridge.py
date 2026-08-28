@@ -39,7 +39,7 @@ Examples:
 
   # Bridge → MLM: recipe + overrides (most common)
   python scripts/translate_mlm_to_bridge.py --reverse \\
-      --recipe llama32_1b_pretrain_config \\
+      --recipe llama32_1b_pretrain_1gpu_h100_bf16_config \\
       --args "train.train_iters=1000 model.tensor_model_parallel_size=2"
 
   # Bridge → MLM: recipe only (all defaults)
@@ -55,6 +55,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib
+import json
+import pkgutil
 import shlex
 import sys
 import textwrap
@@ -126,6 +129,15 @@ ARG_MAP: dict[str, tuple[str, Any]] = {
     "cross-entropy-loss-fusion":         ("model.cross_entropy_loss_fusion",      "flag"),
     "cross-entropy-fusion-impl":         ("model.cross_entropy_fusion_impl",      None),
 
+    # Hybrid / Mamba
+    "hybrid-layer-pattern":              ("model.hybrid_layer_pattern",           None),
+    "hybrid-override-pattern":           (None,                                   "hybrid_override_pattern"),
+    "mamba-state-dim":                   ("model.mamba_state_dim",                None),
+    "mamba-head-dim":                    ("model.mamba_head_dim",                 None),
+    "mamba-num-groups":                  ("model.mamba_num_groups",               None),
+    "mamba-num-heads":                   ("model.mamba_num_heads",                None),
+    "spec":                              (None,                                   "spec"),
+
     # ── MLA (Multi-Latent Attention) ────────────────────────────────────
     "multi-latent-attention":            ("model.multi_latent_attention",         "flag"),
     "q-lora-rank":                       ("model.q_lora_rank",                   None),
@@ -161,6 +173,8 @@ ARG_MAP: dict[str, tuple[str, Any]] = {
     # ── MTP ─────────────────────────────────────────────────────────────
     "mtp-num-layers":                    ("model.mtp_num_layers",                None),
     "mtp-loss-scaling-factor":           ("model.mtp_loss_scaling_factor",       None),
+    "mtp-use-repeated-layer":            ("model.mtp_use_repeated_layer",         "flag"),
+    "mtp-hybrid-override-pattern":       ("model.mtp_hybrid_override_pattern",    None),
 
     # ── Parallelism ─────────────────────────────────────────────────────
     "tensor-model-parallel-size":        ("model.tensor_model_parallel_size",    None),
@@ -184,7 +198,7 @@ ARG_MAP: dict[str, tuple[str, Any]] = {
     "skip-train":                        ("train.skip_train",                    "flag"),
     "manual-gc":                         ("train.manual_gc",                     "flag"),
     "manual-gc-interval":                ("train.manual_gc_interval",            None),
-    "seq-length":                        ("dataset.sequence_length",             "seq_length"),
+    "seq-length":                        ("dataset.seq_length",                  "seq_length"),
     "dataloader-type":                   ("dataset.dataloader_type",             None),
     "num-dataset-builder-threads":       ("dataset.num_dataset_builder_threads", None),
 
@@ -234,6 +248,7 @@ ARG_MAP: dict[str, tuple[str, Any]] = {
     "tokenizer-model":                   ("tokenizer.tokenizer_model",          None),
     "vocab-file":                        ("tokenizer.vocab_file",               None),
     "merge-file":                        ("tokenizer.merge_file",               None),
+    "sft-tokenizer-prompt-format":       (None,                                 "sft_prompt_format"),
 
     # ── Validation ──────────────────────────────────────────────────────
     "eval-iters":                        ("validation.eval_iters",              None),
@@ -367,7 +382,7 @@ def _try_parse_value(val: str) -> Any:
     return _try_numeric(val)
 
 
-def parse_yaml_config(path: str) -> tuple[dict[str, Any], dict[str, str]]:
+def parse_yaml_config(path: str) -> tuple[dict[str, Any], dict[str, str | int | float | bool]]:
     """Parse a Megatron-LM style YAML into a flat arg dict.
 
     Expected YAML structure:
@@ -385,7 +400,7 @@ def parse_yaml_config(path: str) -> tuple[dict[str, Any], dict[str, str]]:
         data = yaml.safe_load(f)
 
     model_args = data.get("MODEL_ARGS", data)
-    env_vars = data.get("ENV_VARS", {})
+    env_vars = data.get("ENV_VARS") or {}
 
     parsed: dict[str, Any] = {}
     for key, val in model_args.items():
@@ -401,7 +416,7 @@ def parse_yaml_config(path: str) -> tuple[dict[str, Any], dict[str, str]]:
     return parsed, env_vars
 
 
-def parse_raw_args(args_str: str) -> tuple[dict[str, Any], dict[str, str]]:
+def parse_raw_args(args_str: str) -> tuple[dict[str, Any], dict[str, str | int | float | bool]]:
     """Parse a raw MLM CLI string into a flat arg dict."""
     tokens = shlex.split(args_str)
     parsed: dict[str, Any] = {}
@@ -445,9 +460,10 @@ class TranslationResult:
         self.skipped: list[tuple[str, Any]] = []
         self.unknown: list[tuple[str, Any]] = []
         self.notes: list[str] = []
-        self.env_vars: dict[str, str] = {}
+        self.env_vars: dict[str, str | int | float | bool] = {}
         self.uses_mla = False
         self.uses_moe = False
+        self.uses_hybrid = False
         self.raw_args: dict[str, Any] = {}
 
     def add_override(self, path: str, value: Any):
@@ -457,17 +473,36 @@ class TranslationResult:
         self.notes.append(note)
 
 
-def translate(args: dict[str, Any], env_vars: dict[str, str] | None = None) -> TranslationResult:
+def translate(args: dict[str, Any], env_vars: dict[str, str | int | float | bool] | None = None) -> TranslationResult:
     """Translate parsed MLM args into Bridge overrides."""
+    if args.get("hybrid-layer-pattern") is not None and args.get("hybrid-override-pattern") is not None:
+        raise ValueError("--hybrid-layer-pattern and deprecated --hybrid-override-pattern cannot both be specified")
+
     result = TranslationResult()
     result.raw_args = args
     result.env_vars = env_vars or {}
 
-    # Detect MLA / MoE usage
+    # Detect MLA / MoE / Hybrid usage
     result.uses_mla = "multi-latent-attention" in args
     result.uses_moe = "num-experts" in args
+    hybrid_spec = args.get("spec")
+    if isinstance(hybrid_spec, str):
+        hybrid_spec_parts = [hybrid_spec]
+    elif isinstance(hybrid_spec, (list, tuple)):
+        hybrid_spec_parts = [str(part) for part in hybrid_spec]
+    else:
+        hybrid_spec_parts = []
+    result.uses_hybrid = any(
+        name in args and args[name] is not None
+        for name in ("hybrid-layer-pattern", "hybrid-override-pattern", "mtp-hybrid-override-pattern")
+    ) or any(
+        module.startswith(("megatron.core.models.hybrid.", "megatron.core.models.mamba."))
+        for module in hybrid_spec_parts
+    )
 
-    if result.uses_mla:
+    if result.uses_hybrid:
+        result.add_note("Hybrid model detected: use HybridModelProvider and review the translated stack specification")
+    elif result.uses_mla:
         result.add_note("MLA detected: use MLAModelProvider instead of GPTModelProvider in recipe")
     if result.uses_moe:
         result.add_note(
@@ -504,7 +539,7 @@ def translate(args: dict[str, Any], env_vars: dict[str, str] | None = None) -> T
                 split_str = str(arg_val)
             result.add_override(bridge_path, split_str)
         elif transform == "seq_length":
-            result.add_override("dataset.sequence_length", arg_val)
+            result.add_override("dataset.seq_length", arg_val)
             result.add_override("model.seq_length", arg_val)
         elif transform == "vpp_from_layers":
             layers_per_vpp_stage = int(arg_val)
@@ -521,6 +556,19 @@ def translate(args: dict[str, Any], env_vars: dict[str, str] | None = None) -> T
                 result.add_override(bridge_path, vpp)
             else:
                 result.unknown.append((arg_name, arg_val))
+        elif transform == "hybrid_override_pattern":
+            result.add_override("model.hybrid_layer_pattern", arg_val)
+            result.add_note("hybrid-override-pattern is deprecated; translated to model.hybrid_layer_pattern")
+        elif transform == "spec":
+            result.skipped.append((arg_name, arg_val))
+            result.add_note(
+                "MLM --spec is not copied as an import target; verify the HybridModelProvider stack spec in trusted code"
+            )
+        elif transform == "sft_prompt_format":
+            if args.get("tokenizer-type") == "SFTTokenizer":
+                result.add_override("tokenizer.tokenizer_prompt_format", arg_val)
+            else:
+                result.skipped.append((arg_name, arg_val))
         elif transform == "skip" or bridge_path is None:
             result.skipped.append((arg_name, arg_val))
         elif transform == "flag":
@@ -531,6 +579,18 @@ def translate(args: dict[str, Any], env_vars: dict[str, str] | None = None) -> T
             result.add_override(bridge_path, arg_val)
         else:
             result.add_override(bridge_path, arg_val)
+
+    # MLM gives an already-unified Hybrid pattern precedence over the deprecated
+    # standalone MTP pattern. Avoid passing both to HybridModelProvider, whose
+    # legacy normalization would otherwise replace the unified MTP suffix.
+    hybrid_pattern = result.overrides.get("model.hybrid_layer_pattern")
+    mtp_override_key = "model.mtp_hybrid_override_pattern"
+    if isinstance(hybrid_pattern, str) and "/" in hybrid_pattern and mtp_override_key in result.overrides:
+        mtp_override = result.overrides.pop(mtp_override_key)
+        result.skipped.append(("mtp-hybrid-override-pattern", mtp_override))
+        result.add_note(
+            "mtp-hybrid-override-pattern ignored because hybrid-layer-pattern already contains unified MTP sections"
+        )
 
     # Handle bf16/fp16 → mixed_precision string
     if "mixed_precision._bf16" in result.overrides:
@@ -593,6 +653,11 @@ def emit_overrides(result: TranslationResult) -> str:
             lines.append(f"# NOTE: {note}")
         lines.append("#")
 
+    if result.env_vars:
+        env_vars_override = ",".join(f"{name}:{json.dumps(value)}" for name, value in result.env_vars.items())
+        lines.append("\n# ── Environment Variables ─────────────────────────────")
+        lines.append(f"  '++env_vars={{{env_vars_override}}}' \\")
+
     # Group overrides by section
     sections: dict[str, list[tuple[str, Any]]] = OrderedDict()
     for path, val in result.overrides.items():
@@ -625,9 +690,9 @@ def emit_overrides(result: TranslationResult) -> str:
             lines.append(f"#   --{arg_name} {arg_val}")
 
     if result.skipped:
-        lines.append("\n# ── Skipped args (not needed in Bridge) ───────────────")
+        lines.append("\n# ── Skipped args (review manually) ───────────────────")
         for arg_name, arg_val in result.skipped:
-            lines.append(f"#   --{arg_name}")
+            lines.append(f"#   --{arg_name} {arg_val}")
 
     return "\n".join(lines)
 
@@ -635,8 +700,22 @@ def emit_overrides(result: TranslationResult) -> str:
 def emit_recipe(result: TranslationResult, recipe_name: str = "custom_model") -> str:
     """Generate a standalone Bridge recipe Python file."""
     uses_mla = result.uses_mla
-    provider_cls = "MLAModelProvider" if uses_mla else "GPTModelProvider"
-    provider_import_path = "megatron.bridge.models.mla_provider" if uses_mla else "megatron.bridge.models.gpt_provider"
+    uses_hybrid = result.uses_hybrid
+    if uses_hybrid and "model.hybrid_layer_pattern" not in result.overrides:
+        raise ValueError(
+            "Cannot emit a standalone Hybrid recipe without --hybrid-layer-pattern or "
+            "--hybrid-override-pattern; saved --spec values are intentionally not imported"
+        )
+
+    if uses_hybrid:
+        provider_cls = "HybridModelProvider"
+        provider_import_path = "megatron.bridge.models.hybrid"
+    elif uses_mla:
+        provider_cls = "MLAModelProvider"
+        provider_import_path = "megatron.bridge.models.mla_provider"
+    else:
+        provider_cls = "GPTModelProvider"
+        provider_import_path = "megatron.bridge.models.gpt_provider"
 
     # Separate model vs other overrides
     model_fields: dict[str, Any] = {}
@@ -743,6 +822,7 @@ def emit_recipe(result: TranslationResult, recipe_name: str = "custom_model") ->
     # Tokenizer
     tok_type = tokenizer_fields.get("tokenizer_type", "HuggingFaceTokenizer")
     tok_model = tokenizer_fields.get("tokenizer_model", None)
+    rng_seed = misc_overrides.get("rng.seed", 1234)
 
     # Build recipe file content
     lines = []
@@ -788,6 +868,8 @@ def emit_recipe(result: TranslationResult, recipe_name: str = "custom_model") ->
     lines.append(f"    context_parallelism: int = {model_fields.get('context_parallel_size', 1)},")
     if result.uses_moe:
         lines.append(f"    expert_parallelism: int = {model_fields.get('expert_model_parallel_size', 1)},")
+    if "expert_tensor_parallel_size" in model_fields:
+        lines.append(f"    expert_tensor_parallelism: int = {model_fields.get('expert_tensor_parallel_size', 1)},")
     lines.append(f"    sequence_parallelism: bool = {model_fields.get('sequence_parallel', False)},")
     lines.append(f") -> {provider_cls}:")
     lines.append(f'    """Configure the {recipe_name} model."""')
@@ -817,6 +899,8 @@ def emit_recipe(result: TranslationResult, recipe_name: str = "custom_model") ->
     lines.append("        context_parallel_size=context_parallelism,")
     if result.uses_moe:
         lines.append("        expert_model_parallel_size=expert_parallelism,")
+    if "expert_tensor_parallel_size" in model_fields:
+        lines.append("        expert_tensor_parallel_size=expert_tensor_parallelism,")
     lines.append("        sequence_parallel=sequence_parallelism,")
     vpp = model_fields.get("virtual_pipeline_model_parallel_size")
     if vpp:
@@ -876,6 +960,7 @@ def emit_recipe(result: TranslationResult, recipe_name: str = "custom_model") ->
     # Dataset blend
     seq_len = dataset_fields.get("seq_length", 4096)
     lines.append("    cfg = ConfigContainer(")
+    lines.append(f"        env_vars={result.env_vars!r},")
     lines.append("        model=model_config(),")
     lines.append("        train=TrainingConfig(")
     for k in [
@@ -917,7 +1002,7 @@ def emit_recipe(result: TranslationResult, recipe_name: str = "custom_model") ->
 
     # Dataset
     lines.append("        dataset=GPTDatasetConfig(")
-    lines.append("            random_seed=1234,")
+    lines.append(f"            random_seed={_fmt_val(rng_seed)},")
     ds_defaults = {
         "reset_attention_mask": False,
         "reset_position_ids": False,
@@ -929,11 +1014,11 @@ def emit_recipe(result: TranslationResult, recipe_name: str = "custom_model") ->
     ds_merged = {**ds_defaults}
     for k, v in dataset_fields.items():
         if k == "seq_length":
-            ds_merged["sequence_length"] = v
+            ds_merged["seq_length"] = v
         else:
             ds_merged[k] = v
-    if "sequence_length" not in ds_merged:
-        ds_merged["sequence_length"] = seq_len
+    if "seq_length" not in ds_merged:
+        ds_merged["seq_length"] = seq_len
     for k, v in ds_merged.items():
         lines.append(f"            {k}={_fmt_val(v)},")
     lines.append("            skip_getting_attention_mask_from_dataset=True,")
@@ -964,6 +1049,10 @@ def emit_recipe(result: TranslationResult, recipe_name: str = "custom_model") ->
     lines.append(f"            tokenizer_type={repr(tok_type)},")
     if tok_model:
         lines.append(f"            tokenizer_model={repr(tok_model)},")
+    for k, v in tokenizer_fields.items():
+        if k in {"tokenizer_type", "tokenizer_model"}:
+            continue
+        lines.append(f"            {k}={_fmt_val(v)},")
     lines.append("        ),")
 
     # Checkpoint
@@ -984,7 +1073,7 @@ def emit_recipe(result: TranslationResult, recipe_name: str = "custom_model") ->
         lines.append(f"            {k}={_fmt_val(v)},")
     lines.append("        ),")
 
-    lines.append("        rng=RNGConfig(seed=1234),")
+    lines.append(f"        rng=RNGConfig(seed={_fmt_val(rng_seed)}),")
 
     # Mixed precision
     mp = mixed_precision_str or "bf16_mixed"
@@ -1269,13 +1358,29 @@ def _load_recipe_to_flat_dict(recipe_name: str) -> dict[str, Any]:
     except ImportError:
         _act_to_str = None
 
-    if not hasattr(recipes, recipe_name):
+    recipe_builder = getattr(recipes, recipe_name, None)
+    if recipe_builder is None:
+        for module_info in pkgutil.iter_modules(recipes.__path__):
+            if not module_info.ispkg or module_info.name.startswith("_") or module_info.name == "utils":
+                continue
+            try:
+                h100_module_name = f"{recipes.__name__}.{module_info.name}.h100"
+                h100_module = importlib.import_module(h100_module_name)
+            except ModuleNotFoundError as exc:
+                if exc.name != h100_module_name:
+                    raise
+                continue
+            recipe_builder = getattr(h100_module, recipe_name, None)
+            if recipe_builder is not None:
+                break
+
+    if recipe_builder is None:
         available = [n for n in dir(recipes) if "config" in n]
         raise ValueError(
             f"Recipe '{recipe_name}' not found in megatron.bridge.recipes.\nAvailable (sample): {available[:20]}"
         )
 
-    cfg = getattr(recipes, recipe_name)()
+    cfg = recipe_builder()
 
     def _flatten(obj: Any, prefix: str = "") -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -1490,11 +1595,11 @@ def translate_bridge_to_mlm(overrides: dict[str, Any]) -> ReverseTranslationResu
         consumed.add("model.cuda_graph_impl")
         result.add_arg("cuda-graph-impl", cuda_impl)
 
-    # --- Special: model.seq_length / dataset.sequence_length → --seq-length
-    seq_len = overrides.get("model.seq_length", overrides.get("dataset.sequence_length"))
+    # --- Special: model.seq_length / dataset.seq_length → --seq-length
+    seq_len = overrides.get("model.seq_length", overrides.get("dataset.seq_length"))
     if seq_len is not None:
         consumed.add("model.seq_length")
-        consumed.add("dataset.sequence_length")
+        consumed.add("dataset.seq_length")
         result.add_arg("seq-length", seq_len)
 
     # --- Special: model.max_position_embeddings → --max-position-embeddings
@@ -1506,6 +1611,16 @@ def translate_bridge_to_mlm(overrides: dict[str, Any]) -> ReverseTranslationResu
     elif seq_len is not None:
         result.add_arg("max-position-embeddings", seq_len)
         result.add_note("max-position-embeddings not set; defaulting to seq-length for MLM assert")
+
+    # --- Special: shared Bridge prompt field → SFT-only MLM flag --------
+    prompt_format_key = "tokenizer.tokenizer_prompt_format"
+    if prompt_format_key in overrides:
+        prompt_format = overrides[prompt_format_key]
+        consumed.add(prompt_format_key)
+        if overrides.get("tokenizer.tokenizer_type") == "SFTTokenizer" and prompt_format is not None:
+            result.add_arg("sft-tokenizer-prompt-format", prompt_format)
+        else:
+            result.skipped.append((prompt_format_key, prompt_format))
 
     # --- Main loop -------------------------------------------------------
     for bridge_key, val in overrides.items():
@@ -1630,8 +1745,8 @@ def main():
           python scripts/translate_mlm_to_bridge.py --yaml DeepSeek-V3.yaml --emit recipe --recipe-name deepseek_v3
 
         Examples (Bridge → MLM, --reverse):
-          python scripts/translate_mlm_to_bridge.py --reverse --recipe llama32_1b_pretrain_config
-          python scripts/translate_mlm_to_bridge.py --reverse --recipe llama32_1b_pretrain_config \\
+          python scripts/translate_mlm_to_bridge.py --reverse --recipe llama32_1b_pretrain_1gpu_h100_bf16_config
+          python scripts/translate_mlm_to_bridge.py --reverse --recipe llama32_1b_pretrain_1gpu_h100_bf16_config \\
               --args "train.train_iters=1000 model.tensor_model_parallel_size=2"
           python scripts/translate_mlm_to_bridge.py --reverse --args "model.num_layers=32 model.hidden_size=4096"
         """),
@@ -1641,7 +1756,7 @@ def main():
     parser.add_argument(
         "--recipe",
         type=str,
-        help="Bridge recipe name for --reverse (e.g., llama32_1b_pretrain_config). "
+        help="Bridge recipe name for --reverse (e.g., llama32_1b_pretrain_1gpu_h100_bf16_config). "
         "Loads recipe defaults; combine with --args to add overrides on top.",
     )
 

@@ -33,17 +33,24 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer, GenerationConfig
 from vlm_generate_utils import (
     pad_input_ids_to_tp_multiple,
     patch_kimi_vision_processor,
     process_image_inputs,
+    process_multi_image_inputs,
+    process_video_inputs,
     to_cuda,
 )
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
-from megatron.bridge.utils.common_utils import get_last_rank, print_rank_0, print_rank_last
+from megatron.bridge.utils.common_utils import (
+    get_last_rank,
+    maybe_initialize_distributed,
+    print_rank_0,
+    print_rank_last,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +71,9 @@ class SingleBatchIterator:
         image_grid_thw=None,
         image_sizes=None,
         mm_token_type_ids=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+        image_position_ids=None,
     ):
         self.batch = dict(
             tokens=input_ids,
@@ -78,6 +88,12 @@ class SingleBatchIterator:
             self.batch["image_sizes"] = image_sizes
         if mm_token_type_ids is not None:
             self.batch["mm_token_type_ids"] = mm_token_type_ids
+        if pixel_values_videos is not None:
+            self.batch["pixel_values_videos"] = pixel_values_videos
+        if video_grid_thw is not None:
+            self.batch["video_grid_thw"] = video_grid_thw
+        if image_position_ids is not None:
+            self.batch["image_position_ids"] = image_position_ids
         self._yielded = False
 
     def __iter__(self):
@@ -98,7 +114,15 @@ def vlm_forward_step(data_iterator, model, **kwargs) -> torch.Tensor:
         "position_ids": batch["position_ids"],
         "attention_mask": batch.get("attention_mask"),
     }
-    for key in ("pixel_values", "image_grid_thw", "image_sizes", "mm_token_type_ids"):
+    for key in (
+        "pixel_values",
+        "image_grid_thw",
+        "image_sizes",
+        "mm_token_type_ids",
+        "pixel_values_videos",
+        "video_grid_thw",
+        "image_position_ids",
+    ):
         if key in batch:
             forward_args[key] = batch[key]
 
@@ -118,8 +142,27 @@ def vlm_forward_step(data_iterator, model, **kwargs) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _hf_revision_kwargs(revision: str | None) -> dict[str, str]:
+    """Build keyword arguments for revision-pinned Hugging Face loads."""
+    return {"revision": revision} if revision is not None else {}
+
+
+def _gather_last_token_logits(output: torch.Tensor, real_seq_len: int) -> torch.Tensor:
+    """Gather only the last real token's tensor-parallel vocabulary shards."""
+    local_logits = output[:, real_seq_len - 1]
+    world_size = parallel_state.get_tensor_model_parallel_world_size()
+    gathered_logits = [torch.zeros_like(local_logits) for _ in range(world_size)]
+    dist.all_gather(
+        gathered_logits,
+        local_logits,
+        group=parallel_state.get_tensor_model_parallel_group(),
+    )
+    return torch.cat(gathered_logits, dim=-1)
+
+
 def main(args) -> None:
     """Run VLM inference with HuggingFace or Megatron checkpoints."""
+    maybe_initialize_distributed()
     tp = args.tp
     pp = args.pp
     ep = args.ep
@@ -131,17 +174,28 @@ def main(args) -> None:
     )
 
     # Detect model family for processor-specific handling
-    config = AutoConfig.from_pretrained(args.hf_model_path, trust_remote_code=trust_remote)
+    config = AutoConfig.from_pretrained(
+        args.hf_model_path,
+        trust_remote_code=trust_remote,
+        **_hf_revision_kwargs(args.hf_revision),
+    )
     model_type = getattr(config, "model_type", "")
     is_kimi = "kimi" in model_type
     image_token_id = getattr(config, "image_token_id", None)
     if is_kimi and image_token_id is None:
         image_token_id = 163605
+    is_gemma4 = "gemma4" in model_type
+    is_minimax = model_type == "minimax_m3_vl"
+    is_mistral3 = model_type == "mistral3"
 
     # ------------------------------------------------------------------
     # Load model
     # ------------------------------------------------------------------
-    bridge = AutoBridge.from_hf_pretrained(args.hf_model_path, trust_remote_code=trust_remote)
+    bridge = AutoBridge.from_hf_pretrained(
+        args.hf_model_path,
+        trust_remote_code=trust_remote,
+        **_hf_revision_kwargs(args.hf_revision),
+    )
 
     if args.megatron_model_path:
         print_rank_0(f"Loading Megatron model from: {args.megatron_model_path}")
@@ -164,6 +218,9 @@ def main(args) -> None:
             "expert_tensor_parallel_size": etp,
             "pipeline_dtype": torch.bfloat16,
         }
+        mp_overrides["params_dtype"] = mp_overrides["pipeline_dtype"]
+        mp_overrides["bf16"] = mp_overrides["pipeline_dtype"] == torch.bfloat16
+        mp_overrides["fp16"] = mp_overrides["pipeline_dtype"] == torch.float16
         if args.pp_layout:
             mp_overrides["pipeline_model_parallel_layout"] = args.pp_layout
         model = bridge.load_megatron_model(
@@ -200,10 +257,18 @@ def main(args) -> None:
     # ------------------------------------------------------------------
     # Tokenizer & processor
     # ------------------------------------------------------------------
-    tokenizer = AutoTokenizer.from_pretrained(args.hf_model_path, trust_remote_code=trust_remote)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.hf_model_path,
+        trust_remote_code=trust_remote,
+        **_hf_revision_kwargs(args.hf_revision),
+    )
     if is_kimi:
         patch_kimi_vision_processor(args.hf_model_path)
-    processor = AutoProcessor.from_pretrained(args.hf_model_path, trust_remote_code=trust_remote)
+    processor = AutoProcessor.from_pretrained(
+        args.hf_model_path,
+        trust_remote_code=trust_remote,
+        **_hf_revision_kwargs(args.hf_revision),
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     pad_token_id = tokenizer.pad_token_id or 0
@@ -211,25 +276,63 @@ def main(args) -> None:
     # ------------------------------------------------------------------
     # Process inputs
     # ------------------------------------------------------------------
-    input_ids_raw, pixel_values, image_grid_thw, image_sizes, mm_token_type_ids = process_image_inputs(
-        processor,
-        args.image_path,
-        args.prompt,
-        is_kimi=is_kimi,
-        image_token_id=image_token_id,
-    )
+    pixel_values = image_grid_thw = image_sizes = mm_token_type_ids = image_position_ids = None
+    pixel_values_videos = video_grid_thw = None
 
+    if args.video_path:
+        input_ids_raw, pixel_values_videos, video_grid_thw = process_video_inputs(
+            processor, args.video_path, args.prompt, fps=args.video_fps
+        )
+    elif args.image_paths:
+        input_ids_raw, pixel_values, image_grid_thw = process_multi_image_inputs(
+            processor, args.image_paths, args.prompt
+        )
+    else:
+        (
+            input_ids_raw,
+            pixel_values,
+            image_grid_thw,
+            image_sizes,
+            mm_token_type_ids,
+            image_position_ids,
+        ) = process_image_inputs(
+            processor,
+            args.image_path,
+            args.prompt,
+            is_gemma4=is_gemma4,
+            is_kimi=is_kimi,
+            is_minimax=is_minimax,
+            is_mistral3=is_mistral3,
+            image_token_id=image_token_id,
+        )
+
+    prompt_length = input_ids_raw.size(1)
     input_ids_raw = input_ids_raw.cuda()
     pixel_values = to_cuda(pixel_values)
     image_grid_thw = to_cuda(image_grid_thw)
     image_sizes = to_cuda(image_sizes)
     mm_token_type_ids = to_cuda(mm_token_type_ids)
+    pixel_values_videos = to_cuda(pixel_values_videos)
+    video_grid_thw = to_cuda(video_grid_thw)
+    image_position_ids = to_cuda(image_position_ids)
 
     # ------------------------------------------------------------------
     # Greedy generation loop
     # ------------------------------------------------------------------
     generated_ids = input_ids_raw.clone()
-    stop_tokens = [tokenizer.eos_token_id]
+    try:
+        generation_config = GenerationConfig.from_pretrained(
+            args.hf_model_path,
+            **_hf_revision_kwargs(args.hf_revision),
+        )
+    except OSError:
+        generation_config = GenerationConfig.from_model_config(config)
+    stop_token_ids = generation_config.eos_token_id
+    if stop_token_ids is None:
+        stop_token_ids = [tokenizer.eos_token_id]
+    elif isinstance(stop_token_ids, int):
+        stop_token_ids = [stop_token_ids]
+    stop_tokens = set(stop_token_ids)
 
     for step in range(args.max_new_tokens):
         with torch.no_grad():
@@ -250,7 +353,16 @@ def main(args) -> None:
 
             fwd_bwd_function = get_forward_backward_func()
             iterator = SingleBatchIterator(
-                input_ids, position_ids, None, pixel_values, image_grid_thw, image_sizes, mm_ids_padded
+                input_ids,
+                position_ids,
+                None,
+                pixel_values,
+                image_grid_thw,
+                image_sizes,
+                mm_ids_padded,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+                image_position_ids=image_position_ids,
             )
 
             output = fwd_bwd_function(
@@ -267,26 +379,22 @@ def main(args) -> None:
                 output = output[0]
 
             if parallel_state.is_pipeline_last_stage():
-                world_size = parallel_state.get_tensor_model_parallel_world_size()
-                gathered_tensors = [torch.zeros_like(output) for _ in range(world_size)]
-                dist.all_gather(gathered_tensors, output, group=parallel_state.get_tensor_model_parallel_group())
-                output = torch.cat(gathered_tensors, dim=2)
-
-                last_pos = real_seq_len - 1
-                next_token_ids = torch.argmax(output[:, last_pos], dim=-1, keepdim=True)
+                last_token_logits = _gather_last_token_logits(output, real_seq_len)
+                del output
+                next_token_ids = torch.argmax(last_token_logits, dim=-1, keepdim=True)
 
                 if step < 5:
                     print_rank_last(
-                        f"Step {step}: output shape={output.shape}, "
-                        f"real_seq_len={real_seq_len}, var={output.var():.4f}"
+                        f"Step {step}: last-token logits shape={last_token_logits.shape}, "
+                        f"real_seq_len={real_seq_len}, last-token var={last_token_logits.var():.4f}"
                     )
-                    logits = output[0, last_pos, :]
-                    top5_vals, top5_ids = torch.topk(logits, 5)
+                    top5_vals, top5_ids = torch.topk(last_token_logits[0], 5)
                     top5_tokens = [tokenizer.decode([idx]) for idx in top5_ids]
                     print_rank_last(f"Top 5: {list(zip(top5_tokens, top5_vals.tolist()))}")
                     print_rank_last(
                         f"Selected: '{tokenizer.decode([next_token_ids.item()])}' (id={next_token_ids.item()})"
                     )
+                del last_token_logits
             else:
                 next_token_ids = torch.ones((1, 1), device=generated_ids.device, dtype=generated_ids.dtype)
 
@@ -302,17 +410,25 @@ def main(args) -> None:
                 break
 
     generated_text = tokenizer.decode(list(generated_ids[0]))
+    completion = tokenizer.decode(generated_ids[0, prompt_length:].tolist(), skip_special_tokens=True)
     print_rank_0("======== GENERATED TEXT OUTPUT ========")
     if args.image_path:
         print_rank_0(f"Image: {args.image_path}")
     print_rank_0(f"Prompt: {args.prompt}")
     print_rank_0(f"Generated: {generated_text}")
+    print_rank_0(f"Completion: {completion}")
     print_rank_0("=======================================")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VLM Generation from HuggingFace Models")
     parser.add_argument("--hf_model_path", type=str, required=True, help="Path to the HuggingFace VL model.")
+    parser.add_argument(
+        "--hf-revision",
+        dest="hf_revision",
+        default=None,
+        help="Hugging Face revision for reproducible model and processor loading.",
+    )
     parser.add_argument("--prompt", type=str, default="Describe this image.", help="Input prompt.")
     parser.add_argument("--max_new_tokens", type=int, default=20, help="Maximum number of new tokens to generate.")
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallelism size")
@@ -323,10 +439,20 @@ if __name__ == "__main__":
         "--pp_layout", type=str, default=None, help="Pipeline model parallel layout (e.g. 'Et*15|t*15|t*16|t*15L')"
     )
     parser.add_argument("--megatron_model_path", type=str, default=None, help="Path to Megatron model checkpoint")
-    parser.add_argument("--image_path", type=str, default=None, help="Path or URL to image (optional).")
+    parser.add_argument("--image_path", type=str, default=None, help="Path or URL to a single image (optional).")
+    parser.add_argument(
+        "--image_paths",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Paths to N image files in order (multi-image; Qwen-family only).",
+    )
+    parser.add_argument("--video_path", type=str, default=None, help="Path to a video file (Qwen-family only).")
+    parser.add_argument(
+        "--video_fps", type=float, default=2.0, help="Frames per second to sample from the video (default: 2.0)."
+    )
     parser.add_argument("--trust_remote_code", action="store_true", help="Trust remote code for HF model loading")
     args = parser.parse_args()
-
     main(args)
 
     if torch.distributed.is_initialized():

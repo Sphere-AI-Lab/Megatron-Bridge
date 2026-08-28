@@ -22,9 +22,8 @@ import torch
 import torch.nn as nn
 from megatron.core.transformer.module import MegatronModule
 
-from megatron.bridge.orbit.oft.param_names import is_peft_adapter_param_name
+from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.recompute import maybe_enable_recompute_inputs_grad
-from megatron.bridge.orbit.peft_ext.bias_normalization import normalize_disabled_bias_placeholders
 from megatron.bridge.peft.walk_utils import walk
 
 
@@ -97,7 +96,21 @@ class PEFT(ABC):
         Returns:
             The same type as the input model, transformed with PEFT applied.
         """
-        self._walk_model(model, normalize_disabled_bias_placeholders)
+        if isinstance(self, ModuleMatcher):
+            # Rebuild alias/match bookkeeping from the *current* target_modules so that
+            # any post-construction mutation (common in recipes) is respected. Then walk
+            # the model once to record which aliases matched and warn on typos.
+            self._init_target_match_state()
+
+            def _validate_only(
+                module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None
+            ) -> nn.Module:
+                self.match(module, name, prefix)
+                return module
+
+            self._walk_model(model, _validate_only)
+            self._validate_target_matches()
+            self._reset_target_match_state()
 
         self.freeze_model(model, training=training)
 
@@ -232,4 +245,4 @@ class PEFT(ABC):
             return key[1].requires_grad
 
         # Handle regular string keys
-        return key in self.params_to_save or is_peft_adapter_param_name(key)
+        return key in self.params_to_save or ".adapter." in key or key.endswith(".adapters")

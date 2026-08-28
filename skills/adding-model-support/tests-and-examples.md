@@ -11,7 +11,7 @@ Mock the HF config and pretrained model, then verify `provider_bridge()` and `ma
 ```python
 import pytest
 from unittest.mock import Mock
-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM  # or .causal_lm
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 def _make_mock_config():
     """Create a mock HF config with model-specific attributes."""
@@ -32,7 +32,7 @@ def _make_mock_config():
     return config
 
 def _make_mock_pretrained(config):
-    pretrained = Mock(spec=PreTrainedVLM)  # or PreTrainedCausalLM
+    pretrained = Mock(spec=PreTrainedCausalLM)
     pretrained.config = config
     return pretrained
 
@@ -115,7 +115,7 @@ class TestMyMoEBridge:
 
 ## Functional Tests
 
-Location: `tests/functional_tests/models/<model>/`
+Location: `tests/functional_tests/test_groups/models/<model>/`
 
 ### Conversion Functional Test
 
@@ -214,21 +214,25 @@ Example scripts target **real published models** (e.g. `Qwen/Qwen3-8B`), not toy
 The inference script must produce reasonable output — a coherent text completion for LLMs,
 a plausible image description for VLMs. This is the acceptance bar for the deliverable.
 
-### Conversion example (`examples/models/<type>/<model>/conversion.sh`)
+### Conversion example (`examples/models/<family>/<model>/README.md`)
+
+Document real-model import and export with the stable conversion CLI. Use the GPU backend when
+the model requires distributed conversion; omit the execution and device flags for local CPU
+conversion. Add a model-specific shell wrapper only when the shared CLI cannot express required
+model preparation or verification.
 
 ```bash
-#!/usr/bin/env bash
-set -e
-
 WORKSPACE=${WORKSPACE:-/workspace}
 MODEL_NAME=<default-model-name>
 HF_MODEL=<org>/${MODEL_NAME}
 TP=1; PP=8; EP=1  # Adjust per model
 
 # Import HF → Megatron
-uv run python examples/conversion/convert_checkpoints.py import \
+./scripts/conversion/convert.sh import \
+    --executor local --device gpu --gpus-per-node 8 \
     --hf-model ${HF_MODEL} \
     --megatron-path ${WORKSPACE}/${MODEL_NAME} \
+    --tp ${TP} --pp ${PP} --ep ${EP} \
     --torch-dtype bfloat16
 
 # Compare logits
@@ -240,10 +244,12 @@ uv run python -m torch.distributed.run --nproc_per_node=8 \
     --tp ${TP} --pp ${PP} --ep ${EP}
 
 # Export Megatron → HF
-uv run python examples/conversion/convert_checkpoints.py export \
+./scripts/conversion/convert.sh export \
+    --executor local --device gpu --gpus-per-node 8 \
     --hf-model ${HF_MODEL} \
     --megatron-path ${WORKSPACE}/${MODEL_NAME}/iter_0000000 \
-    --hf-path ${WORKSPACE}/${MODEL_NAME}-hf-export
+    --hf-path ${WORKSPACE}/${MODEL_NAME}-hf-export \
+    --tp ${TP} --pp ${PP} --ep ${EP}
 
 # Roundtrip validation
 uv run python -m torch.distributed.run --nproc_per_node=8 \
@@ -251,7 +257,7 @@ uv run python -m torch.distributed.run --nproc_per_node=8 \
     --hf-model-id ${HF_MODEL} --tp ${TP} --pp ${PP} --ep ${EP}
 ```
 
-### Inference example (`examples/models/<type>/<model>/inference.sh`)
+### Inference example (`examples/models/<family>/<model>/inference.sh`)
 
 For LLMs:
 ```bash
@@ -272,6 +278,33 @@ uv run python examples/conversion/hf_to_megatron_generate_vlm.py \
 --model_class "MyModelForConditionalGeneration"
 ```
 
+## Optional External NeMo-RL E2E
+
+After Bridge unit and conversion tests pass for a new model/provider, optionally run a small
+external-loop smoke test through NeMo-RL when downstream RL compatibility matters or the PR claims
+NeMo-RL compatibility. This is not required for every model-support change. Start with the
+Megatron policy GRPO smoke (`tests/functional/grpo_megatron.sh`) to prove NeMo-RL can import the
+local Bridge checkout, build the Megatron policy, initialize optimizer/scheduler state, and
+complete a short RL training loop.
+
+Add the non-colocated vLLM refit variant when the change touches HF export, parameter mapping,
+policy-to-generation weight transfer, delta compression, or vLLM loading. Add PEFT/checkpoint,
+Megatron generation, parallelism stress, learning-signal, or architecture-specific variants when
+the change requires that coverage.
+
+Read @skills/nemo-rl-e2e-testing/SKILL.md for the full workflow, environment setup, metric checks,
+failure triage, and reporting format.
+
+## Optional External verl E2E
+
+After Bridge unit and conversion tests pass for a new model/provider, optionally run a small
+external-loop smoke test through verl when downstream RL compatibility matters or the PR claims verl
+compatibility. This is not required for every model-support change. Start with the non-vanilla
+Bridge path, LoRA enabled, and Megatron DDP selected, then add save/resume, parallelism stress,
+Megatron-FSDP, or architecture-specific variants when the change requires that coverage.
+
+Read @skills/verl-e2e-testing/SKILL.md for the full workflow and reporting format.
+
 ## Documentation Page
 
 Create `docs/models/<type>/<model>.md`:
@@ -290,13 +323,13 @@ Create `docs/models/<type>/<model>.md`:
 
 \`\`\`bash
 # HF → Megatron
-uv run python examples/conversion/convert_checkpoints.py import \
+./scripts/conversion/convert.sh import \
     --hf-model <org>/<model> --megatron-path /workspace/<model>
 \`\`\`
 
 ## Training
 
-See `examples/models/<type>/<model>/slurm_sft.sh` and `slurm_peft.sh` for full Slurm scripts.
+See `examples/models/<family>/<model>/slurm_sft.sh` and `slurm_peft.sh` for full Slurm scripts.
 Single-node quick-start:
 
 ### SFT

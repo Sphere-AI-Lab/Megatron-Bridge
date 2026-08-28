@@ -35,7 +35,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     QKVMapping,
     ReplicatedMapping,
 )
-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.qwen_audio.modeling_qwen2_audio import Qwen2AudioModel
 from megatron.bridge.models.qwen_audio.qwen2_audio_provider import Qwen2AudioModelProvider
 
@@ -64,7 +64,7 @@ class Qwen2AudioBridge(MegatronModelBridge):
         >>> provider = bridge.to_megatron_provider()
     """
 
-    def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> Qwen2AudioModelProvider:
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> Qwen2AudioModelProvider:
         """
         Create a Qwen2AudioModelProvider from a HuggingFace pretrained model.
 
@@ -85,10 +85,14 @@ class Qwen2AudioBridge(MegatronModelBridge):
 
         # Qwen2-specific settings
         provider.normalization = "RMSNorm"
+        provider.position_embedding_type = "rope"
         provider.gated_linear_unit = True
         provider.add_qkv_bias = True
         provider.add_bias_linear = False
         provider.hidden_dropout = 0.0
+
+        # Disable gradient accumulation fusion (requires APEX fused_weight_gradient_mlp_cuda)
+        provider.gradient_accumulation_fusion = False
 
         # Audio-specific settings
         provider.hf_config = hf_config
@@ -117,20 +121,28 @@ class Qwen2AudioBridge(MegatronModelBridge):
         Returns:
             MegatronMappingRegistry with all parameter mappings
         """
+        language_model_prefix = "language_model.model"
+        hf_state = getattr(getattr(self, "hf_pretrained", None), "state", None)
+        hf_source = getattr(hf_state, "source", None)
+        if hf_source is not None:
+            hf_keys = hf_source.get_all_keys()
+            if any(key.startswith("language_model.model.model.") for key in hf_keys):
+                language_model_prefix = "language_model.model.model"
+
         # Language model direct mappings
         # Maps: Megatron param name -> HuggingFace param name
         param_mappings = {
             # Embeddings and output layers
-            "language_model.embedding.word_embeddings.weight": "language_model.model.embed_tokens.weight",
+            "language_model.embedding.word_embeddings.weight": f"{language_model_prefix}.embed_tokens.weight",
             "language_model.output_layer.weight": "language_model.lm_head.weight",
-            "language_model.decoder.final_layernorm.weight": "language_model.model.norm.weight",
+            "language_model.decoder.final_layernorm.weight": f"{language_model_prefix}.norm.weight",
             # Layer normalization for attention and MLP
-            "language_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "language_model.model.layers.*.input_layernorm.weight",
-            "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "language_model.model.layers.*.post_attention_layernorm.weight",
+            "language_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": f"{language_model_prefix}.layers.*.input_layernorm.weight",
+            "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": f"{language_model_prefix}.layers.*.post_attention_layernorm.weight",
             # Attention output projection
-            "language_model.decoder.layers.*.self_attention.linear_proj.weight": "language_model.model.layers.*.self_attn.o_proj.weight",
+            "language_model.decoder.layers.*.self_attention.linear_proj.weight": f"{language_model_prefix}.layers.*.self_attn.o_proj.weight",
             # MLP output projection
-            "language_model.decoder.layers.*.mlp.linear_fc2.weight": "language_model.model.layers.*.mlp.down_proj.weight",
+            "language_model.decoder.layers.*.mlp.linear_fc2.weight": f"{language_model_prefix}.layers.*.mlp.down_proj.weight",
         }
 
         mapping_list = []
@@ -155,22 +167,22 @@ class Qwen2AudioBridge(MegatronModelBridge):
                 # QKV: Combine separate Q, K, V matrices into single QKV matrix
                 QKVMapping(
                     megatron_param="language_model.decoder.layers.*.self_attention.linear_qkv.weight",
-                    q="language_model.model.layers.*.self_attn.q_proj.weight",
-                    k="language_model.model.layers.*.self_attn.k_proj.weight",
-                    v="language_model.model.layers.*.self_attn.v_proj.weight",
+                    q=f"{language_model_prefix}.layers.*.self_attn.q_proj.weight",
+                    k=f"{language_model_prefix}.layers.*.self_attn.k_proj.weight",
+                    v=f"{language_model_prefix}.layers.*.self_attn.v_proj.weight",
                 ),
                 # QKV bias: Combine separate Q, K, V biases into single QKV bias (Qwen2 specific)
                 QKVMapping(
                     megatron_param="language_model.decoder.layers.*.self_attention.linear_qkv.bias",
-                    q="language_model.model.layers.*.self_attn.q_proj.bias",
-                    k="language_model.model.layers.*.self_attn.k_proj.bias",
-                    v="language_model.model.layers.*.self_attn.v_proj.bias",
+                    q=f"{language_model_prefix}.layers.*.self_attn.q_proj.bias",
+                    k=f"{language_model_prefix}.layers.*.self_attn.k_proj.bias",
+                    v=f"{language_model_prefix}.layers.*.self_attn.v_proj.bias",
                 ),
                 # Gated MLP: Combine gate and up projection matrices into single FC1 matrix
                 GatedMLPMapping(
                     megatron_param="language_model.decoder.layers.*.mlp.linear_fc1.weight",
-                    gate="language_model.model.layers.*.mlp.gate_proj.weight",
-                    up="language_model.model.layers.*.mlp.up_proj.weight",
+                    gate=f"{language_model_prefix}.layers.*.mlp.gate_proj.weight",
+                    up=f"{language_model_prefix}.layers.*.mlp.up_proj.weight",
                 ),
             ]
         )

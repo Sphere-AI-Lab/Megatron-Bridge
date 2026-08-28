@@ -32,7 +32,6 @@ LLAMA_PRETRAIN_RECIPES = [
                 "num_layers": 2,
                 "cuda_graph_impl": "local",
                 "cuda_graph_scope": ["full_iteration"],
-                "check_for_nan_in_grad": False,
                 "use_te_rng_tracker": True,
             },
             "rerun_state_machine": {"check_for_nan_in_loss": False},
@@ -47,9 +46,25 @@ LLAMA_PRETRAIN_RECIPES = [
                 "num_layers": 2,
                 "cuda_graph_impl": "transformer_engine",
                 "cuda_graph_scope": ["attn"],
-                "check_for_nan_in_grad": False,
                 "use_te_rng_tracker": True,
             },
+            "rerun_state_machine": {"check_for_nan_in_loss": False},
+            "ddp": {"check_for_nan_in_grad": False},
+        },
+    ),
+    (
+        llama32_1b_config,
+        "llama32_1b",
+        {
+            "model": {
+                "num_layers": 2,
+                "cuda_graph_impl": "local",
+                "cuda_graph_scope": ["full_iteration"],
+                "use_te_rng_tracker": True,
+            },
+            "optimizer": {"optimizer_cuda_graph": True},
+            # Disable checkpoint save as it's not supported currently with OptimizerCG.
+            "checkpoint": {"save": None},
             "rerun_state_machine": {"check_for_nan_in_loss": False},
             "ddp": {"check_for_nan_in_grad": False},
         },
@@ -62,10 +77,11 @@ class TestLlamaCudaGraphRecipes:
 
     @pytest.mark.run_only_on("GPU")
     @pytest.mark.parametrize("config_func,recipe_name,config_overrides", LLAMA_PRETRAIN_RECIPES)
-    def test_llama_pretrain_recipes(self, config_func, recipe_name, config_overrides):
+    def test_llama_pretrain_recipes(self, config_func, recipe_name, config_overrides, tmp_path):
         """Functional test for LLaMA recipes with appropriate parallelism configurations."""
         run_pretrain_recipe_perf_test(
             config_func,
             recipe_name,
             config_overrides=config_overrides,
+            tmp_path=tmp_path,
         )

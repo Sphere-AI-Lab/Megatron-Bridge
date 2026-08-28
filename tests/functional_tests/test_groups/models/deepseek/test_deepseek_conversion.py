@@ -20,8 +20,6 @@ import pytest
 import torch
 from transformers import (
     AutoTokenizer,
-    DeepseekV2Config,
-    DeepseekV2ForCausalLM,
     DeepseekV3Config,
     DeepseekV3ForCausalLM,
 )
@@ -53,28 +51,11 @@ HF_DEEPSEEK_V3_TOY_MODEL_CONFIG = {
 }
 
 
-HF_DEEPSEEK_V2_TOY_MODEL_CONFIG = {
-    "architectures": ["DeepseekV2ForCausalLM"],
-    "model_type": "deepseek_v2",
-    "first_k_dense_replace": 1,
-    "hidden_act": "silu",
-    "hidden_size": 2048,
-    "initializer_range": 0.02,
-    "intermediate_size": 6144,
-    "kv_lora_rank": 512,
-    "max_position_embeddings": 4096,
-    "moe_intermediate_size": 768,
-    "n_routed_experts": 8,
-    "n_shared_experts": 1,
-    "num_attention_heads": 32,
-    "num_experts_per_tok": 4,
-    "num_hidden_layers": 2,
-    "num_key_value_heads": 4,
-    "q_lora_rank": 512,
-    "vocab_size": 32000,
-    "torch_dtype": "bfloat16",
-    "scoring_func": "softmax",
-    "topk_method": "greedy",
+# The fixture above is the control. Without a query LoRA the HF architecture builds a bare
+# `q_proj` and defines no query-side norm, which is the branch this PR corrects.
+HF_DEEPSEEK_V3_NO_Q_LORA_CONFIG = {
+    **HF_DEEPSEEK_V3_TOY_MODEL_CONFIG,
+    "q_lora_rank": None,
 }
 
 
@@ -133,8 +114,8 @@ class TestDeepSeekConversion:
             "-m",
             "coverage",
             "run",
-            "--data-file=/opt/Megatron-Bridge/.coverage",
-            "--source=/opt/Megatron-Bridge/",
+            f"--data-file={Path(__file__).resolve().parents[5] / '.coverage'}",
+            f"--source={Path(__file__).resolve().parents[5]}",
             "--parallel-mode",
             "examples/conversion/hf_megatron_roundtrip_multi_gpu.py",
             "--hf-model-id",
@@ -192,39 +173,76 @@ class TestDeepSeekConversion:
             f"MoE parameters preserved: {saved['n_routed_experts']} experts, {saved['num_experts_per_tok']} per token"
         )
 
-    @pytest.fixture(scope="class")
-    def deepseek_v2_toy_model_path(self, tmp_path_factory):
-        temp_dir = tmp_path_factory.mktemp("deepseek_v2_toy_model")
-        model_dir = temp_dir / "deepseek_v2_toy"
-
-        config = DeepseekV2Config(**HF_DEEPSEEK_V2_TOY_MODEL_CONFIG)
-        config.torch_dtype = torch.bfloat16
-
-        model = DeepseekV2ForCausalLM(config)
-        model = model.bfloat16()
-
-        try:
-            tokenizer = AutoTokenizer.from_pretrained("gpt2")
-            tokenizer.save_pretrained(model_dir)
-        except Exception:
-            pass
-
-        model.save_pretrained(model_dir, safe_serialization=True)
-
-        config_path = model_dir / "config.json"
-        with open(config_path, "w") as f:
-            json.dump(model.config.to_dict(), f, indent=2)
-
-        return str(model_dir)
-
     @pytest.mark.run_only_on("GPU")
     def test_deepseek_v3_autoconfig_roundtrip(self, deepseek_toy_model_path, tmp_path):
         from tests.functional_tests.utils import autoconfig_roundtrip
 
         autoconfig_roundtrip(deepseek_toy_model_path, tmp_path)
 
-    @pytest.mark.run_only_on("GPU")
-    def test_deepseek_v2_autoconfig_roundtrip(self, deepseek_v2_toy_model_path, tmp_path):
-        from tests.functional_tests.utils import autoconfig_roundtrip
 
-        autoconfig_roundtrip(deepseek_v2_toy_model_path, tmp_path)
+class TestDeepSeekWithoutQueryLoRA:
+    """Cover the `q_lora_rank=None` branch end to end, not only at the spec level."""
+
+    @pytest.fixture(scope="class")
+    def deepseek_no_q_lora_model_path(self, tmp_path_factory):
+        temp_dir = tmp_path_factory.mktemp("deepseek_no_q_lora_model")
+        model_dir = temp_dir / "deepseek_no_q_lora"
+
+        config = DeepseekV3Config(**HF_DEEPSEEK_V3_NO_Q_LORA_CONFIG)
+        config.torch_dtype = torch.bfloat16
+
+        torch.manual_seed(1234)
+        model = DeepseekV3ForCausalLM(config).bfloat16()
+        model.save_pretrained(model_dir, safe_serialization=True)
+
+        with open(model_dir / "config.json", "w") as f:
+            json.dump(model.config.to_dict(), f, indent=2)
+
+        return str(model_dir)
+
+    @pytest.mark.run_only_on("GPU")
+    def test_state_dict_round_trip_without_a_query_norm(self, deepseek_no_q_lora_model_path):
+        """HF to Megatron to HF must preserve every weight and invent none.
+
+        The structural assertions come from the HF architecture rather than from the
+        conversion registry, so the registry cannot act as its own oracle. HF has
+        `q_proj.weight` and `kv_a_layernorm.weight` and no query LoRA; Megatron must have
+        `linear_q_proj.weight` and `linear_kv_up_proj.layer_norm_weight` and no
+        `linear_q_proj.layer_norm_weight`, which is the phantom parameter this PR removes.
+        """
+        from safetensors.torch import load_file
+
+        from megatron.bridge import AutoBridge
+
+        hf_state = load_file(Path(deepseek_no_q_lora_model_path) / "model.safetensors")
+        assert "model.layers.1.self_attn.q_proj.weight" in hf_state
+        assert "model.layers.1.self_attn.kv_a_layernorm.weight" in hf_state
+        assert not [key for key in hf_state if "q_a_proj" in key or "q_a_layernorm" in key]
+
+        # `get_model` is the builder-backed path and DeepSeek has not migrated to it; its
+        # config conversion rejects the MLA fields before any weight handling happens.
+        bridge = AutoBridge.from_hf_pretrained(deepseek_no_q_lora_model_path, torch_dtype=torch.bfloat16)
+        model = bridge.to_megatron_model(load_weights=True, wrap_with_ddp=False)
+        try:
+            megatron_names = {name for stage in model for name, _ in stage.named_parameters()}
+            assert any(name.endswith("self_attention.linear_q_proj.weight") for name in megatron_names)
+            assert any(name.endswith("self_attention.linear_kv_up_proj.layer_norm_weight") for name in megatron_names)
+            assert not [name for name in megatron_names if "linear_q_proj.layer_norm_weight" in name]
+
+            exported = {name: tensor.cpu() for name, tensor in bridge.export_hf_weights(model, cpu=True)}
+        finally:
+            _teardown_distributed()
+
+        assert not [key for key in exported if "q_a_proj" in key or "q_a_layernorm" in key]
+        assert not sorted(set(hf_state) - set(exported)), "export dropped weights"
+        mismatched = sorted(key for key in hf_state if not torch.equal(exported[key], hf_state[key]))
+        assert not mismatched, f"round trip changed {len(mismatched)} weights, e.g. {mismatched[:3]}"
+
+
+def _teardown_distributed():
+    """Release the standalone process groups `get_model` sets up for a single process."""
+    from megatron.core import parallel_state
+
+    parallel_state.destroy_model_parallel()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()

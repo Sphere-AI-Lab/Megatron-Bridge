@@ -90,14 +90,6 @@ def map(  # noqa: A001
         ...     return m
         >>> model = map(model, add_id, module_id=42)
     """
-    # ``nn.ModuleList`` allows ``None`` entries (used by experimental MoE
-    # blocks like DeepSeek V4 to mark non-local experts under expert-model
-    # parallelism). Passing through ``None`` keeps the slot intact instead
-    # of raising AttributeError when the recursive walker tries to call
-    # ``.named_children()`` on it.
-    if module is None:
-        return None
-
     if not kwargs.pop("_skip_map", False) and hasattr(module, "map"):
         return module.map(func, leaf_only=leaf_only, **kwargs)
 

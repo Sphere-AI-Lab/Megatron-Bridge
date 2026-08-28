@@ -43,11 +43,6 @@ _EXCLUDE_FIELD = object()
 _SERIALIZABLE_CALLABLE_FIELDS: frozenset[str] = frozenset({"activation_func"})
 
 
-def _drop_none_values(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a shallow copy without ``None`` values."""
-    return {key: value for key, value in data.items() if value is not None}
-
-
 def create_omegaconf_dict_config(config_container: Any) -> Tuple[DictConfig, Dict[str, Any]]:
     """Create OmegaConf while tracking excluded fields for later restoration.
 
@@ -257,13 +252,10 @@ def _dataclass_to_omegaconf_dict(val_to_convert: Any, path: str = "") -> Any:
             cfg_class = val_to_convert.__class__
             target = f"{inspect.getmodule(cfg_class).__name__}.{cfg_class.__qualname__}.from_dict"
             logger.debug(f"Converting {cfg_class.__qualname__} at {current_path} to callable dict")
-            config_dict = val_to_convert.to_dict()
-            if isinstance(val_to_convert, GenerationConfig):
-                config_dict = _drop_none_values(config_dict)
             return {
                 "_target_": target,
                 "_call_": True,
-                "config_dict": config_dict,
+                "config_dict": val_to_convert.to_dict(),
             }
     except ModuleNotFoundError:
         # transformers is optional; if unavailable, fall through to other handlers
@@ -502,6 +494,22 @@ def _apply_overrides(config_obj: DataclassInstance, overrides_dict: Dict[str, An
             try:
                 # Handle special case conversions if needed
                 final_value = value
+
+                # Hydra serializes Enum members to strings. Restore the original
+                # field's Enum type so downstream identity/equality checks keep
+                # working after CLI or YAML overrides.
+                if isinstance(current_attr, Enum) and not isinstance(value, type(current_attr)):
+                    enum_type = type(current_attr)
+                    try:
+                        final_value = enum_type[value] if isinstance(value, str) else enum_type(value)
+                    except (KeyError, ValueError):
+                        try:
+                            final_value = enum_type(value)
+                        except ValueError:
+                            logger.warning(
+                                f"Could not convert '{value}' back to {enum_type.__name__}; keeping provided value"
+                            )
+                            final_value = value
 
                 # If the original was a torch.dtype and value is a string, convert back
                 if isinstance(current_attr, torch.dtype) and isinstance(value, str):

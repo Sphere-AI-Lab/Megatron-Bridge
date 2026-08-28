@@ -20,23 +20,25 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 
+from megatron.bridge.inference._tokenizer import HFTokenizerAdapter
 
-class TokenizerWrapper:
-    """Wrapper around tokenizer to provide a unified interface for inference."""
+
+class TokenizerWrapper(HFTokenizerAdapter):
+    """Wrapper around tokenizer to provide a unified interface for inference.
+
+    Thin specialization of :class:`HFTokenizerAdapter` preserving the historical VLM behavior:
+    no pad-token defaulting, ``vocab_size`` left as ``None``, and detokenization that always
+    keeps special tokens.
+    """
 
     # pylint: disable=C0115,C0116
     def __init__(self, tokenizer):
-        self.eod = tokenizer.eos_token_id
-        self.vocab_size = None
-        self._tokenizer = tokenizer
-
-    def detokenize(self, tokens):
-        # pylint: disable=C0115,C0116
-        return self._tokenizer.decode(tokens, skip_special_tokens=False)
-
-    def tokenize(self, prompt):
-        # pylint: disable=C0115,C0116
-        return self._tokenizer.encode(prompt, add_special_tokens=False)
+        super().__init__(
+            tokenizer,
+            set_pad_token=False,
+            expose_vocab_size=False,
+            force_skip_special_tokens=False,
+        )
 
 
 class VLMTextGenerationController(TextGenerationController):
@@ -93,16 +95,18 @@ class QwenVLTextGenerationController(VLMTextGenerationController):
 
     def __init__(self, inference_wrapped_model, tokenizer, image_processor, processor):
         super().__init__(inference_wrapped_model, tokenizer, image_processor)
+        vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
 
         class QwenVLTokenizer(TokenizerWrapper):
             # pylint: disable=C0115,C0116
             def detokenize(self, tokens):
                 new_tokens = []
                 for token in tokens:
-                    if token == 151652:
+                    if token == vision_start_token_id:
                         new_tokens.append(token)
-                        new_tokens.append(151655)
-                    elif token != 151655:
+                        new_tokens.append(image_token_id)
+                    elif token != image_token_id:
                         new_tokens.append(token)
                 return self._tokenizer.decode(new_tokens, skip_special_tokens=False)
 
@@ -111,6 +115,11 @@ class QwenVLTextGenerationController(VLMTextGenerationController):
 
     def tokenize_prompt(self, prompt: str, image):
         """Tokenize with the HF processor (image + text; same idea as hf_to_megatron_generate_vlm)."""
+        if self.processor is None:
+            if image is not None:
+                raise ValueError("A processor is required for Qwen VLM image prompts.")
+            return self.tokenizer.tokenize(prompt), None
+
         if image is None:
             inputs = self.processor(text=[prompt], return_tensors="pt")
         else:

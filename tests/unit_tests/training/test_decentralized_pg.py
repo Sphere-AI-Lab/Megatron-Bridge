@@ -110,6 +110,42 @@ class TestCreatePgCollectionFunction:
         mock_hyper_grid.assert_called()
         call_kwargs = mock_hyper_grid.call_args[1]
         assert call_kwargs["shape"][0] == 2  # TP size
+        assert mock_model_config.expert_tensor_parallel_size is None
+        assert mock_hyper_grid.call_args_list[1].kwargs["shape"][0] == 2
+
+    @pytest.mark.parametrize(
+        ("expert_tensor_parallel_size", "expected_expert_shape"),
+        [(None, [1, 4, 2, 1]), (2, [2, 4, 1, 1])],
+    )
+    @patch("megatron.bridge.training.initialize.HyperCommGrid")
+    @patch("torch.distributed.get_world_size", return_value=8)
+    @patch("torch.distributed.new_subgroups_by_enumeration")
+    def test_create_pg_collection_with_expert_parallelism(
+        self,
+        mock_subgroups,
+        mock_world_size,
+        mock_hyper_grid,
+        expert_tensor_parallel_size,
+        expected_expert_shape,
+        mock_model_config,
+    ):
+        """Test Bridge's ETP default and explicit override in decentralized process groups."""
+        from megatron.bridge.training.initialize import _create_pg_collection
+
+        mock_model_config.tensor_model_parallel_size = 2
+        mock_model_config.expert_model_parallel_size = 4
+        mock_model_config.expert_tensor_parallel_size = expert_tensor_parallel_size
+
+        mock_grid_instance = MagicMock()
+        mock_grid_instance.create_pg.return_value = MagicMock()
+        mock_grid_instance._gen_rank_enum.return_value = [[0, 1, 2, 3, 4, 5, 6, 7]]
+        mock_hyper_grid.return_value = mock_grid_instance
+        mock_subgroups.return_value = (MagicMock(), [])
+
+        _create_pg_collection(mock_model_config, num_distributed_optimizer_instances=1)
+
+        assert mock_model_config.expert_tensor_parallel_size == (expert_tensor_parallel_size or 1)
+        assert mock_hyper_grid.call_args_list[1].kwargs["shape"] == expected_expert_shape
 
     @patch("megatron.bridge.training.initialize.HyperCommGrid")
     @patch("torch.distributed.get_world_size", return_value=8)
@@ -135,6 +171,119 @@ class TestCreatePgCollectionFunction:
         mock_hyper_grid.assert_called()
         call_kwargs = mock_hyper_grid.call_args[1]
         assert call_kwargs["shape"][3] == 2  # PP size
+
+
+class TestCreateDistTrainPgsFunction:
+    """Tests for the _create_dist_train_pgs function."""
+
+    @pytest.fixture
+    def mock_dist_train_model_config(self):
+        """Minimal model config with dist_train fields required by _create_dist_train_pgs."""
+        config = MagicMock()
+        dt = MagicMock()
+        dt.vision_world_size = 1
+        dt.language_world_size = 1
+        dt.vision_tensor_model_parallel_size = 1
+        dt.vision_pipeline_model_parallel_size = 1
+        dt.vision_context_parallel_size = 1
+        dt.vision_expert_tensor_parallel_size = None
+        dt.vision_expert_model_parallel_size = 1
+        config.dist_train = dt
+        config.tensor_model_parallel_size = 1
+        config.pipeline_model_parallel_size = 1
+        config.context_parallel_size = 1
+        config.expert_tensor_parallel_size = None
+        config.expert_model_parallel_size = 1
+        config.hierarchical_context_parallel_sizes = None
+        return config
+
+    @patch("megatron.bridge.training.initialize.MultiModulePipelineCommunicator")
+    @patch("megatron.bridge.training.initialize.is_rank_in_pg")
+    @patch("megatron.bridge.training.initialize._create_pg_collection")
+    def test_create_dist_train_pgs_vision_rank_returns_wrapped_vision_collection(
+        self, mock_create_pg, mock_is_rank_in_pg, mock_mm_comm, mock_dist_train_model_config
+    ):
+        """Vision ranks get DistTrainProcessGroupCollection wrapping the vision ProcessGroupCollection."""
+        from megatron.bridge.training.initialize import _create_dist_train_pgs
+        from megatron.bridge.training.utils.pg_utils import DistTrainProcessGroupCollection
+
+        vision_pgc = MagicMock()
+        language_pgc = MagicMock()
+
+        def create_pg_side_effect(
+            _mc,
+            _num_opt,
+            get_embedding_ranks=None,
+            get_position_embedding_ranks=None,
+            world_size=None,
+            rank_offset=None,
+            save_grid=False,
+        ):
+            if rank_offset == 0:
+                return vision_pgc
+            return language_pgc
+
+        mock_create_pg.side_effect = create_pg_side_effect
+        mock_is_rank_in_pg.side_effect = lambda coll: coll is vision_pgc
+
+        result = _create_dist_train_pgs(
+            mock_dist_train_model_config,
+            num_distributed_optimizer_instances=1,
+            get_embedding_ranks=None,
+            get_position_embedding_ranks=None,
+        )
+
+        assert isinstance(result, DistTrainProcessGroupCollection)
+        assert result.language_model_module_name is None
+        assert mock_dist_train_model_config.add_encoder is True
+        assert mock_dist_train_model_config.add_decoder is False
+        assert mock_dist_train_model_config.dist_train.has_language_module is False
+        assert mock_create_pg.call_count == 2
+        mock_mm_comm.assert_called_once()
+        assert mock_dist_train_model_config._p2p_communicator is not None
+
+    @patch("megatron.bridge.training.initialize.MultiModulePipelineCommunicator")
+    @patch("megatron.bridge.training.initialize.is_rank_in_pg")
+    @patch("megatron.bridge.training.initialize._create_pg_collection")
+    def test_create_dist_train_pgs_language_rank_returns_wrapped_language_collection(
+        self, mock_create_pg, mock_is_rank_in_pg, mock_mm_comm, mock_dist_train_model_config
+    ):
+        """Language ranks get DistTrainProcessGroupCollection with language_model_module_name set."""
+        from megatron.bridge.training.initialize import _create_dist_train_pgs
+        from megatron.bridge.training.utils.pg_utils import DistTrainProcessGroupCollection
+
+        vision_pgc = MagicMock()
+        language_pgc = MagicMock()
+
+        def create_pg_side_effect(
+            _mc,
+            _num_opt,
+            get_embedding_ranks=None,
+            get_position_embedding_ranks=None,
+            world_size=None,
+            rank_offset=None,
+            save_grid=False,
+        ):
+            if rank_offset == 0:
+                return vision_pgc
+            return language_pgc
+
+        mock_create_pg.side_effect = create_pg_side_effect
+        mock_is_rank_in_pg.side_effect = lambda coll: coll is language_pgc
+
+        result = _create_dist_train_pgs(
+            mock_dist_train_model_config,
+            num_distributed_optimizer_instances=1,
+            get_embedding_ranks=None,
+            get_position_embedding_ranks=None,
+        )
+
+        assert isinstance(result, DistTrainProcessGroupCollection)
+        assert result.language_model_module_name == "language_module"
+        assert mock_dist_train_model_config.add_encoder is False
+        assert mock_dist_train_model_config.add_decoder is True
+        assert mock_create_pg.call_count == 2
+        mock_mm_comm.assert_called_once()
 
 
 class TestSetRandomSeedWithPgCollection:
@@ -325,6 +474,10 @@ class TestInitializeDistributedBranching:
         # Verify the result is the pg_collection from _create_pg_collection
         assert result == mock_pg_collection
 
+    @pytest.mark.parametrize(
+        ("expert_tensor_parallel_size", "expected_expert_tensor_parallel_size"),
+        [(None, 1), (2, 2)],
+    )
     @patch("megatron.bridge.training.initialize.ProcessGroupCollection")
     @patch("megatron.bridge.training.initialize._create_pg_collection")
     @patch("megatron.bridge.training.initialize.parallel_state")
@@ -339,19 +492,21 @@ class TestInitializeDistributedBranching:
         mock_parallel_state,
         mock_create_pg_collection,
         mock_pg_collection_class,
+        expert_tensor_parallel_size,
+        expected_expert_tensor_parallel_size,
     ):
         """Test that _initialize_distributed uses mpu when use_decentralized_pg=False."""
         from megatron.bridge.training.initialize import _initialize_distributed
 
         mock_model_config = MagicMock()
-        mock_model_config.tensor_model_parallel_size = 1
+        mock_model_config.tensor_model_parallel_size = 2
         mock_model_config.pipeline_model_parallel_size = 1
         mock_model_config.context_parallel_size = 1
         mock_model_config.virtual_pipeline_model_parallel_size = None
         mock_model_config.pipeline_model_parallel_comm_backend = "nccl"
         mock_model_config.hierarchical_context_parallel_sizes = None
-        mock_model_config.expert_model_parallel_size = 1
-        mock_model_config.expert_tensor_parallel_size = None
+        mock_model_config.expert_model_parallel_size = 4
+        mock_model_config.expert_tensor_parallel_size = expert_tensor_parallel_size
 
         mock_dist_config = MagicMock()
         mock_dist_config.use_decentralized_pg = False
@@ -379,6 +534,10 @@ class TestInitializeDistributedBranching:
         mock_create_pg_collection.assert_not_called()
         # Verify parallel_state.initialize_model_parallel WAS called
         mock_parallel_state.initialize_model_parallel.assert_called_once()
+        assert (
+            mock_parallel_state.initialize_model_parallel.call_args.kwargs["expert_tensor_parallel_size"]
+            == expected_expert_tensor_parallel_size
+        )
 
 
 class TestSetupUsesDecentralizedPg:

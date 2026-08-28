@@ -45,13 +45,12 @@ class Qwen3MoEBridge(MegatronModelBridge):
         """Convert Megatron provider config to HuggingFace Qwen3MoeConfig dict."""
         hf_config = super().megatron_to_hf_config(provider)
         hf_config["decoder_sparse_step"] = 1  # All layers are MoE in Qwen3 MoE
-        hf_config["norm_topk_prob"] = False  # Qwen3 MoE does not normalize top-k probs
+        hf_config["norm_topk_prob"] = not provider.moe_router_pre_softmax
         return hf_config
 
     def provider_bridge(self, hf_pretrained):
         """Convert HuggingFace Qwen3 MoE config to GPTModelProvider."""
         provider = super().provider_bridge(hf_pretrained)
-        hf_config = hf_pretrained.config
 
         provider.normalization = "RMSNorm"
         provider.gated_linear_unit = True
@@ -64,20 +63,9 @@ class Qwen3MoEBridge(MegatronModelBridge):
         provider.moe_grouped_gemm = True
         provider.moe_router_load_balancing_type = "aux_loss"
         provider.moe_aux_loss_coeff = 1e-3
-        provider.moe_router_pre_softmax = False
-        provider.moe_router_dtype = "fp32"
+        provider.moe_router_pre_softmax = not hf_pretrained.config.norm_topk_prob
         provider.moe_token_dispatcher_type = "alltoall"
         provider.moe_permute_fusion = True
-
-        decoder_sparse_step = getattr(hf_config, "decoder_sparse_step", 1) or 0
-        mlp_only_layers = set(getattr(hf_config, "mlp_only_layers", []) or [])
-        if getattr(hf_config, "num_experts", 0) > 0 and decoder_sparse_step > 0:
-            provider.moe_layer_freq = [
-                1 if (layer_idx not in mlp_only_layers) and (layer_idx + 1) % decoder_sparse_step == 0 else 0
-                for layer_idx in range(hf_config.num_hidden_layers)
-            ]
-        else:
-            provider.moe_layer_freq = [0] * hf_config.num_hidden_layers
 
         return provider
 

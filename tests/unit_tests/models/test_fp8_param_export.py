@@ -14,7 +14,6 @@
 
 """Unit tests for FP8 export behavior."""
 
-import builtins
 import logging
 import sys
 import types
@@ -43,9 +42,13 @@ def _make_qkv_mapping_type(global_name: str = _QKV_GLOBAL):
     class MegatronQkvMapping:
         hf_param = "hf.qkv.weight"
         megatron_param = global_name
+        allow_hf_name_mismatch = False
 
         def resolve(self, _captures):
             return MegatronQkvMapping()
+
+        def set_process_groups_from_pg_collection(self, _pg_collection):
+            pass
 
         def hf_to_megatron(self, hf_weights, _module):
             return hf_weights
@@ -204,31 +207,31 @@ class TestFp8ParamExport:
         mock_mb = Mock()
         fp8_tasks = [Mock(name="fp8_w"), Mock(name="fp8_scale")]
         mock_mb.build_export_fp8_tasks.return_value = fp8_tasks
+        mock_mb.stream_weights_megatron_to_hf.return_value = iter(
+            [("model.layers.0.self_attn.q_proj.weight", torch.ones(1))]
+        )
 
         with patch.object(AutoBridge, "_model_bridge", mock_mb):
-            with patch(
-                "megatron.bridge.models.conversion.auto_bridge.model_bridge.stream_weights_megatron_to_hf"
-            ) as stream:
-                stream.return_value = iter([("model.layers.0.self_attn.q_proj.weight", torch.ones(1))])
-                with patch("megatron.bridge.models.conversion.auto_bridge.transformers") as tf:
-                    tf.LlamaForCausalLM = arch = Mock()
-                    bridge = AutoBridge(mock_hf)
-                    bridge.export_weight_dtype = export_dtype
-                    with patch.object(AutoBridge, "_causal_lm_architecture", new_callable=PropertyMock) as arch_prop:
-                        arch_prop.return_value = arch
-                        if expect_raise:
-                            with pytest.raises(ValueError, match="only supports blockwise FP8 parameter export"):
-                                list(bridge.export_hf_weights(megatron, cpu=True))
-                        else:
+            with patch("megatron.bridge.models.conversion.auto_bridge.transformers") as tf:
+                tf.LlamaForCausalLM = arch = Mock()
+                bridge = AutoBridge(mock_hf)
+                bridge.export_weight_dtype = export_dtype
+                with patch.object(AutoBridge, "_causal_lm_architecture", new_callable=PropertyMock) as arch_prop:
+                    arch_prop.return_value = arch
+                    if expect_raise:
+                        with pytest.raises(ValueError, match="only supports blockwise FP8 parameter export"):
                             list(bridge.export_hf_weights(megatron, cpu=True))
+                    else:
+                        list(bridge.export_hf_weights(megatron, cpu=True))
         assert mock_mb.build_export_fp8_tasks.call_count == n_fp8_build_calls
         if export_dtype == "fp8" and not expect_raise:
             mock_mb.build_export_fp8_tasks.assert_called_once_with(mock_hf, megatron)
-            assert stream.call_args.kwargs["conversion_tasks"] == fp8_tasks
+            assert mock_mb.stream_weights_megatron_to_hf.call_args.kwargs["conversion_tasks"] == fp8_tasks
         elif expect_raise:
             mock_mb.build_export_fp8_tasks.assert_not_called()
+            mock_mb.stream_weights_megatron_to_hf.assert_not_called()
         else:
-            assert stream.call_args.kwargs["conversion_tasks"] is None
+            assert mock_mb.stream_weights_megatron_to_hf.call_args.kwargs["conversion_tasks"] is None
 
     @pytest.mark.parametrize(
         "scale_shape, quantizer, is_2d, warn_trim, expect_shape",
@@ -247,25 +250,24 @@ class TestFp8ParamExport:
         gname = _QKV_GLOBAL
         MappingT = _make_qkv_mapping_type(gname)
 
-        class Reg:
-            @staticmethod
-            def megatron_to_hf_lookup(_n):
-                return MappingT()
-
         rowwise = torch.ones(scale_shape, dtype=torch.float32)
-        fake_w = SimpleNamespace(
-            _rowwise_data=torch.zeros((2, 256), dtype=torch.uint8),
-            _rowwise_scale_inv=rowwise,
-            _fp8_dtype=None,
-            _quantizer=quantizer,
-            _is_2D_scaled=is_2d,
-            shape=(2, 256),
-        )
+        metadata = {
+            "rowwise_data": torch.zeros((2, 256), dtype=torch.uint8),
+            "rowwise_scale_inv": rowwise,
+            "quantizer": quantizer,
+            "is_2D_scaled": is_2d,
+        }
+        fake_w = SimpleNamespace(get_metadata=lambda: metadata, shape=(2, 256))
         model = SimpleNamespace(
             config=SimpleNamespace(share_embeddings_and_output_weights=False),
             named_parameters=lambda: [(gname, torch.nn.Parameter(torch.zeros(1)))],
         )
-        _patch_export_task_context(monkeypatch, bridge, gname, registry_factory=lambda: Reg())
+        _patch_export_task_context(
+            monkeypatch,
+            bridge,
+            gname,
+            registry_factory=lambda: MegatronMappingRegistry(MappingT()),
+        )
         monkeypatch.setattr(
             f"{_MODEL_MB}.get_module_and_param_from_name",
             lambda *_a, **_k: (SimpleNamespace(config=model.config), fake_w),
@@ -274,28 +276,28 @@ class TestFp8ParamExport:
             SimpleNamespace(state=SimpleNamespace(source=SimpleNamespace())), [model]
         )
         assert len(tasks) == 2 and tasks[1].global_param_name == f"{gname}_scale_inv"
+        assert tasks[0].param_weight.dtype == torch.float8_e4m3fn
         assert tasks[1].param_weight.shape == expect_shape
         assert torch.all(tasks[1].param_weight == 1.0)
         assert ("block_len or not is_2d_scaled" in caplog.text) is warn_trim
         if tasks[1].param_weight.shape == rowwise.shape:
             assert tasks[1].param_weight.data_ptr() == rowwise.data_ptr()
 
-    def test_detect_fp8_params_blockwise(self, monkeypatch):
+    def test_detect_fp8_params_without_top_level_te_class(self, monkeypatch):
         bridge = DummyBridge()
         gname = _QKV_GLOBAL
 
-        class TeTensor:
+        class BlockwiseMetadataTensor:
             pass
 
         monkeypatch.setitem(
             sys.modules,
-            "transformer_engine.pytorch.tensor",
-            types.ModuleType("transformer_engine.pytorch.tensor"),
+            "transformer_engine.pytorch",
+            types.ModuleType("transformer_engine.pytorch"),
         )
-        sys.modules["transformer_engine.pytorch.tensor"].Float8BlockwiseQTensor = TeTensor
 
-        holder = TeTensor()
-        holder._rowwise_scale_inv = torch.ones(1)
+        holder = BlockwiseMetadataTensor()
+        holder.get_metadata = lambda: {"rowwise_scale_inv": torch.ones(1), "is_2D_scaled": False}
         model = SimpleNamespace(
             config=SimpleNamespace(share_embeddings_and_output_weights=False),
             named_parameters=lambda: [(gname, torch.nn.Parameter(torch.zeros(1)))],
@@ -318,17 +320,9 @@ class TestFp8ParamExport:
         )
         assert flags[gname] and flags["decoder.layers.1.other.weight"]
 
-    def test_detect_fp8_params_te_import_fails(self, monkeypatch):
+    def test_detect_fp8_params_ignores_tensor_without_blockwise_metadata(self, monkeypatch):
         bridge = DummyBridge()
         gname = _QKV_GLOBAL
-        real_imp = builtins.__import__
-
-        def guard(name, glb=None, loc=None, fromlist=(), level=0):
-            if name == "transformer_engine.pytorch.tensor":
-                raise ImportError("no te")
-            return real_imp(name, glb, loc, fromlist, level)
-
-        monkeypatch.setattr(builtins, "__import__", guard)
         model = SimpleNamespace(
             config=SimpleNamespace(share_embeddings_and_output_weights=False),
             named_parameters=lambda: [(gname, torch.nn.Parameter(torch.zeros(1)))],
@@ -347,39 +341,19 @@ class TestFp8ParamExport:
         monkeypatch.setattr(f"{_MODEL_MB}.torch.distributed.all_gather_object", _ag1)
         assert bridge._detect_fp8_params([model], model.config, [gname], None, "_rowwise_scale_inv") == {}
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param("remote_pp", id="remote_pp"),
-            pytest.param("scale_lookup_none", id="scale_lookup_none"),
-        ],
-    )
-    def test_build_export_fp8_tasks_placeholder(self, monkeypatch, caplog, mode):
-        caplog.set_level(logging.WARNING, logger="megatron.bridge.models.conversion.model_bridge")
+    def test_build_export_fp8_tasks_remote_pp_tasks_are_concrete(self, monkeypatch):
         bridge = DummyBridge()
         gname = _QKV_GLOBAL
         MappingT = _make_qkv_mapping_type(gname)
-
-        if mode == "remote_pp":
-
-            class Reg:
-                @staticmethod
-                def megatron_to_hf_lookup(_n):
-                    return MappingT()
-
-            _patch_export_task_context(
-                monkeypatch, bridge, gname, registry_factory=lambda: Reg(), pp_rank=1, pp_size=2
-            )
-        else:
-            n = {"c": 0}
-
-            class Reg:
-                @staticmethod
-                def megatron_to_hf_lookup(_n):
-                    n["c"] += 1
-                    return MappingT() if n["c"] == 1 else None
-
-            _patch_export_task_context(monkeypatch, bridge, gname, registry_factory=lambda: Reg())
+        _patch_export_task_context(
+            monkeypatch,
+            bridge,
+            gname,
+            registry_factory=lambda: MegatronMappingRegistry(MappingT()),
+            pp_rank=1,
+            pp_size=2,
+            detect_fp8=lambda *_a, **_k: {gname: 1},
+        )
 
         model = SimpleNamespace(
             config=SimpleNamespace(share_embeddings_and_output_weights=False),
@@ -389,14 +363,28 @@ class TestFp8ParamExport:
             SimpleNamespace(state=SimpleNamespace(source=SimpleNamespace())), [model]
         )
         assert len(tasks) == 2
-        if mode == "remote_pp":
-            assert tasks[0] and tasks[1]
-            assert tasks[0].megatron_module is None and isinstance(tasks[0].mapping, MappingT)
-            assert isinstance(tasks[1].mapping, _HFNameSuffixMapping)
-        else:
-            assert tasks[0] and tasks[0].global_param_name == gname
-            assert tasks[1] is None
-            assert "No mapping found for global_name" in caplog.text
+        assert tasks[0].megatron_module is None and isinstance(tasks[0].mapping, MappingT)
+        assert tasks[1].megatron_module is None and isinstance(tasks[1].mapping, _HFNameSuffixMapping)
+        assert tasks[1].mapping.scale_block_size == 1
+
+    def test_build_export_fp8_tasks_rejects_missing_mapping_on_remote_pp_rank(self, monkeypatch):
+        bridge = DummyBridge()
+        gname = _QKV_GLOBAL
+        _patch_export_task_context(
+            monkeypatch,
+            bridge,
+            gname,
+            registry_factory=MegatronMappingRegistry,
+            pp_rank=1,
+            pp_size=2,
+        )
+        model = SimpleNamespace(
+            config=SimpleNamespace(share_embeddings_and_output_weights=False),
+            named_parameters=lambda: [],
+        )
+
+        with pytest.raises(ValueError, match=gname.replace(".", r"\.")):
+            bridge.build_export_fp8_tasks(SimpleNamespace(state=SimpleNamespace(source=SimpleNamespace())), [model])
 
     @pytest.mark.parametrize(
         "hidden_size, last_dim, expected_shapes, expected_error",

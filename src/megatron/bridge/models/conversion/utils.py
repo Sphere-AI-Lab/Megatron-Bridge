@@ -20,9 +20,57 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import unwrap_model
 from rich.table import Table
 from transformers.configuration_utils import PretrainedConfig
+
+
+def mcore_to_hf_window_size(window_size: int | list[int] | tuple[int, int] | None) -> int | None:
+    """Convert an MCore inclusive attention window to the Hugging Face token count.
+
+    MCore represents a causal sliding window as ``(left, right)``, where the
+    current token is included in the Hugging Face window size. Checkpoint YAML
+    reloads tuples as lists, so both sequence types are accepted. Providers that
+    already store the Hugging Face scalar representation pass through unchanged.
+    """
+    if isinstance(window_size, (list, tuple)):
+        if len(window_size) != 2:
+            raise ValueError(f"Expected a two-element MCore window, got {window_size!r}")
+        return window_size[0] + 1
+    return window_size
+
+
+def unwrap_model(model, module_instances=None):
+    """Unwrap a model (or list of models) to the underlying module.
+    Extends ``megatron.core.utils.unwrap_model`` with awareness of ``MegatronFSDP``.
+    """
+    if module_instances is None:
+        from megatron.core.distributed import DistributedDataParallel as DDP
+        from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
+        from megatron.core.transformer.module import Float16Module
+
+        from megatron.bridge.training.fsdp_compat import MEGATRON_FSDP_TYPES
+
+        module_instances = (
+            DDP,
+            torch_FSDP,
+            *MEGATRON_FSDP_TYPES,
+            Float16Module,
+            MegatronFSDP,
+        )
+
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+    unwrapped_model = []
+    for model_module in model:
+        while isinstance(model_module, module_instances):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model
 
 
 def weights_verification_table(bridge, megatron_model) -> Table:
@@ -43,14 +91,8 @@ def weights_verification_table(bridge, megatron_model) -> Table:
     table.add_column("Device")
     table.add_column("Matches Original", justify="center")
 
-    # TODO: Remove fix_gpt_oss_export_transpose once GPT-OSS bridge export is fixed.
-    from megatron.bridge.utils.common_utils import fix_gpt_oss_export_transpose, get_hf_model_type
-
-    weight_iter = bridge.export_hf_weights(megatron_model, show_progress=True)
-    if get_hf_model_type(bridge) == "gpt_oss":
-        weight_iter = fix_gpt_oss_export_transpose(weight_iter)
     # Check each weight against the original HF-model
-    for name, param in weight_iter:
+    for name, param in bridge.export_hf_weights(megatron_model, show_progress=True):
         original_param = bridge.hf_pretrained.state[name]
         table.add_row(
             name,
@@ -251,15 +293,58 @@ def extract_sort_key(param_name: str):
     layer_match = re.search(r"layers\.(\d+)", param_name)
     if layer_match:
         numbers.append(int(layer_match.group(1)))
-    # Find expert number after bias or weight
+    # Find expert number after bias or weight for grouped experts.
     expert_match = re.search(r"(?:bias|weight)(\d+)", param_name)
     if expert_match:
         numbers.append(int(expert_match.group(1)))
+    else:
+        # SequentialMLP names use local_experts.<N> instead.
+        local_experts_match = re.search(r"local_experts\.(\d+)", param_name)
+        if local_experts_match:
+            numbers.append(int(local_experts_match.group(1)))
     # Pad to ensure consistent comparison (max 2 numbers)
     while len(numbers) < 2:
         numbers.append(-1)
     numbers = numbers[:2]  # Keep at most 2 numbers
     return numbers, param_name
+
+
+def moe_experts_stored_packed(hf_pretrained, layers_prefix: str, default: bool = False) -> bool:
+    """Whether a checkpoint stores routed MoE experts *fused* rather than *per-expert*.
+
+    Fused layout keys look like ``{layers_prefix}<L>.mlp.experts.gate_up_proj`` / ``.down_proj`` (a
+    single stacked tensor per projection), while the per-expert layout (what ``save_pretrained``
+    writes) uses ``{layers_prefix}<L>.mlp.experts.<i>.gate_proj|up_proj|down_proj.weight``. Which one a
+    checkpoint uses depends on the transformers version, so the bridge selects mappings accordingly.
+
+    Args:
+        hf_pretrained: The loaded HF model wrapper (its ``state.source`` provides the checkpoint keys).
+        layers_prefix: HF prefix up to and including ``layers.`` (e.g. ``"model.layers."`` for an LLM,
+            ``"model.language_model.layers."`` for a VLM).
+        default: Value returned when the checkpoint keys are unavailable (e.g. building mappings
+            without a loaded checkpoint, as in unit tests) or no routed-expert keys are found.
+
+    Returns:
+        ``True`` if experts are stored fused, ``False`` if per-expert, ``default`` if undetermined.
+
+    Raises:
+        ValueError: if the checkpoint mixes fused and per-expert layouts.
+    """
+    source = getattr(getattr(hf_pretrained, "state", None), "source", None)
+    if source is None or not hasattr(source, "get_all_keys"):
+        return default
+    prefix = re.escape(layers_prefix)
+    per_expert_re = re.compile(rf"^{prefix}\d+\.mlp\.experts\.\d+\.(?:gate|up|down)_proj\.weight$")
+    fused_re = re.compile(rf"^{prefix}\d+\.mlp\.experts\.(?:gate_up_proj|down_proj)$")
+    keys = list(source.get_all_keys())
+    has_per_expert = any(per_expert_re.match(k) for k in keys)
+    has_fused = any(fused_re.match(k) for k in keys)
+    if has_per_expert and has_fused:
+        raise ValueError(
+            f"Checkpoint mixes fused and per-expert MoE expert layouts under {layers_prefix}*.mlp.experts; "
+            "expected a single consistent layout."
+        )
+    return has_fused if (has_fused or has_per_expert) else default
 
 
 def get_causal_lm_class_name_via_auto_map(
@@ -282,9 +367,18 @@ def get_causal_lm_class_name_via_auto_map(
 def conform_config_to_reference(
     hf_config_dict: dict[str, object], reference_config: dict[str, object]
 ) -> dict[str, object]:
-    """Return a projected hf_config_dict onto the reference key set, imputing missing keys with reference values."""
+    """Return hf_config_dict projected onto reference keys, filling missing values from reference_config."""
     reference_config_keys = set(reference_config.keys())
-    filtered_config_dict = {key: value for (key, value) in hf_config_dict.items() if key in reference_config_keys}
+    filtered_config_dict = {}
+    for key, value in hf_config_dict.items():
+        if key not in reference_config_keys:
+            continue
+
+        reference_value = reference_config[key]
+        if isinstance(value, dict) and isinstance(reference_value, dict):
+            value = conform_config_to_reference(value, reference_value)
+        filtered_config_dict[key] = value
+
     for key, value in reference_config.items():
         if key not in filtered_config_dict:
             filtered_config_dict[key] = value

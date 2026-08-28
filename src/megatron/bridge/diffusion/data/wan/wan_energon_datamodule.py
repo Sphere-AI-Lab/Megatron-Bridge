@@ -18,7 +18,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Union
 
-from megatron.bridge.data.utils import DatasetBuildContext, DatasetProvider
+from megatron.bridge.data.base import DatasetBuildContext, DatasetProvider
 from megatron.bridge.diffusion.data.common.diffusion_energon_datamodule import (
     DiffusionDataModule,
     DiffusionDataModuleConfig,
@@ -52,7 +52,7 @@ class WanDatasetConfig(DatasetProvider):
 
     path: Optional[Union[str, list]] = None
     seq_length: int = 1024
-    packing_buffer_size: Optional[int] = None
+    packing_buffer_size: int = 200
     micro_batch_size: int = 1
     global_batch_size: int = 4
     num_workers: int = 16
@@ -68,6 +68,8 @@ class WanDatasetConfig(DatasetProvider):
     context_embeddings_dim: int = 4096
 
     def __post_init__(self):
+        if self.packing_buffer_size is None:
+            raise ValueError("WAN requires sequence packing: `packing_buffer_size` cannot be None.")
         self.sequence_length = self.seq_length
 
     def build_datasets(self, context: DatasetBuildContext):

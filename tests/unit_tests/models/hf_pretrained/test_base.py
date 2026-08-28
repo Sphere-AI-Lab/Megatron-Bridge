@@ -14,10 +14,14 @@
 # limitations under the License.
 
 
+import json
 import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import pytest
+from transformers.configuration_utils import PretrainedConfig
 
 
 # Add the src directory to Python path for imports
@@ -119,6 +123,33 @@ def test_copy_custom_modeling_files_nonexistent_source():
         print("✅ test_copy_custom_modeling_files_nonexistent_source passed")
 
 
+def test_hub_download_cleans_local_dir_cache():
+    """Test Hub downloads do not leave local_dir cache metadata in the export directory."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        target_dir = tmp_path / "target"
+        target_dir.mkdir()
+
+        def fake_hf_hub_download(repo_id, filename, local_dir, local_dir_use_symlinks):
+            del repo_id, local_dir_use_symlinks
+            local_dir = Path(local_dir)
+            (local_dir / filename).write_text("# downloaded file")
+            metadata_dir = local_dir / ".cache" / "huggingface" / "download"
+            metadata_dir.mkdir(parents=True)
+            (metadata_dir / f"{filename}.metadata").write_text("metadata")
+
+        base = MockPreTrainedBase()
+        with patch("huggingface_hub.list_repo_files", return_value=["nano_v3_reasoning_parser.py"]):
+            with patch("huggingface_hub.hf_hub_download", side_effect=fake_hf_hub_download):
+                copied_files = base._copy_custom_modeling_files(
+                    "org/repo", target_dir, file_patterns=["*reasoning_parser.py"]
+                )
+
+        assert copied_files == ["nano_v3_reasoning_parser.py"]
+        assert (target_dir / "nano_v3_reasoning_parser.py").exists()
+        assert not (target_dir / ".cache").exists()
+
+
 def test_save_artifacts_with_trust_remote_code_true():
     """Test save_artifacts preserves custom files when trust_remote_code=True."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -177,6 +208,53 @@ def test_save_artifacts_with_trust_remote_code_false():
         print("✅ test_save_artifacts_with_trust_remote_code_false passed")
 
 
+def test_save_artifacts_strips_auto_map_without_trust_remote_code():
+    """Test save_artifacts drops remote-code auto_map when remote code is not preserved."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        target_dir = tmp_path / "target"
+
+        base = MockPreTrainedBase(trust_remote_code=False)
+        config = PretrainedConfig()
+        config.auto_map = {
+            "AutoConfig": "configuration_custom.CustomConfig",
+            "AutoModelForCausalLM": "modeling_custom.CustomForCausalLM",
+        }
+        base._config = config
+
+        base.save_artifacts(target_dir)
+
+        saved_config = json.loads((target_dir / "config.json").read_text())
+        assert "auto_map" not in saved_config
+        assert config.auto_map == {
+            "AutoConfig": "configuration_custom.CustomConfig",
+            "AutoModelForCausalLM": "modeling_custom.CustomForCausalLM",
+        }
+
+
+def test_save_artifacts_preserves_auto_map_with_trust_remote_code():
+    """Test save_artifacts keeps auto_map when remote code is preserved."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        target_dir = tmp_path / "target"
+
+        base = MockPreTrainedBase(trust_remote_code=True)
+        config = PretrainedConfig()
+        config.auto_map = {
+            "AutoConfig": "configuration_custom.CustomConfig",
+            "AutoModelForCausalLM": "modeling_custom.CustomForCausalLM",
+        }
+        base._config = config
+
+        base.save_artifacts(target_dir)
+
+        saved_config = json.loads((target_dir / "config.json").read_text())
+        assert saved_config["auto_map"] == {
+            "AutoConfig": "configuration_custom.CustomConfig",
+            "AutoModelForCausalLM": "modeling_custom.CustomForCausalLM",
+        }
+
+
 def test_save_artifacts_without_model_name_or_path():
     """Test save_artifacts handles missing model_name_or_path gracefully."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -195,6 +273,70 @@ def test_save_artifacts_without_model_name_or_path():
         base.save_artifacts(target_dir)
 
         print("✅ test_save_artifacts_without_model_name_or_path passed")
+
+
+def test_save_artifacts_preserves_rejected_source_generation_config():
+    """Test invalid-but-loadable source generation metadata is preserved verbatim."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        source_generation_config = '{"do_sample": false, "temperature": 0.000001}\n'
+        (source_dir / "generation_config.json").write_text(source_generation_config)
+        target_dir = tmp_path / "target"
+
+        base = MockPreTrainedBase(model_name_or_path=str(source_dir))
+        base._config = Mock(save_pretrained=Mock())
+        base._generation_config = Mock()
+        base._generation_config.save_pretrained.side_effect = ValueError("invalid generation config")
+
+        base.save_artifacts(target_dir)
+
+        assert (target_dir / "generation_config.json").read_text() == source_generation_config
+
+
+def test_save_artifacts_preserves_generation_config_from_pinned_hub_revision(tmp_path):
+    """Test the source fallback keeps the immutable revision for a remote model."""
+    expected_revision = "dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"  # pragma: allowlist secret
+    generation_config = '{"do_sample": false, "top_p": 0.95}\n'
+
+    def fake_hf_hub_download(*, repo_id, filename, local_dir, local_dir_use_symlinks, revision):
+        assert repo_id == "org/model"
+        assert filename == "generation_config.json"
+        assert local_dir_use_symlinks is False
+        assert revision == expected_revision
+        (Path(local_dir) / filename).write_text(generation_config)
+
+    base = MockPreTrainedBase(model_name_or_path="org/model", revision=expected_revision)
+    base._config = Mock()
+    base._generation_config = Mock()
+    base._generation_config.save_pretrained.side_effect = ValueError("invalid generation config")
+
+    with (
+        patch("huggingface_hub.list_repo_files", return_value=["generation_config.json"]) as list_repo_files,
+        patch("huggingface_hub.hf_hub_download", side_effect=fake_hf_hub_download) as hf_hub_download,
+    ):
+        base.save_artifacts(tmp_path / "target")
+
+    list_repo_files.assert_called_once_with("org/model", revision=expected_revision)
+    hf_hub_download.assert_called_once()
+    assert (tmp_path / "target" / "generation_config.json").read_text() == generation_config
+
+
+def test_save_artifacts_reraises_generation_config_error_without_source_file():
+    """Test generation config save errors are not hidden without a source artifact."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+
+        base = MockPreTrainedBase(model_name_or_path=str(source_dir))
+        base._config = Mock(save_pretrained=Mock())
+        base._generation_config = Mock()
+        base._generation_config.save_pretrained.side_effect = ValueError("invalid generation config")
+
+        with pytest.raises(ValueError, match="invalid generation config"):
+            base.save_artifacts(tmp_path / "target")
 
 
 def test_copy_handles_permission_errors():
@@ -459,8 +601,11 @@ def main():
     try:
         test_copy_custom_modeling_files_basic()
         test_copy_custom_modeling_files_nonexistent_source()
+        test_hub_download_cleans_local_dir_cache()
         test_save_artifacts_with_trust_remote_code_true()
         test_save_artifacts_with_trust_remote_code_false()
+        test_save_artifacts_strips_auto_map_without_trust_remote_code()
+        test_save_artifacts_preserves_auto_map_with_trust_remote_code()
         test_save_artifacts_without_model_name_or_path()
         test_copy_handles_permission_errors()
 

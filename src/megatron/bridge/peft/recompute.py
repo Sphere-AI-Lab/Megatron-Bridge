@@ -22,10 +22,6 @@ from typing import Iterable, Set
 import torch
 from megatron.core.utils import unwrap_model
 
-from megatron.bridge.orbit.oft.param_names import (
-    is_peft_adapter_param_name,
-    is_trainable_base_param_name,
-)
 from megatron.bridge.utils.common_utils import print_rank_0
 
 
@@ -79,13 +75,9 @@ def maybe_enable_recompute_inputs_grad(model, peft_recompute_patched: Set[int] |
                 continue
 
             params = list(unwrapped_model.named_parameters())
-            trainable_adapter = any(
-                p.requires_grad and is_peft_adapter_param_name(n)
-                for n, p in params
-            )
+            trainable_adapter = any(p.requires_grad and ".adapter." in n.lower() for n, p in params)
             trainable_base = any(
-                p.requires_grad and is_trainable_base_param_name(n)
-                for n, p in params
+                p.requires_grad and (".to_wrap." not in n.lower() and ".adapter." not in n.lower()) for n, p in params
             )
 
             if not (trainable_adapter and not trainable_base):

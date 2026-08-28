@@ -33,9 +33,11 @@ _spec.loader.exec_module(_mod)
 _try_numeric = _mod._try_numeric
 _try_parse_value = _mod._try_parse_value
 parse_raw_args = _mod.parse_raw_args
+parse_yaml_config = _mod.parse_yaml_config
 translate = _mod.translate
 TranslationResult = _mod.TranslationResult
 emit_overrides = _mod.emit_overrides
+emit_recipe = _mod.emit_recipe
 parse_bridge_overrides = _mod.parse_bridge_overrides
 translate_bridge_to_mlm = _mod.translate_bridge_to_mlm
 ReverseTranslationResult = _mod.ReverseTranslationResult
@@ -208,6 +210,15 @@ class TestParseRawArgs:
         assert args["num-layers"] == 32
         assert args["swiglu"] is True
 
+    def test_hybrid_spec_and_repeated_mtp(self):
+        """Hybrid spec pairs and repeated-MTP flags retain their MLM CLI shape."""
+        args, _ = parse_raw_args(
+            "--spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec --mtp-use-repeated-layer"
+        )
+
+        assert args["spec"] == ["megatron.core.models.mamba.mamba_layer_specs", "mamba_stack_spec"]
+        assert args["mtp-use-repeated-layer"] is True
+
     def test_float_value(self):
         """Float value parsed correctly."""
         args, _ = parse_raw_args("--lr 3e-4")
@@ -376,9 +387,9 @@ class TestTranslateSeqLength:
     """Tests for seq-length dual mapping."""
 
     def test_seq_length_maps_to_both(self):
-        """--seq-length maps to both dataset.sequence_length and model.seq_length."""
+        """--seq-length maps to both dataset.seq_length and model.seq_length."""
         r = translate({"seq-length": 4096})
-        assert r.overrides["dataset.sequence_length"] == 4096
+        assert r.overrides["dataset.seq_length"] == 4096
         assert r.overrides["model.seq_length"] == 4096
 
 
@@ -427,6 +438,70 @@ class TestTranslateEnvVars:
         """Default env_vars is empty dict."""
         r = translate({})
         assert r.env_vars == {}
+
+    @pytest.mark.skipif(not _mod.HAS_YAML, reason="PyYAML is not installed")
+    def test_yaml_env_vars_preserve_scalar_types_and_colons(self, tmp_path):
+        """MLM ENV_VARS blocks should survive parsing without losing special values."""
+        config_path = tmp_path / "model.yaml"
+        config_path.write_text(
+            """ENV_VARS:
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 16
+  TORCHINDUCTOR_WORKER_START: fork
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  USE_MNNVL: 1
+MODEL_ARGS:
+  --num-layers: 2
+"""
+        )
+
+        _, env_vars = parse_yaml_config(str(config_path))
+
+        assert env_vars == {
+            "NVTE_FWD_LAYERNORM_SM_MARGIN": 16,
+            "TORCHINDUCTOR_WORKER_START": "fork",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "USE_MNNVL": 1,
+        }
+
+    def test_env_vars_are_emitted_in_generated_recipe(self):
+        """Generated recipes preserve scalar and colon-bearing environment values."""
+        env_vars = {
+            "NVTE_FWD_LAYERNORM_SM_MARGIN": 16,
+            "TORCHINDUCTOR_WORKER_START": "fork",
+            "QUANTIZATION_TYPE_DEBUG": 1,
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN": 64,
+            "USE_MNNVL": 1,
+        }
+
+        output = emit_recipe(translate({}, env_vars=env_vars), recipe_name="translated_model")
+
+        assert f"env_vars={env_vars!r}" in output
+
+    def test_env_vars_are_emitted_as_hydra_override(self):
+        """Override output should preserve values containing colons without shell splitting."""
+        from hydra.core.override_parser.overrides_parser import OverridesParser
+
+        result = translate(
+            {},
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "QUANTIZATION_TYPE_DEBUG": 1,
+            },
+        )
+
+        output = emit_overrides(result)
+
+        override = next(line.strip().removesuffix(" \\") for line in output.splitlines() if "++env_vars=" in line)
+        override = override.removeprefix("'").removesuffix("'")
+        parsed = OverridesParser.create().parse_overrides([override])
+
+        assert len(parsed) == 1
+        assert parsed[0].key_or_group == "env_vars"
+        assert parsed[0].value() == {
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "QUANTIZATION_TYPE_DEBUG": 1,
+        }
 
 
 class TestTranslateMlaMoe:
@@ -489,6 +564,135 @@ class TestTranslateSequenceParallelNote:
         # No SP note about TP requirement
         sp_notes = [n for n in r.notes if "requires tensor_model_parallel" in n]
         assert len(sp_notes) == 0
+
+
+class TestTranslateHybrid:
+    """Tests for MLM Hybrid/Mamba and repeated-MTP configuration."""
+
+    def test_maps_hybrid_mamba_and_repeated_mtp_fields(self):
+        """Weight-bearing Hybrid fields translate without becoming unknown args."""
+        args = {
+            "hybrid-override-pattern": "M*M*",
+            "mamba-state-dim": 128,
+            "mamba-head-dim": 64,
+            "mamba-num-groups": 8,
+            "mamba-num-heads": 64,
+            "mtp-num-layers": 2,
+            "mtp-hybrid-override-pattern": "*E",
+            "mtp-use-repeated-layer": True,
+            "spec": ["megatron.core.models.mamba.mamba_layer_specs", "mamba_stack_spec"],
+            "tokenizer-type": "SFTTokenizer",
+            "sft-tokenizer-prompt-format": "nemotron-h-aligned",
+        }
+
+        result = translate(args)
+
+        assert result.uses_hybrid is True
+        assert result.overrides["model.hybrid_layer_pattern"] == "M*M*"
+        assert result.overrides["model.mamba_state_dim"] == 128
+        assert result.overrides["model.mamba_head_dim"] == 64
+        assert result.overrides["model.mamba_num_groups"] == 8
+        assert result.overrides["model.mamba_num_heads"] == 64
+        assert result.overrides["model.mtp_num_layers"] == 2
+        assert result.overrides["model.mtp_hybrid_override_pattern"] == "*E"
+        assert result.overrides["model.mtp_use_repeated_layer"] is True
+        assert result.overrides["tokenizer.tokenizer_prompt_format"] == "nemotron-h-aligned"
+        assert not result.unknown
+        assert ("spec", args["spec"]) in result.skipped
+
+    def test_recipe_uses_hybrid_provider_and_preserves_tokenizer_prompt_format(self):
+        """Standalone recipe output selects the Hybrid provider and keeps tokenizer config."""
+        result = translate(
+            {
+                "hybrid-layer-pattern": "M*M*/*E",
+                "mtp-num-layers": 1,
+                "tokenizer-type": "SFTTokenizer",
+                "sft-tokenizer-prompt-format": "nemotron-h-aligned",
+            }
+        )
+
+        output = emit_recipe(result, recipe_name="hybrid_model")
+
+        compile(output, "<generated-hybrid-recipe>", "exec")
+        assert "from megatron.bridge.models.hybrid import HybridModelProvider" in output
+        assert "def model_config(" in output
+        assert ") -> HybridModelProvider:" in output
+        assert "hybrid_layer_pattern='M*M*/*E'" in output
+        assert "tokenizer_prompt_format='nemotron-h-aligned'" in output
+
+    def test_unified_hybrid_pattern_takes_precedence_over_legacy_mtp_pattern(self):
+        """A unified pattern keeps MLM precedence over the deprecated MTP field."""
+        result = translate(
+            {
+                "hybrid-layer-pattern": "M*M*/EE/EE",
+                "mtp-num-layers": 2,
+                "mtp-hybrid-override-pattern": "*E",
+            }
+        )
+
+        output = emit_recipe(result, recipe_name="hybrid_model")
+
+        assert result.overrides["model.hybrid_layer_pattern"] == "M*M*/EE/EE"
+        assert "model.mtp_hybrid_override_pattern" not in result.overrides
+        assert ("mtp-hybrid-override-pattern", "*E") in result.skipped
+        assert any("already contains unified MTP sections" in note for note in result.notes)
+        assert "hybrid_layer_pattern='M*M*/EE/EE'" in output
+        assert "mtp_hybrid_override_pattern" not in output
+
+    def test_sft_default_does_not_override_multimodal_prompt_format(self):
+        """The globally present MLM SFT default is ignored for non-SFT tokenizers."""
+        result = translate(
+            {
+                "tokenizer-type": "MultimodalTokenizer",
+                "sft-tokenizer-prompt-format": "nemotron-h-aligned",
+            }
+        )
+
+        assert "tokenizer.tokenizer_prompt_format" not in result.overrides
+        assert ("sft-tokenizer-prompt-format", "nemotron-h-aligned") in result.skipped
+
+    def test_rejects_ambiguous_hybrid_recipe_inputs(self):
+        """Hybrid recipes fail when their architecture cannot be reconstructed safely."""
+        with pytest.raises(ValueError, match="cannot both be specified"):
+            translate(
+                {
+                    "hybrid-layer-pattern": "M*M*/EE",
+                    "hybrid-override-pattern": "MMMM",
+                }
+            )
+
+        result = translate(
+            {
+                "num-layers": 4,
+                "spec": ["megatron.core.models.mamba.mamba_layer_specs", "mamba_stack_spec"],
+            }
+        )
+
+        with pytest.raises(ValueError, match="Cannot emit a standalone Hybrid recipe"):
+            emit_recipe(result, recipe_name="hybrid_model")
+
+    def test_recipe_preserves_expert_tensor_parallelism_and_seed(self):
+        """Standalone recipes retain translated ETP and RNG settings."""
+        result = translate(
+            {
+                "num-experts": 8,
+                "expert-model-parallel-size": 2,
+                "expert-tensor-parallel-size": 4,
+                "seed": 5678,
+            }
+        )
+
+        output = emit_recipe(result, recipe_name="moe_model")
+
+        compile(output, "<generated-moe-recipe>", "exec")
+        assert "expert_tensor_parallelism: int = 4" in output
+        assert "expert_tensor_parallel_size=expert_tensor_parallelism" in output
+        assert "random_seed=5678" in output
+        assert "rng=RNGConfig(seed=5678)" in output
+        spec = ["megatron.core.models.mamba.mamba_layer_specs", "mamba_stack_spec"]
+        overrides = emit_overrides(translate({"spec": spec}))
+
+        assert f"#   --spec {spec}" in overrides
 
 
 # ===========================================================================
@@ -722,14 +926,14 @@ class TestTranslateBridgeToMlmSeqLength:
         r = translate_bridge_to_mlm({"model.seq_length": 4096})
         assert r.mlm_args.get("seq-length") == 4096
 
-    def test_dataset_sequence_length(self):
-        """dataset.sequence_length → --seq-length."""
-        r = translate_bridge_to_mlm({"dataset.sequence_length": 4096})
+    def test_dataset_seq_length(self):
+        """dataset.seq_length → --seq-length."""
+        r = translate_bridge_to_mlm({"dataset.seq_length": 4096})
         assert r.mlm_args.get("seq-length") == 4096
 
     def test_both_seq_length_not_duplicated(self):
         """Both seq_length fields produce only one --seq-length entry."""
-        r = translate_bridge_to_mlm({"model.seq_length": 4096, "dataset.sequence_length": 4096})
+        r = translate_bridge_to_mlm({"model.seq_length": 4096, "dataset.seq_length": 4096})
         count = list(r.mlm_args.keys()).count("seq-length")
         assert count == 1
 
@@ -787,6 +991,35 @@ class TestTranslateBridgeToMlmBridgeOnlyKeys:
         r = translate_bridge_to_mlm({"model._target_": "some.class"})
         skipped_keys = [k for k, _ in r.skipped]
         assert "model._target_" in skipped_keys
+
+
+class TestTranslateBridgeToMlmTokenizerPromptFormat:
+    """Tests for the tokenizer-type-aware SFT prompt-format reverse mapping."""
+
+    def test_sft_prompt_format_maps_to_sft_flag(self):
+        """SFT tokenizers use MLM's dedicated SFT prompt flag."""
+        result = translate_bridge_to_mlm(
+            {
+                "tokenizer.tokenizer_type": "SFTTokenizer",
+                "tokenizer.tokenizer_prompt_format": "nemotron-h-aligned",
+            }
+        )
+
+        assert result.mlm_args["tokenizer-type"] == "SFTTokenizer"
+        assert result.mlm_args["sft-tokenizer-prompt-format"] == "nemotron-h-aligned"
+
+    def test_multimodal_prompt_format_does_not_map_to_sft_flag(self):
+        """The shared Bridge field does not become an SFT flag for multimodal tokenizers."""
+        result = translate_bridge_to_mlm(
+            {
+                "tokenizer.tokenizer_type": "MultimodalTokenizer",
+                "tokenizer.tokenizer_prompt_format": "nemotron-vl",
+            }
+        )
+
+        assert result.mlm_args["tokenizer-type"] == "MultimodalTokenizer"
+        assert "sft-tokenizer-prompt-format" not in result.mlm_args
+        assert ("tokenizer.tokenizer_prompt_format", "nemotron-vl") in result.skipped
 
 
 # ===========================================================================
@@ -919,7 +1152,7 @@ class TestRoundTripMlmToBridge:
         """--seq-length maps to both dataset and model fields."""
         args, env = parse_raw_args("--seq-length 4096")
         r = translate(args, env)
-        assert r.overrides.get("dataset.sequence_length") == 4096
+        assert r.overrides.get("dataset.seq_length") == 4096
         assert r.overrides.get("model.seq_length") == 4096
 
 
@@ -950,7 +1183,7 @@ class TestRoundTripBridgeToMlm:
         assert r.mlm_args.get("num-layers") == 32
 
     def test_bridge_to_mlm_seq_length(self):
-        """dataset.sequence_length → --seq-length."""
-        overrides = parse_bridge_overrides("dataset.sequence_length=4096")
+        """dataset.seq_length → --seq-length."""
+        overrides = parse_bridge_overrides("dataset.seq_length=4096")
         r = translate_bridge_to_mlm(overrides)
         assert r.mlm_args.get("seq-length") == 4096

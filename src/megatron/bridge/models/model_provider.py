@@ -16,9 +16,9 @@ import abc
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Callable, Generic, TypedDict, TypeVar, Union
+from typing import Any, Callable, Generic, Mapping, Self, TypedDict, TypeVar, Union
 
-from megatron.bridge.models.common.unimodal import _ddp_wrap, _print_num_params, to_empty_if_meta_device
+from megatron.bridge.models.common.unimodal import _ddp_wrap, _print_num_params
 
 
 try:
@@ -31,14 +31,9 @@ except ImportError:
 
         Unpack = MagicMock()
 
-
-from typing import Callable
-
 import torch
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.distributed import (
-    DistributedDataParallelConfig,
-)
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -63,6 +58,42 @@ except ImportError:
 
 
 ModelT = TypeVar("ModelT", bound=MegatronModule)
+
+
+def _apply_mixed_precision_wrapper(
+    model: list[MegatronModule],
+    model_config: Any,
+    mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule],
+) -> list[MegatronModule]:
+    """Wrap a model while preserving parameters explicitly marked for FP32."""
+    keep_in_fp32: list[tuple[torch.nn.Module, str, torch.Tensor]] = []
+    for model_module in model:
+        for submodule in model_module.modules():
+            # Preserve the existing MCore expert-bias contract.
+            if hasattr(submodule, "_maintain_float32_expert_bias"):
+                expert_bias = getattr(submodule, "expert_bias", None)
+                if expert_bias is not None:
+                    keep_in_fp32.append((submodule, "expert_bias", expert_bias.data.clone()))
+
+            # Model-specific modules can mark direct parameters that must not be
+            # truncated by Float16Module's recursive half()/bfloat16() cast.
+            parameter_names = vars(submodule).get("_keep_in_float32_parameter_names", ())
+            if not isinstance(parameter_names, (list, tuple)):
+                raise TypeError("_keep_in_float32_parameter_names must be a list or tuple")
+            for parameter_name in parameter_names:
+                parameter = getattr(submodule, parameter_name, None)
+                if not isinstance(parameter, torch.nn.Parameter):
+                    raise TypeError(
+                        f"{type(submodule).__name__}.{parameter_name} must be a Parameter to remain in FP32"
+                    )
+                keep_in_fp32.append((submodule, parameter_name, parameter.data.clone()))
+
+    wrapped_model = [mixed_precision_wrapper(model_config, model_module) for model_module in model]
+
+    for submodule, parameter_name, fp32_data in keep_in_fp32:
+        getattr(submodule, parameter_name).data = fp32_data
+
+    return wrapped_model
 
 
 class ModelProviderMixin(abc.ABC, Generic[ModelT]):
@@ -103,6 +134,54 @@ class ModelProviderMixin(abc.ABC, Generic[ModelT]):
             ModelT: The Megatron model instance.
         """
         pass
+
+    @abc.abstractmethod
+    def finalize(self) -> None:
+        """Finalize provider state after configuration overrides are applied."""
+        pass
+
+    def apply_overrides_and_finalize(
+        self,
+        dtype: torch.dtype | None = None,
+        overrides: Mapping[str, object] | None = None,
+    ) -> Self:
+        """Apply dtype and attribute overrides, then finalize this provider.
+
+        Args:
+            dtype: Optional parameter dtype. Also sets ``fp16`` and ``bf16``.
+            overrides: Provider attributes to set before finalization.
+
+        Returns:
+            This provider.
+        """
+        if dtype is not None:
+            self.params_dtype = dtype
+            self.fp16 = dtype == torch.float16
+            self.bf16 = dtype == torch.bfloat16
+
+        for name, value in (overrides or {}).items():
+            if not hasattr(self, name):
+                raise AttributeError(f"{type(self).__name__} has no attribute {name!r}.")
+            setattr(self, name, value)
+
+        # DeepSeek-V4 hash-routed MoE requires an explicit pipeline_model_parallel_layout
+        # when PP > 1 (the hash layers must co-locate with the embedding on the first
+        # stage). Recipes set this explicitly; auto-set it here so provider paths that
+        # bypass recipes (e.g. mbridge/verl) also work for PP > 1 without the caller
+        # supplying a layout. Only applies to DeepSeek-V4 and never overrides a user layout.
+        if (
+            getattr(self, "experimental_attention_variant", None) == "dsv4_hybrid"
+            and (getattr(self, "pipeline_model_parallel_size", 1) or 1) > 1
+            and getattr(self, "pipeline_model_parallel_layout", None) is None
+        ):
+            from megatron.bridge.models.deepseek.deepseek_v4_bridge import (
+                set_deepseek_v4_pipeline_model_parallel_layout,
+            )
+
+            set_deepseek_v4_pipeline_model_parallel_layout(self)
+
+        self.finalize()
+        return self
 
     def provide_distributed_model(
         self,
@@ -476,6 +555,7 @@ class ModelParallelKwargs(TypedDict, total=False):
     sequence_parallel: bool
     virtual_pipeline_model_parallel_size: int | None
     hierarchical_context_parallel_sizes: list[int] | None
+    pipeline_model_parallel_layout: list[list[str]] | None
     pipeline_dtype: torch.dtype
 
 
@@ -537,14 +617,34 @@ def get_model(
         list[MegatronModule]: List of model modules. Contains multiple modules
             when using virtual pipeline parallelism, otherwise a single module
     """
-    if fp16:
+    if fp16 is True and bf16 is True:
+        raise ValueError("Only one of fp16 and bf16 can be enabled.")
+
+    if fp16 is not None:
         model_provider.fp16 = fp16
-    if bf16:
+    if bf16 is not None:
         model_provider.bf16 = bf16
 
-    requested_meta_init = bool(init_model_with_meta_device)
+    # Enabling one precision mode overrides the provider's existing mode even
+    # when the caller omits the corresponding explicit False.
+    if fp16 is True and bf16 is None:
+        model_provider.bf16 = False
+    elif bf16 is True and fp16 is None:
+        model_provider.fp16 = False
+
+    if fp16 is not None or bf16 is not None:
+        if model_provider.fp16:
+            selected_dtype = torch.float16
+        elif model_provider.bf16:
+            selected_dtype = torch.bfloat16
+        else:
+            selected_dtype = torch.float32
+        for field_name in ("params_dtype", "pipeline_dtype", "autocast_dtype"):
+            if hasattr(model_provider, field_name):
+                setattr(model_provider, field_name, selected_dtype)
+
     model_provider.use_cpu_initialization = use_cpu_initialization if use_cpu_initialization else False
-    if requested_meta_init:
+    if init_model_with_meta_device:
         model_provider.init_model_with_meta_device = True
         with torch.device("meta"):
             model = _create_model(model_provider, model_type, pg_collection=pg_collection)
@@ -576,8 +676,6 @@ def get_model(
     _print_num_params(model, pg_collection=pg_collection)
 
     model_config = get_model_config(model[0])
-    if requested_meta_init:
-        model_config.init_model_with_meta_device = True
 
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
@@ -591,26 +689,7 @@ def get_model(
             model_module.cuda(torch.cuda.current_device())
 
     if (model_config.fp16 or model_config.bf16) and mixed_precision_wrapper is not None:
-        # Save expert bias in float32 to avoid precision loss during conversion
-        keep_in_fp32 = []
-        for model_module in model:
-            for submodule in model_module.modules():
-                if hasattr(submodule, "_maintain_float32_expert_bias"):
-                    expert_bias = getattr(submodule, "expert_bias", None)
-                    if expert_bias is not None:
-                        keep_in_fp32.append((submodule, expert_bias.data.clone()))
-
-        model = [mixed_precision_wrapper(model_config, model_module) for model_module in model]
-
-        # Restore expert bias to float32
-        for submodule, fp32_data in keep_in_fp32:
-            submodule.expert_bias.data = fp32_data
-
-    if requested_meta_init and not use_torch_fsdp2 and not use_megatron_fsdp:
-        model = [
-            to_empty_if_meta_device(model_module, device=torch.device("cuda"))
-            for model_module in model
-        ]
+        model = _apply_mixed_precision_wrapper(model, model_config, mixed_precision_wrapper)
 
     if correct_amax_history_if_needed is not None:
         correct_amax_history_if_needed(model)
@@ -660,6 +739,7 @@ def _create_model(
                 vp_stage=i,
             )
             this_model.model_type = model_type
+            this_model.vp_stage = i
             model.append(this_model)
     else:
         pre_process = is_pp_first_stage(pp_group)

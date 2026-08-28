@@ -447,61 +447,49 @@ class TestAutoBridgeIntegration:
         non_causal_config.architectures = ["Qwen2Model"]  # Not ForCausalLM
         assert AutoBridge.supports(non_causal_config) == False
 
-    def test_list_supported_models(self):
-        """Test list_supported_models includes Qwen3ForCausalLM."""
-        # This test requires the dispatch system to be set up
-        # Since we're testing in isolation, we'll skip this test
-        # In a real environment, this would work if the bridges are registered
-        pass  # Skip for now as it requires full dispatch setup
 
+class TestQwen3BridgeMTPMapping:
+    """Tests for MTP (Multi-Token Prediction) weight mappings in Qwen3Bridge.
 
-class TestQwen3BridgeParameterMapping:
-    """Test parameter mapping functionality in Qwen3Bridge."""
+    Covers the regression reported in GitHub issue #3348 where
+    AutoBridge.export_ckpt() silently dropped all MTP parameters because
+    Qwen3Bridge had no megatron_to_hf mappings for any mtp.* keys.
+    """
 
-    @pytest.fixture
-    def mock_qwen3_state_dict(self):
-        """Create a mock state dict with Qwen3 parameter names."""
-        return {
-            "model.embed_tokens.weight": torch.randn(151936, 2048),
-            "lm_head.weight": torch.randn(151936, 2048),
-            "model.norm.weight": torch.randn(2048),
-            "model.layers.0.input_layernorm.weight": torch.randn(2048),
-            "model.layers.0.post_attention_layernorm.weight": torch.randn(2048),
-            "model.layers.0.self_attn.q_norm.weight": torch.randn(256),  # Qwen3 specific
-            "model.layers.0.self_attn.k_norm.weight": torch.randn(256),  # Qwen3 specific
-            "model.layers.0.self_attn.q_proj.weight": torch.randn(2048, 2048),
-            "model.layers.0.self_attn.k_proj.weight": torch.randn(1024, 2048),
-            "model.layers.0.self_attn.v_proj.weight": torch.randn(1024, 2048),
-            "model.layers.0.self_attn.o_proj.weight": torch.randn(2048, 2048),
-            "model.layers.0.mlp.gate_proj.weight": torch.randn(6144, 2048),
-            "model.layers.0.mlp.up_proj.weight": torch.randn(6144, 2048),
-            "model.layers.0.mlp.down_proj.weight": torch.randn(2048, 6144),
-        }
+    # All Megatron-side MTP parameter patterns exactly as stored in the registry.
+    # Derived from the WARNING lines in issue #3348 plus the full MTP
+    # parameter set seen in Qwen3NextBridge (which already had MTP support).
+    # Note: QKVMapping uses a wildcard pattern (mtp.layers.*) while all
+    # AutoMapping / GatedMLPMapping entries use a concrete index (mtp.layers.0).
+    EXPECTED_MTP_MEGATRON_PARAMS: tuple = (
+        "mtp.layers.0.eh_proj.weight",
+        "mtp.layers.0.enorm.weight",
+        "mtp.layers.0.hnorm.weight",
+        "mtp.layers.0.final_layernorm.weight",
+        "mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.layer_norm_weight",
+        "mtp.layers.0.mtp_model_layer.self_attention.q_layernorm.weight",
+        "mtp.layers.0.mtp_model_layer.self_attention.k_layernorm.weight",
+        "mtp.layers.0.mtp_model_layer.self_attention.linear_proj.weight",
+        # QKVMapping stores a wildcard pattern, not a concrete layer index
+        "mtp.layers.*.mtp_model_layer.self_attention.linear_qkv.weight",
+        "mtp.layers.0.mtp_model_layer.mlp.linear_fc1.layer_norm_weight",
+        "mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight",
+        "mtp.layers.0.mtp_model_layer.mlp.linear_fc2.weight",
+    )
 
-    def test_mapping_registry_has_qwen3_specific_mappings(self):
-        """Test that mapping registry includes Qwen3-specific QK norm mappings."""
+    def _get_all_megatron_params(self, mapping_registry):
+        """Return the set of Megatron parameter patterns as stored in the registry."""
+        return {mapping.megatron_param for mapping in mapping_registry.get_all_mappings()}
+
+    def test_mtp_params_are_registered(self):
+        """All MTP Megatron parameter patterns must appear in the mapping registry."""
         bridge = Qwen3Bridge()
-        mapping_registry = bridge.mapping_registry()
+        registry = bridge.mapping_registry()
+        registered = self._get_all_megatron_params(registry)
 
-        # This test verifies that the mapping registry was created
-        # The actual parameter mappings are tested in integration tests
-        assert mapping_registry is not None
-
-    def test_qwen3_qk_norm_mapping_difference(self):
-        """Test that Qwen3 bridge includes QK norm mappings not present in Qwen2."""
-        bridge = Qwen3Bridge()
-        mapping_registry = bridge.mapping_registry()
-
-        # Qwen3 should have QK norm mappings
-        # This is implicitly tested by the bridge's mapping_registry method
-        # which includes the QK norm parameter mappings
-        assert mapping_registry is not None
-
-    def test_qwen3_no_qkv_bias_mapping(self):
-        """Test that Qwen3 bridge doesn't include QKV bias mappings."""
-        bridge = Qwen3Bridge()
-        mapping_registry = bridge.mapping_registry()
-
-        # Qwen3 doesn't have QKV bias, unlike Qwen2
-        # This is reflected in the QKVMapping not including bias terms
-        assert mapping_registry is not None
+        missing = [p for p in self.EXPECTED_MTP_MEGATRON_PARAMS if p not in registered]
+        assert not missing, (
+            f"Qwen3Bridge.mapping_registry() is missing MTP mappings for: {missing}\n"
+            "These parameters are silently dropped during AutoBridge.export_ckpt() "
+            "when mtp_num_layers >= 1 (see issue #3348)."
+        )

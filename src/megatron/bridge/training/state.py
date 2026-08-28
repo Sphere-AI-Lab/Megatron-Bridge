@@ -20,22 +20,19 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
+from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.energy_monitor import EnergyMonitor
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.timers import Timers
 from megatron.core.utils import StragglerDetector
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.tensorboard.writer import SummaryWriter
 
-
-# TODO: Remove try/except once `get_async_strategy` lands in mcore dev.
-#       The function was added to mcore main but has not yet been merged into dev.
-try:
-    from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
-except ImportError:
-    get_async_strategy = None  # type: ignore[assignment]
-
 from megatron.bridge.training.config import ConfigContainer
-from megatron.bridge.training.nvrx_straggler import NVRxStragglerDetectionManager
+from megatron.bridge.training.nvrx_straggler import (
+    NVRxStragglerDetectionManager,
+    safe_shutdown_nvrx_straggler_manager,
+)
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.log_utils import safe_serialize
 from megatron.bridge.training.utils.sig_utils import DistributedSignalHandler
@@ -70,10 +67,10 @@ class TrainState(Stateful):
             their corresponding tensor representations.
         """
         return {
-            "step": torch.tensor(self.step, dtype=torch.int32),
-            "consumed_train_samples": torch.tensor(self.consumed_train_samples, dtype=torch.int32),
-            "skipped_train_samples": torch.tensor(self.skipped_train_samples, dtype=torch.int32),
-            "consumed_valid_samples": torch.tensor(self.consumed_valid_samples, dtype=torch.int32),
+            "step": torch.tensor(self.step, dtype=torch.int64),
+            "consumed_train_samples": torch.tensor(self.consumed_train_samples, dtype=torch.int64),
+            "skipped_train_samples": torch.tensor(self.skipped_train_samples, dtype=torch.int64),
+            "consumed_valid_samples": torch.tensor(self.consumed_valid_samples, dtype=torch.int64),
             "floating_point_operations_so_far": torch.tensor(
                 self.floating_point_operations_so_far, dtype=torch.float64
             ),
@@ -144,8 +141,13 @@ class GlobalState:
         self._async_calls_queue: Optional[Any] = None
         self._nvrx_straggler_manager: Optional[NVRxStragglerDetectionManager] = None
         self._nvrx_straggler_created: bool = False
-        self._energy_monitor: Optional[EnergyMonitor] = None
+        self._energy_monitor: Optional[Any] = None
         self._energy_monitor_created: bool = False
+        # Eval-time context parallelism: set by the caller when eval_context_parallel_size
+        # differs from the training CP degree. ``eval_context_parallel_rebinding.eval_cp_context``
+        # reads these.
+        self._train_pgs: Optional[ProcessGroupCollection] = None
+        self._eval_pgs: Optional[ProcessGroupCollection] = None
 
     @property
     def cfg(self) -> Optional[ConfigContainer]:
@@ -201,7 +203,9 @@ class GlobalState:
 
                 import wandb
 
-                save_dir = self.cfg.logger.wandb_save_dir or os.path.join(self.cfg.checkpoint.save, "wandb")
+                save_dir = self.cfg.logger.wandb_save_dir
+                if not save_dir:
+                    save_dir = os.path.join(self.cfg.checkpoint.save, "wandb") if self.cfg.checkpoint.save else None
 
                 config_dict = self.cfg.to_dict()
                 sanitized_config = json.loads(json.dumps(config_dict, default=safe_serialize))
@@ -274,7 +278,19 @@ class GlobalState:
 
                 active_run = mlflow.active_run()
                 if active_run is None:
-                    mlflow.start_run(run_name=run_name, tags=tags or None)
+                    mlflow.start_run(
+                        run_name=run_name,
+                        tags=tags or None,
+                        description=logger_cfg.mlflow_description,
+                    )
+
+                    # Mark the run FAILED on uncaught Python exceptions.
+                    # Local import: mlflow_utils → checkpoint_utils → state forms a
+                    # cycle if install_mlflow_failure_hook is imported at module top.
+                    from megatron.bridge.training.utils.mlflow_utils import install_mlflow_failure_hook
+
+                    install_mlflow_failure_hook()
+
                 elif tags:
                     # If there is already an active run, at least set provided tags
                     mlflow.set_tags(tags)
@@ -402,13 +418,10 @@ class GlobalState:
             and self.cfg.checkpoint.save is not None
             and self.cfg.checkpoint.async_save
         ):
-            if get_async_strategy is None:
-                raise RuntimeError(
-                    "get_async_strategy is required for async checkpointing but is not available "
-                    "in the current mcore version. Please use mcore main or a newer mcore dev branch."
-                )
             async_strategy, async_modules = get_async_strategy(self.cfg.checkpoint.async_strategy)
             async_calls_queue_cls = async_modules["AsyncCallsQueue"]
+            get_write_results_queue_fn = async_modules["get_write_results_queue"]
+
             self._async_calls_queue = async_calls_queue_cls(persistent=self.cfg.checkpoint.use_persistent_ckpt_worker)
 
             if self.cfg.checkpoint.use_persistent_ckpt_worker:
@@ -419,7 +432,7 @@ class GlobalState:
                 if async_strategy == "mcore":
                     warmup_kwargs["mp_mode"] = "spawn"
                 self._async_calls_queue.warmup_persistent_caller(get_rank_safe(), **warmup_kwargs)
-                async_modules["get_write_results_queue"](self.cfg.checkpoint.async_write_results_mp_mode)
+                get_write_results_queue_fn(self.cfg.checkpoint.async_write_results_mp_mode)
 
     @property
     def async_calls_queue(self) -> Optional[Any]:
@@ -440,7 +453,7 @@ class GlobalState:
         return self._nvrx_straggler_manager
 
     @property
-    def energy_monitor(self) -> Optional[EnergyMonitor]:
+    def energy_monitor(self) -> Optional[Any]:
         """The EnergyMonitor instance for tracking energy consumption."""
         if (
             not self._energy_monitor_created
@@ -454,8 +467,8 @@ class GlobalState:
 
     def _set_signal_handler(self) -> None:
         """Initializes the distributed signal handler based on the configuration."""
-        if self.cfg.train is not None:
-            self._signal_handler = DistributedSignalHandler(self.cfg.train.exit_signal)
+        if self.cfg.train is not None and self.cfg.train.exit_signal_handler:
+            self._signal_handler = DistributedSignalHandler(self.cfg.train.exit_signal).__enter__()
 
     def reset_for_restart(self) -> None:
         """Reset GlobalState components for in-process restart.
@@ -463,16 +476,36 @@ class GlobalState:
         This cleans up all stateful components that need to be reinitialized between restart iterations.
         The async calls queue for checkpointing is handled separately in aborting in order to clean up persistent workers.
         """
+        from megatron.bridge.training.utils.checkpoint_utils import read_train_state
+
+        # The top-level tracker is overwritten after every checkpoint. A restart must
+        # not reuse the iteration cached by an earlier invocation in this process.
+        read_train_state.cache_clear()
+        if self.cfg is not None:
+            model_config = getattr(self.cfg.model, "transformer", self.cfg.model)
+            for callback_name in (
+                "finalize_model_grads_func",
+                "grad_scale_func",
+                "no_sync_func",
+                "grad_sync_func",
+                "param_sync_func",
+            ):
+                setattr(model_config, callback_name, None)
         self._timers = None
         self._train_state = None
+        if self._tensorboard_logger is not None:
+            self._tensorboard_logger.close()
         self._tensorboard_logger = None
         self._wandb_logger = None
         self._mlflow_logger = None
         self._comet_logger = None
         self._energy_monitor = None
         self._energy_monitor_created = False
+        if self._signal_handler is not None:
+            self._signal_handler.release()
         self._signal_handler = None
         self._straggler_timer = None
+        safe_shutdown_nvrx_straggler_manager(self._nvrx_straggler_manager)
         self._nvrx_straggler_manager = None
         self._nvrx_straggler_created = False
 

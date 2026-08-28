@@ -98,7 +98,7 @@ class TestGemma3VLConversion:
         # Download and save tokenizer from a reference Gemma model
         # We use a Gemma model for tokenizer artifacts since they should be compatible
         try:
-            tokenizer = GemmaTokenizer.from_pretrained("google/gemma-2b")
+            tokenizer = GemmaTokenizer.from_pretrained("google/gemma-3-1b-pt")
             tokenizer.save_pretrained(model_dir)
         except Exception as e:
             print(f"Warning: Could not download tokenizer, creating minimal tokenizer files: {e}")
@@ -208,8 +208,8 @@ class TestGemma3VLConversion:
             "-m",
             "coverage",
             "run",
-            "--data-file=/opt/Megatron-Bridge/.coverage",
-            "--source=/opt/Megatron-Bridge/",
+            f"--data-file={Path(__file__).resolve().parents[5] / '.coverage'}",
+            f"--source={Path(__file__).resolve().parents[5]}",
             "--parallel-mode",
             "examples/conversion/hf_megatron_roundtrip_multi_gpu.py",
             "--hf-model-id",

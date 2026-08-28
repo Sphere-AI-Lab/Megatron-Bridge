@@ -31,7 +31,24 @@ docker build \
 |---|---|
 | `BASE_IMAGE` | Base container |
 | `MCORE_TRIGGERED_TESTING` | When `true`, skips the uv lockfile check to allow testing against a different Megatron-LM version than the one pinned in the lockfile |
+| `INSTALL_DIFFUSION_DEPS` | When `true`, runs `scripts/install_diffusion_deps.sh` to add WAN codecs to a CI image; defaults to `false` so CVE-carrying codecs stay out of shipped Framework images |
 | `UV_CACHE_PRUNE_ARGS` | Extra arguments forwarded to `uv cache prune` after install |
+
+Use the diffusion dependency opt-in only for CI images that run the diffusion test suite:
+
+```bash
+docker build \
+  -f docker/Dockerfile.ci \
+  --target megatron_bridge \
+  --build-arg INSTALL_DIFFUSION_DEPS=true \
+  -t megatron-bridge-diffusion-tests:latest \
+  .
+```
+
+The packages installed by `scripts/install_diffusion_deps.sh` are intentionally excluded from the
+normal dependency solve in `pyproject.toml`. The installer consumes `scripts/diffusion-deps.lock`,
+which pins package versions and accepted artifact hashes; its header records the regeneration
+command. Do not enable this argument for the NeMo Framework image stack or other release images.
 
 ---
 
@@ -96,7 +113,7 @@ docker build \
   --build-arg NEMO_FW_FINAL_BASE_IMAGE=megatron-bridge:latest \
   --build-arg NEMO_COMMIT=<commit-sha> \
   --build-arg NEMO_EXPORT_DEPLOY_COMMIT=<commit-sha> \
-  --build-arg NEMO_EVAL_COMMIT=<commit-sha> \
+  --build-arg NEMO_EVALUATOR_COMMIT=<commit-sha> \
   --build-arg NEMO_RUN_COMMIT=<commit-sha> \
   -t fw-final:latest \
   .
@@ -113,9 +130,9 @@ docker build \
 | `NEMO_FW_BASE_IMAGE` | Base PyTorch container |
 | `FW_DEP_BUILDER` | Stage used as the `fw_dep_builder` base. `trtllm_builder` to include TRT-LLM, `base` to skip it |
 | `FW_BASE_FINAL` | Output stage. `trtllm_install` (with TRT-LLM) or `fw_toolkit_builder` (without) |
-| `FW_NETWORK_LAYER` | Stage used as the `fw_toolkit_builder` base. `aws_ofi_builder` (default) to reinstall EFA and build AWS-OFI-NCCL from source, `fw_dep_builder` to skip it |
 | `UV_VERSION` | uv version to install |
 | `VLLM_VERSION` | vLLM git tag to build |
+| `VLLM_WHEEL_SRC` | Stage supplying the vLLM wheel. `vllm_wheel_build` (default) builds it from source; `vllm_wheel_none` skips both the build and the install |
 | `TRT_LLM_COMMIT` | TensorRT-LLM git commit or tag |
 | `TRT_LLM_VERSION` | TensorRT-LLM version string embedded as an image environment variable |
 | `TRT_VER` | TensorRT version for the TRT-LLM install scripts |
@@ -124,8 +141,6 @@ docker build \
 | `NCCL_VER` | NCCL version for the TRT-LLM install scripts |
 | `CUBLAS_VER` | cuBLAS version for the TRT-LLM install scripts |
 | `NVRTC_VER` | NVRTC version for the TRT-LLM install scripts |
-| `INSTALL_DEEPEP` | Set to `True` to build and install DeepEP and nvshmem |
-| `DEEPEP_COMMIT` | DeepEP git commit SHA |
 | `REINSTALL_NSYS` | Set to `True` to reinstall Nsight Systems from the NVIDIA apt repo |
 | `NSYS_VERSION` | Nsight Systems version (e.g. `2026.1.0.1085`) |
 | `REINSTALL_CUDNN` | Set to `True` to reinstall cuDNN from the NVIDIA apt repo |
@@ -140,7 +155,12 @@ docker build \
 | Argument | Description |
 |---|---|
 | `BASE_IMAGE` | Base container; set to the fw-base image when building the full stack |
+| `APPLY_PYTORCH_LIBRARY_FINALIZER_PATCH` | Set to `True` to apply the torch.library finalizer patch; `False` for base images it does not apply against (e.g. Rubin) |
+| `INSTALL_DEEPEP` | Set to `True` to build and install DeepEP and nvshmem |
+| `DEEPEP_COMMIT` | DeepEP git commit SHA |
+| `REINSTALL_NVSHMEM` | Set to `True` to reinstall nvshmem (`nvidia-nvshmem-cu13`) over the base image version; only applied when `INSTALL_DEEPEP=True` |
 | `MCORE_TRIGGERED_TESTING` | Skip uv lockfile check for cross-version Megatron-LM testing |
+| `INSTALL_DIFFUSION_DEPS` | Install the test-only WAN diffusion dependencies; defaults to `false` for Framework/release images |
 | `UV_CACHE_PRUNE_ARGS` | Extra arguments for `uv cache prune` |
 
 ### `Dockerfile.fw_final`
@@ -150,7 +170,7 @@ docker build \
 | `NEMO_FW_FINAL_BASE_IMAGE` | Base image; must be a megatron-bridge image |
 | `NEMO_COMMIT` | NeMo git commit SHA |
 | `NEMO_EXPORT_DEPLOY_COMMIT` | NeMo Export-Deploy git commit SHA |
-| `NEMO_EVAL_COMMIT` | NeMo Evaluator git commit SHA |
+| `NEMO_EVALUATOR_COMMIT` | NeMo Evaluator git commit SHA |
 | `NEMO_RUN_COMMIT` | NeMo Run git commit SHA |
 
 ---
@@ -164,5 +184,5 @@ docker build \
 | `common/install_nccl.sh` | Reinstall NCCL from the public NVIDIA CUDA apt repo |
 | `common/install_cudnn.sh` | Reinstall cuDNN from the public NVIDIA CUDA apt repo |
 | `common/install_nsys.sh` | Reinstall Nsight Systems from the public NVIDIA CUDA apt repo |
-| `patches/deepep.patch` | Patch applied to DeepEP during fw-base build |
+| `patches/deepep.patch` | Patch applied to DeepEP during CI image build |
 | `patches/vllm.patch` | Patch applied to vLLM after install in fw-base |

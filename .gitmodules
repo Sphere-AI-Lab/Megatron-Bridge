@@ -1,4 +1,3 @@
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM
-	url = https://github.com/Sphere-AI-Lab/Megatron-LM.git
-	branch = orbit-main
+	url = https://github.com/NVIDIA/Megatron-LM.git

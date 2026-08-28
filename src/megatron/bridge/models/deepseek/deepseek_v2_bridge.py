@@ -14,11 +14,14 @@
 
 from functools import partial
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.deepseek.attention import (
+    get_deepseek_decoder_block_spec,
+    replace_mla_self_attention,
+)
 from megatron.bridge.models.deepseek.common import get_common_mapping_list
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mla_provider import MLAModelProvider
@@ -45,7 +48,10 @@ class DeepSeekV2Bridge(MegatronModelBridge):
         provider = super().provider_bridge(hf_pretrained)
         hf_config = hf_pretrained.config
 
-        provider.transformer_layer_spec = partial(get_gpt_decoder_block_spec, use_transformer_engine=HAVE_TE)
+        provider.transformer_layer_spec = partial(get_deepseek_decoder_block_spec, use_transformer_engine=HAVE_TE)
+        # A standalone MTP stage has no decoder layers, so the provider re-derives its
+        # layer spec from MCore and never calls the builder above. Re-apply the swap there.
+        provider.mtp_layer_spec_transform = replace_mla_self_attention
         provider.normalization = "RMSNorm"
         provider.gated_linear_unit = True
         provider.add_bias_linear = False
@@ -111,16 +117,6 @@ class DeepSeekV2Bridge(MegatronModelBridge):
 
         return hf_cfg
 
-    def build_conversion_tasks(self, hf_pretrained, megatron_model):
-        """Override to store config before mapping_registry is called."""
-        # Store config on instance for use in mapping_registry
-        from transformers import PretrainedConfig
-
-        self._hf_config = hf_pretrained if isinstance(hf_pretrained, PretrainedConfig) else hf_pretrained.config
-        return super().build_conversion_tasks(hf_pretrained, megatron_model)
-
     def mapping_registry(self) -> MegatronMappingRegistry:
-        # Get hf_config if available (set by build_conversion_tasks)
-        hf_config = getattr(self, "_hf_config", None)
-        mapping_list = get_common_mapping_list(hf_config=hf_config)
+        mapping_list = get_common_mapping_list(hf_config=self.hf_config)
         return MegatronMappingRegistry(*mapping_list)

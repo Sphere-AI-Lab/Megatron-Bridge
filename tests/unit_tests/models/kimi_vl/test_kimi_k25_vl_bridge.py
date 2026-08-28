@@ -16,10 +16,12 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from transformers.configuration_utils import PretrainedConfig
 
+from megatron.bridge.models.conversion.auto_bridge import AutoBridge
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.param_mapping import AutoMapping, ReplicatedMapping
-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.kimi_vl.kimi_k25_vl_bridge import KimiK25VLBridge
 from megatron.bridge.models.kimi_vl.kimi_k25_vl_provider import KimiK25VLModelProvider
 
@@ -119,9 +121,10 @@ def mock_hf_config(mock_text_config, mock_vision_config):
 @pytest.fixture
 def mock_hf_pretrained(mock_hf_config):
     """Create a mock HF pretrained VLM."""
-    pretrained = Mock(spec=PreTrainedVLM)
+    pretrained = Mock(spec=PreTrainedCausalLM)
     pretrained.config = mock_hf_config
-    pretrained._model_name_or_path = "/path/to/kimi_k25_vl"
+    pretrained.model_name_or_path = "/path/to/kimi_k25_vl"
+    pretrained.trust_remote_code = False
     pretrained.generation_config = None
     return pretrained
 
@@ -132,23 +135,27 @@ def kimi_bridge():
     return KimiK25VLBridge()
 
 
-class TestKimiK25VLBridgeInitialization:
-    """Test KimiK25VLBridge initialization."""
-
-    def test_bridge_initialization(self, kimi_bridge):
-        """Test bridge can be initialized."""
-        assert isinstance(kimi_bridge, KimiK25VLBridge)
-
-    def test_bridge_has_required_methods(self, kimi_bridge):
-        """Test bridge has required methods."""
-        assert hasattr(kimi_bridge, "provider_bridge")
-        assert callable(kimi_bridge.provider_bridge)
-        assert hasattr(kimi_bridge, "mapping_registry")
-        assert callable(kimi_bridge.mapping_registry)
-
-
 class TestKimiK25VLBridgeProviderBridge:
     """Test provider_bridge method."""
+
+    def test_autobridge_config_only_provider_flow(self, mock_hf_config):
+        """Test AutoBridge passes a config-backed causal wrapper through the real VLM bridge."""
+        model_id = "moonshotai/Kimi-K2.5"
+        config = PretrainedConfig(name_or_path=model_id)
+        config.architectures = ["KimiK25ForConditionalGeneration"]
+        config.text_config = mock_hf_config.text_config
+        config.vision_config = mock_hf_config.vision_config
+        config.media_placeholder_token_id = mock_hf_config.media_placeholder_token_id
+        config.pad_token_id = mock_hf_config.pad_token_id
+        config.ignore_index = mock_hf_config.ignore_index
+        config.torch_dtype = mock_hf_config.torch_dtype
+
+        provider = AutoBridge.from_hf_config(config).to_megatron_provider(load_weights=False)
+
+        assert isinstance(provider, KimiK25VLModelProvider)
+        assert provider.hf_model_path == model_id
+        assert provider.num_layers == 61
+        assert provider.vision_config is mock_hf_config.vision_config
 
     def test_provider_bridge_basic_config(self, kimi_bridge, mock_hf_pretrained):
         """Test provider_bridge creates correct provider with basic config."""
@@ -168,6 +175,10 @@ class TestKimiK25VLBridgeProviderBridge:
         assert provider.moe_router_topk == 8
         assert provider.moe_router_score_function == "sigmoid"
         assert provider.moe_router_enable_expert_bias is True
+        assert provider.moe_token_dispatcher_type == "flex"
+        assert provider.moe_flex_dispatcher_backend == "hybridep"
+        assert provider.moe_flex_dispatcher_num_sms == 16
+        assert provider.moe_permute_fusion_into_hybridep is False
 
     def test_provider_bridge_moe_layer_freq(self, kimi_bridge, mock_hf_pretrained):
         """Test MoE layer frequency computation."""
@@ -206,6 +217,19 @@ class TestKimiK25VLBridgeProviderBridge:
         """Test HF model path is stored on provider."""
         provider = kimi_bridge.provider_bridge(mock_hf_pretrained)
         assert provider.hf_model_path == "/path/to/kimi_k25_vl"
+
+    def test_provider_bridge_trust_remote_code_default(self, kimi_bridge, mock_hf_pretrained):
+        """Test remote code trust is disabled by default."""
+        provider = kimi_bridge.provider_bridge(mock_hf_pretrained)
+        assert provider.trust_remote_code is False
+
+    def test_provider_bridge_trust_remote_code_propagates(self, kimi_bridge, mock_hf_pretrained):
+        """Test remote code trust is propagated from the HF wrapper."""
+        mock_hf_pretrained.trust_remote_code = True
+
+        provider = kimi_bridge.provider_bridge(mock_hf_pretrained)
+
+        assert provider.trust_remote_code is True
 
     def test_provider_bridge_different_hidden_sizes(self, kimi_bridge, mock_hf_pretrained):
         """Test provider_bridge with different hidden sizes."""
@@ -280,6 +304,49 @@ class TestKimiK25VLBridgeWeightConversion:
         """Test _is_quantized_expert_key returns False for non-expert keys."""
         assert kimi_bridge._is_quantized_expert_key("model.layers.5.self_attn.q_proj.weight") is False
         assert kimi_bridge._is_quantized_expert_key("model.embed_tokens.weight") is False
+
+    def test_plain_export_dtype_skips_int4_requantization(self, kimi_bridge):
+        """An explicit plain export dtype must preserve routed expert weights."""
+        from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+
+        task = WeightConversionTask(
+            param_name="decoder.layers.5.mlp.experts.linear_fc1.weight0",
+            global_param_name="decoder.layers.5.mlp.experts.linear_fc1.weight0",
+            mapping=Mock(),
+            weight_dtype=torch.bfloat16,
+        )
+        weight_key = "language_model.model.layers.5.mlp.experts.0.gate_proj.weight"
+        weight = torch.ones((2, 32), dtype=torch.float32)
+
+        result = kimi_bridge.maybe_modify_converted_hf_weight(task, {weight_key: weight}, {})
+
+        assert set(result) == {weight_key}
+        assert result[weight_key] is weight
+
+    def test_default_export_requantizes_routed_expert_weights(self, kimi_bridge):
+        """Default export should continue recreating Kimi's INT4 source layout."""
+        from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+
+        task = WeightConversionTask(
+            param_name="decoder.layers.5.mlp.experts.linear_fc1.weight0",
+            global_param_name="decoder.layers.5.mlp.experts.linear_fc1.weight0",
+            mapping=Mock(),
+        )
+        weight_key = "language_model.model.layers.5.mlp.experts.0.gate_proj.weight"
+
+        result = kimi_bridge.maybe_modify_converted_hf_weight(
+            task,
+            {weight_key: torch.ones((2, 32), dtype=torch.bfloat16)},
+            {},
+        )
+
+        base_key = weight_key.removesuffix(".weight")
+        assert set(result) == {
+            f"{base_key}.weight_packed",
+            f"{base_key}.weight_scale",
+            f"{base_key}.weight_shape",
+        }
+        assert result[f"{base_key}.weight_packed"].dtype == torch.int32
 
     @patch("megatron.bridge.models.kimi_vl.kimi_k25_vl_bridge.dequantize_int4")
     def test_load_and_dequantize_uses_source_tensor_device(self, mock_dequantize, kimi_bridge):

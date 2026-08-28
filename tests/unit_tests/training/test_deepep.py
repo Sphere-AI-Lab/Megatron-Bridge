@@ -12,15 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from megatron.core.transformer import TransformerConfig
+from scripts.performance.utils.utils import finalize_config_overrides
 
 from megatron.bridge.training.flex_dispatcher_backend import (
     apply_flex_dispatcher_backend,
     validate_flex_dispatcher_backend,
 )
+
+
+@pytest.fixture(autouse=True)
+def _mock_cuda_available(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
 
 
 class TestApplyDeepEP:
@@ -87,6 +94,16 @@ class TestApplyDeepEP:
         assert config.moe_token_dispatcher_type == "flex"
         assert config.moe_flex_dispatcher_backend == "deepep"
         assert config.moe_shared_expert_overlap is False
+
+    @patch("torch.cuda.get_device_properties", side_effect=RuntimeError("CUDA initialization failed"))
+    def test_apply_flex_dispatcher_backend_preserves_cuda_probe_errors(self, mock_get_device_properties):
+        config = MagicMock(spec=TransformerConfig)
+        config.num_moe_experts = 8
+
+        with pytest.raises(RuntimeError, match="CUDA initialization failed"):
+            apply_flex_dispatcher_backend(config, moe_flex_dispatcher_backend="deepep")
+
+        mock_get_device_properties.assert_called_once_with(0)
 
     @patch("megatron.bridge.training.flex_dispatcher_backend.logger")
     def test_apply_flex_dispatcher_backend_warns_for_non_moe_model_none_experts(self, mock_logger):
@@ -183,6 +200,69 @@ class TestApplyDeepEP:
         # Verify configs were NOT set
         assert config.moe_token_dispatcher_type != "flex"
         assert config.moe_shared_expert_overlap != False
+
+
+class TestFlexDispatcherFallback:
+    """Test unsupported flex backends stay disabled after config finalization."""
+
+    @patch("torch.cuda.get_device_properties")
+    def test_none_backend_override_falls_back_to_alltoall(self, mock_get_device_properties):
+        """Test that clearing a configured flex backend restores the standard dispatcher."""
+        mock_properties = MagicMock()
+        mock_properties.major = 9
+        mock_properties.name = "NVIDIA H100"
+        mock_get_device_properties.return_value = mock_properties
+        config = SimpleNamespace(
+            num_moe_experts=8,
+            moe_token_dispatcher_type="alltoall",
+            moe_flex_dispatcher_backend=None,
+            moe_shared_expert_overlap=True,
+        )
+
+        apply_flex_dispatcher_backend(config, moe_flex_dispatcher_backend="deepep")
+        config.moe_flex_dispatcher_backend = None
+        validate_flex_dispatcher_backend(config)
+
+        assert config.moe_token_dispatcher_type == "alltoall"
+        assert config.moe_flex_dispatcher_backend is None
+
+    @pytest.mark.parametrize(
+        ("backend", "major", "device_name"),
+        [
+            pytest.param("deepep", 10, "NVIDIA GB200", id="deepep-gb200"),
+            pytest.param("hybridep", 11, "NVIDIA X200", id="hybridep-unsupported"),
+        ],
+    )
+    @patch("torch.cuda.get_device_properties")
+    def test_unsupported_backend_falls_back_to_alltoall(
+        self,
+        mock_get_device_properties,
+        backend,
+        major,
+        device_name,
+    ):
+        mock_properties = MagicMock()
+        mock_properties.major = major
+        mock_properties.name = device_name
+        mock_get_device_properties.return_value = mock_properties
+        config = SimpleNamespace(
+            model=SimpleNamespace(
+                num_moe_experts=8,
+                moe_token_dispatcher_type="alltoall",
+                moe_flex_dispatcher_backend=backend,
+                moe_shared_expert_overlap=True,
+            ),
+            ddp=SimpleNamespace(nccl_ub=False, fsdp_manual_registration=False),
+        )
+
+        apply_flex_dispatcher_backend(config.model, moe_flex_dispatcher_backend=backend)
+        finalize_config_overrides(config)
+        validate_flex_dispatcher_backend(config.model)
+
+        assert config.model.moe_token_dispatcher_type == "alltoall"
+        assert config.model.moe_flex_dispatcher_backend is None
+        assert config.model.moe_shared_expert_overlap is True
+        mock_get_device_properties.assert_called_once_with(0)
 
 
 class TestValidateDeepEP:

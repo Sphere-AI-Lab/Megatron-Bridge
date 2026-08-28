@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
+import json
+import math
 import os
 import warnings
-from abc import ABC, abstractmethod
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Tuple, Union
@@ -27,9 +27,8 @@ from megatron.core.optimizer import OptimizerConfig as MCoreOptimizerConfig
 from megatron.core.optimizer import (
     ParamGroupOverride,
     ParamKey,
+    get_standard_config_overrides,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import MLATransformerConfig as MCoreMLATransformerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig as MCoreTransformerConfig
@@ -43,23 +42,47 @@ from megatron.training.config import SchedulerConfig as MTrainSchedulerConfig
 from megatron.training.config import StragglerDetectionConfig as MTrainStragglerDetectionConfig
 from megatron.training.config import TrainingConfig as MTrainTrainingConfig
 
-from megatron.bridge.data.datasets.packed_sequence import PackedSequenceSpecs
+from megatron.bridge.data.base import (
+    DataloaderConfig,
+    DatasetProvider,
+)
+from megatron.bridge.data.base import (
+    DatasetBuildContext as DatasetBuildContext,
+)
+from megatron.bridge.data.builders.direct_hf_sft import DirectHFSFTDatasetConfig
+from megatron.bridge.data.builders.energon import EnergonDatasetConfig
+
+# Deprecated training.config import compatibility. New code imports dataset
+# Config + Builder APIs from megatron.bridge.data.builders.
+from megatron.bridge.data.builders.gpt_sft import (
+    FinetuningDatasetConfig as FinetuningDatasetConfig,
+)
+from megatron.bridge.data.builders.gpt_sft import (
+    GPTSFTDatasetConfig,
+)
+from megatron.bridge.data.builders.mock_vlm_sft import MockVLMSFTDatasetConfig
+from megatron.bridge.data.sources.hf import HFDatasetSourceConfig as HFDatasetSourceConfig
 from megatron.bridge.models import GPTModelProvider, T5ModelProvider
 from megatron.bridge.models.gpt.gpt_builder import GPTModelConfig
-from megatron.bridge.models.mamba.mamba_builder import MambaModelConfig
-from megatron.bridge.models.mamba.mamba_provider import MambaModelProvider
-from megatron.bridge.models.mimo.mimo_provider import MimoModelProvider
+from megatron.bridge.models.hybrid.hybrid_builder import HybridModelConfig
+from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
+from megatron.bridge.models.megatron_mimo.megatron_mimo_provider import MegatronMIMOProvider
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.training.comm_overlap import CommOverlapConfig
 from megatron.bridge.training.flex_dispatcher_backend import validate_flex_dispatcher_backend
+from megatron.bridge.training.fsdp_compat import MCORE_HAS_MEGATRON_FSDP_V2
 from megatron.bridge.training.mixed_precision import MixedPrecisionConfig, get_mixed_precision_config
 from megatron.bridge.training.tokenizers.config import TokenizerConfig
-from megatron.bridge.training.tokenizers.tokenizer import MegatronTokenizer
 from megatron.bridge.training.utils.config_utils import _ConfigContainerBase as Container
 from megatron.bridge.utils.common_utils import (
     get_world_size_safe,
     print_rank_0,
     warn_rank_0,
+)
+from megatron.bridge.utils.cuda_graph import (
+    cuda_graph_module_names,
+    is_full_iteration_cuda_graph,
+    validate_cuda_graph_configuration,
 )
 
 
@@ -138,6 +161,13 @@ class DistributedInitConfig(MTrainDistributedInitConfig):
     global parallel state (mpu) variables. When True, parallel groups are obtained from
     the pg_collection object rather than the global megatron.core.parallel_state module."""
 
+    eval_context_parallel_size: int | None = None
+    """If set and different from model.context_parallel_size, validation runs with this CP
+    degree instead of the training CP degree. Requires use_decentralized_pg=True. The caller
+    is responsible for constructing a separate eval ProcessGroupCollection and wiring it
+    through GlobalState or the evaluate() call. See eval_context_parallel_rebinding.py
+    and the examples/training_features/decentralized_pg/pretrain_qwen3_eval_cp.py showcase."""
+
     @property
     def lazy_init(self) -> bool:
         return self.lazy_mpu_init
@@ -160,61 +190,6 @@ class RerunStateMachineConfig(MTrainRerunStateMachineConfig):
     this multiple of the max observed loss over the sample window."""
 
 
-@dataclass(kw_only=True)
-class DataloaderConfig:
-    """Base configuration for data loading."""
-
-    dataloader_type: Optional[Literal["single", "cyclic", "batch", "external"]] = None
-    """Dataloader type: 'single' for single pass, 'cyclic' for multiple passes with shuffling,
-    'batch' for global batch sampling (used in fine-tuning), or 'external' for custom dataloaders."""
-
-    num_workers: int = 2
-    """Dataloader number of workers."""
-
-    data_sharding: bool = True
-    """Disable data sharding."""
-
-    pin_memory: bool = True
-    """Whether to pin memory during data loading for faster GPU training."""
-
-    drop_last: bool = True
-    """Whether to drop the last incomplete batch."""
-
-    persistent_workers: bool = True
-    """Whether to keep data loading workers persistent across epochs.
-    Automatically set to False when num_workers is 0."""
-
-    trust_remote_code: Optional[bool] = None
-    """Whether remote code execution should be trusted for a given HF path."""
-
-    def finalize(self):
-        """Finalize dataloader config field constraints."""
-        if self.num_workers == 0 and self.persistent_workers:
-            self.persistent_workers = False
-
-
-@dataclass(frozen=True)
-class DatasetBuildContext:
-    """Interface that encapsulates framework internals.
-
-    This context provides metadata needed to build datasets
-    while hiding implementation details of the framework.
-
-    Attributes:
-        train_samples: Number of samples for training dataset
-        valid_samples: Number of samples for validation dataset
-        test_samples: Number of samples for test dataset
-        tokenizer: Optional tokenizer instance for text processing
-        pg_collection: Optional process group collection for distributed training
-    """
-
-    train_samples: int
-    valid_samples: int
-    test_samples: int
-    tokenizer: Optional[MegatronTokenizer] = None
-    pg_collection: Optional[ProcessGroupCollection] = None
-
-
 @dataclass(frozen=True)
 class OptimizerConfigOverrideProviderContext:
     """Context for providing config overrides."""
@@ -231,110 +206,17 @@ class OptimizerConfigOverrideProvider:
     def build_config_overrides(
         self, context: OptimizerConfigOverrideProviderContext
     ) -> dict[ParamKey, ParamGroupOverride] | None:
-        """Build config overrides for weight decay based on scheduler configuration.
-
-        This function creates parameter-specific overrides for weight decay behavior.
-        By default, weight decay is skipped for bias parameters and 1D parameters.
-        For Qwen3-Next models, weight decay is applied to q_layernorm and k_layernorm.
+        """Build optimizer parameter-group overrides.
 
         Args:
-            context: OptimizerConfigOverrideProviderContext which packages the scheduler
-                configuration, optimizer configuration, and model.
+            context: Scheduler, optimizer, and model context for override construction.
 
         Returns:
-            Dictionary of ParamKey to ParamGroupOverride for the optimizer
+            Mapping from ``ParamKey`` matchers to per-group optimizer overrides, or ``None``
+            if no overrides are needed.
         """
-        model = context.model
-        scheduler_config = context.scheduler_config
-        optimizer_config = context.optimizer_config
-
-        config_overrides: dict[ParamKey, ParamGroupOverride] = {}
-
-        # Collect param names that should skip weight decay
-        # NOTE: this can be simplified once https://github.com/NVIDIA/Megatron-LM/pull/2753
-        #  is merged into dev. Then we can re-use megatron's apply_wd_to_qk_layernorm option
-        #  and call megatron.core.optimizer.get_standard_config_overrides(optimizer_config)
-        #  directly for standard settings, replacing the custom logic below for qwen3-next.
-        no_wd_names: list[str] = []
-        is_qwen3_next = scheduler_config.no_weight_decay_cond_type == "qwen3_next"
-
-        model_list = model if isinstance(model, list) else [model]
-        for model_chunk in model_list:
-            for name, param in model_chunk.named_parameters():
-                # Skip weight decay for bias parameters
-                if name.endswith(".bias"):
-                    no_wd_names.append(name)
-                    continue
-
-                # Skip weight decay for 1D parameters
-                if len(param.shape) == 1:
-                    if is_qwen3_next:
-                        # Qwen3-Next: apply weight decay to qk layernorm (don't add to skip list)
-                        if "q_layernorm" in name or "k_layernorm" in name:
-                            continue
-                    no_wd_names.append(name)
-
-        # Create a single ParamKey with all names that should skip weight decay
-        if no_wd_names:
-            no_wd_key = ParamKey(name=tuple(no_wd_names))
-            config_overrides[no_wd_key] = ParamGroupOverride(wd_mult=0.0)
-
-        # Now handle decoupled LR:
-        if optimizer_config.decoupled_lr is not None:
-            decoupled_lr_config: ParamGroupOverride = {"max_lr": optimizer_config.decoupled_lr}
-            decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-            if optimizer_config.decoupled_min_lr is not None:
-                decoupled_lr_config["min_lr"] = optimizer_config.decoupled_min_lr
-            config_overrides[decoupled_param_key] = decoupled_lr_config
-
+        config_overrides = get_standard_config_overrides(config=context.optimizer_config)
         return config_overrides if config_overrides else None
-
-
-@dataclass
-class DatasetProvider(DataloaderConfig, ABC):
-    """Abstract base class for custom dataset configurations.
-
-    Provides an interface for users to implement their own dataset builders
-    while automatically inheriting all DataloaderConfig functionality.
-
-    Users must:
-    1. Inherit from this class
-    2. Implement the build_datasets() method
-
-    Example:
-        @dataclass
-        class S3DatasetConfig(DatasetProvider):
-            bucket_name: str
-            data_prefix: str
-            seq_length: int
-
-            def build_datasets(self, context: DatasetBuildContext) -> Tuple[Optional[Any], Optional[Any], Optional[Any]]:
-                # Custom implementation to load data from S3
-                train_ds = load_s3_dataset(self.bucket_name, f"{self.data_prefix}/train", context.tokenizer)
-                valid_ds = load_s3_dataset(self.bucket_name, f"{self.data_prefix}/valid", context.tokenizer)
-                test_ds = load_s3_dataset(self.bucket_name, f"{self.data_prefix}/test", context.tokenizer)
-                return train_ds, valid_ds, test_ds
-    """
-
-    @abstractmethod
-    def build_datasets(self, context: DatasetBuildContext) -> Tuple[Optional[Any], Optional[Any], Optional[Any]]:
-        """Build train, validation, and test datasets.
-
-        This method is called by the framework during dataset initialization.
-        Implementations should use the provided context to create appropriate
-        datasets for each split.
-
-        Args:
-            context: Build context with sample counts and tokenizer
-
-        Returns:
-            Tuple of (train_dataset, valid_dataset, test_dataset)
-            Any element can be None if that split shouldn't be created.
-
-        Raises:
-            NotImplementedError: Must be implemented by subclasses
-        """
-        pass
 
 
 @dataclass
@@ -346,29 +228,44 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
     for field modifications after construction but before computed fields are calculated.
     """
 
+    seq_length: int = field(kw_only=True)
+    """Bridge-facing sequence length copied to Megatron Core during ``finalize()``."""
+
     data_path: str | list[str] | None = None
     """CLI-friendly alternative to ``blend``.  Accepts a single path string,
     a space-separated multi-path string, or a list of paths (with optional
     interleaved weights, matching Megatron-LM ``--data-path`` semantics).
     Converted to ``blend`` automatically during ``finalize()``."""
 
+    per_dataset_sequences_path: str | None = None
+    """Path to a JSON file containing precomputed sequence and document counts
+    per dataset path.  The file is generated by
+    ``tools/build_sequences_per_dataset.py`` from Megatron-LM.  When provided,
+    the JSON is loaded and passed as ``sequences_per_dataset`` during
+    ``finalize()``, which speeds up dataloader initialization by skipping
+    per-dataset index file reads."""
+
     def __init__(
         self,
         seq_length: int | None = None,
         skip_getting_attention_mask_from_dataset: bool = True,
         data_path: str | list[str] | None = None,
+        per_dataset_sequences_path: str | None = None,
         *args,
         **kwargs,
     ):
         """
         Args:
-            seq_length (int | None): the sequence length. If not provided, `sequence_length` must be in kwargs.
+            seq_length (int | None): The sequence length.
             skip_getting_attention_mask_from_dataset (bool): if set, the dataset will pass a None attention mask
                 and the attention mask is autogenerated from the attn backend.
             data_path: CLI-friendly data path(s). Converted to ``blend`` in ``finalize()``.
+            per_dataset_sequences_path: Path to a JSON file with precomputed sequence/document
+                counts per dataset.  Converted to ``sequences_per_dataset`` in ``finalize()``.
         """
         self.skip_getting_attention_mask_from_dataset = skip_getting_attention_mask_from_dataset
         self.data_path = data_path
+        self.per_dataset_sequences_path = per_dataset_sequences_path
 
         if seq_length is not None:
             kwargs["sequence_length"] = seq_length
@@ -378,6 +275,7 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
         dataloader_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if k in DataloaderConfig.__dataclass_fields__}
         MCoreGPTDatasetConfig.__init__(self, *args, **kwargs)
         DataloaderConfig.__init__(self, **dataloader_kwargs)
+        self.seq_length = self.sequence_length
 
     def __post_init__(self) -> None:
         """Skip MCore post_init during initial construction.
@@ -386,14 +284,16 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
         """
         pass
 
-    @property
-    def seq_length(self):
-        """Alias for MCore's `sequence_length` field."""
-        return getattr(self, "sequence_length", None)
-
-    @seq_length.setter
-    def seq_length(self, value):
-        setattr(self, "sequence_length", value)
+    def to_cfg_dict(self) -> dict[str, Any]:
+        """Serialize the Bridge-facing fields without MCore's internal sequence-length copy."""
+        config_dict = {
+            "_target_": f"{self.__class__.__module__}.{self.__class__.__qualname__}",
+        }
+        for config_field in fields(self):
+            if config_field.name.startswith("_") or config_field.name == "sequence_length":
+                continue
+            config_dict[config_field.name] = Container._convert_value_to_dict(getattr(self, config_field.name))
+        return config_dict
 
     def finalize(self) -> None:
         """Execute the deferred MCore post-init logic and Bridge-specific checks.
@@ -401,6 +301,8 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
         This method calls the original Megatron Core GPTDatasetConfig.__post_init__()
         and then performs Bridge-specific validation.
         """
+        self.sequence_length = self.seq_length
+
         if self.blend is None and self.data_path is not None:
             from megatron.core.datasets.utils import get_blend_from_list
 
@@ -409,6 +311,11 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
             else:
                 paths = list(self.data_path)
             self.blend = get_blend_from_list(paths)
+
+        # Load sequences_per_dataset from JSON file if path is provided
+        if self.per_dataset_sequences_path is not None and self.sequences_per_dataset is None:
+            with open(self.per_dataset_sequences_path, "r") as f:
+                self.sequences_per_dataset = json.load(f)
 
         # Call MCore's post_init
         super(MCoreGPTDatasetConfig, self).__post_init__()
@@ -483,33 +390,24 @@ class MockGPTDatasetConfig(GPTDatasetConfig):
 
 
 @dataclass(kw_only=True)
-class FinetuningDatasetConfig(DataloaderConfig):
-    """Configuration specific to finetuning datasets, inheriting from DataloaderConfig.
-
-    Note: For fine-tuning, dataloader_type defaults to 'batch' which ensures sequences
-    within each global batch are padded to the same length.
-    """
-
-    dataloader_type: Optional[Literal["single", "cyclic", "batch", "external"]] = "batch"
-    """Dataloader type for fine-tuning. Defaults to 'batch' for optimal padding behavior."""
-
-    dataset_root: Optional[Union[str, Path]] = None
-    seq_length: int
-    seed: int = 1234
-    memmap_workers: int = 1
-    max_train_samples: Optional[int] = None
-    packed_sequence_specs: Optional[PackedSequenceSpecs] = None
-    dataset_kwargs: Optional[dict[str, Any]] = None
-    do_validation: bool = True
-    do_test: bool = True
-
-
-@dataclass(kw_only=True)
 class SchedulerConfig(MTrainSchedulerConfig):
     """Configuration settings for the learning rate scheduler and weight decay."""
 
+    max_steps: int | None = None
+    """Number of steps used to configure schedules during shortened test runs.
+
+    Set this to ``y`` together with ``TrainingConfig.train_iters=x`` when a
+    test should run only the first ``x`` steps of a full ``y``-step training
+    run. This keeps the learning-rate and weight-decay schedules the same as
+    the full ``y``-step run. ``max_steps`` must be greater than or equal to
+    ``train_iters``. When unset, existing scheduler behavior is unchanged.
+    """
+
     def finalize(self) -> None:
         """Post-initialization checks for scheduler config."""
+        if self.max_steps is not None and self.max_steps <= 0:
+            raise ValueError(f"scheduler.max_steps must be positive, got {self.max_steps}.")
+
         if self.start_weight_decay is not None:
             assert self.start_weight_decay >= 0.0, "start_weight_decay should be positive."
             assert self.end_weight_decay >= self.start_weight_decay
@@ -544,6 +442,11 @@ class SchedulerConfig(MTrainSchedulerConfig):
 class TrainingConfig(MTrainTrainingConfig):
     """Configuration settings related to the training loop and validation."""
 
+    num_epochs: float | None = None
+    """Number of passes over a finite training dataset. Supports fractional epochs."""
+
+    _train_iters_from_num_epochs: bool = field(default=False, init=False, repr=False)
+
     check_optimizer_step_success: bool = True
     """Checks optimizer.step() succeeded at each training step ."""
 
@@ -565,14 +468,27 @@ class TrainingConfig(MTrainTrainingConfig):
         """Validate training mode specification and calculate train_iters from train_samples if needed."""
         has_train_iters = self.train_iters is not None
         has_train_samples = self.train_samples is not None
+        has_num_epochs = self.num_epochs is not None
+        num_training_modes = sum(
+            (
+                has_train_iters and not self._train_iters_from_num_epochs,
+                has_train_samples,
+                has_num_epochs,
+            )
+        )
 
-        assert has_train_iters or has_train_samples, "Either train_iters or train_samples must be provided"
-        assert not (has_train_iters and has_train_samples), "Cannot specify both train_iters and train_samples"
+        assert num_training_modes > 0, "One of train_iters, train_samples, or num_epochs must be provided"
+        assert num_training_modes == 1, "Cannot specify more than one of train_iters, train_samples, or num_epochs"
+        if has_num_epochs:
+            assert self.num_epochs > 0, "num_epochs must be a positive number"
+            assert self.rampup_batch_size is None, "Batch size rampup not supported with epoch-based training"
+            assert self.global_batch_size is not None, "global_batch_size must be set when using num_epochs"
         if has_train_samples:
             assert self.train_samples > 0, "train_samples must be positive"
             assert self.rampup_batch_size is None, "Batch size rampup not supported with sample-based training yet"
 
             # Calculate train_iters from train_samples (rampup_batch_size already validated as None)
+            assert self.global_batch_size is not None, "global_batch_size must be set when using train_samples"
             self.train_iters = self.train_samples // self.global_batch_size
             print_rank_0(f"Setting training iterations to {self.train_iters} based on {self.train_samples} samples")
 
@@ -580,6 +496,16 @@ class TrainingConfig(MTrainTrainingConfig):
 @dataclass(kw_only=True)
 class CheckpointConfig(MTrainCheckpointConfig):
     """Configuration settings for model checkpointing (saving and loading)."""
+
+    stage_precision_aware_optimizer_state_on_cpu: bool = False
+    """Stage expanded precision-aware Transformer Engine optimizer state on CPU.
+
+    Enable this when reduced-precision Adam state fits during training but its
+    portable FP32 checkpoint representation would exceed available GPU memory.
+    The checkpoint values and dtypes are unchanged; only their device during
+    state-dict construction is affected. Supported only for ``torch_dist``
+    checkpoints.
+    """
 
     pretrained_checkpoint: Optional[str] = None
     """Directory containing a pretrained model checkpoint for finetuning.
@@ -624,6 +550,52 @@ class CheckpointConfig(MTrainCheckpointConfig):
     Example: ``'mypackage.checkpoint.MyCheckpointManager'``
     """
 
+    dist_ckpt_workers: int = 1
+    """Specifies the number of distributed checkpoint workers for asynchronous saving."""
+
+    also_save_hf_checkpoint: bool = False
+    """Whether to export an additional HuggingFace artifact alongside each Megatron checkpoint.
+
+    When enabled, the native Megatron checkpoint under each ``iter_*/`` directory keeps the same
+    behavior as normal checkpoint saves.  In addition, model weights are exported as HuggingFace
+    ``*.safetensors`` under ``iter_*/hf/`` together with HF ``config.json`` / tokenizer /
+    (optional) custom modeling files.
+
+    When ``cfg.peft`` is configured, the extra HF export writes a HuggingFace
+    PEFT-compatible ``adapter_model.safetensors`` + ``adapter_config.json`` instead of the
+    full base weights.
+
+    Warning:
+        Full-model HF export is synchronous and runs on the checkpoint save critical path.  It can
+        considerably slow down checkpoint saving and is intended for small models or debugging.
+        For larger models, prefer a separate background conversion job that scans for new native
+        Megatron checkpoints and exports HF weights outside the training step.
+    """
+
+    hf_source_path: Optional[str] = None
+    """Override for the HuggingFace model identifier (or local path) used as a template when
+    saving/loading checkpoints with ``also_save_hf_checkpoint=True`` (or when ``pretrained_checkpoint``
+    points to a HuggingFace directory).
+
+    When unset, Bridge resolves a source in this order (see training checkpointing helpers):
+      1. ``cfg.model.hf_model_id`` (preferred when populated by recipes / AutoBridge);
+      2. ``cfg.tokenizer.tokenizer_model`` (fallback; may refer to tokenizer assets rather than model ids).
+
+    Explicit ``hf_source_path`` always overrides both when set.
+    """
+
+    hf_trust_remote_code: bool = False
+    """Whether to trust remote code when constructing the ``AutoBridge`` for HF save/load.
+    Required for models with custom modeling files."""
+
+    hf_distributed_save: bool = False
+    """When ``also_save_hf_checkpoint=True``, enable distributed weights saving where multiple ranks
+    share the safetensors write workload. See ``SafeTensorsStateSource.save_generator``."""
+
+    hf_save_every_n_ranks: int = 1
+    """Interval for saving HF safetensors shards across ranks in distributed mode.
+    Only effective when ``hf_distributed_save=True``."""
+
     def finalize(self) -> None:
         """Post-initialization checks for checkpoint config."""
         if self.pretrained_checkpoint is not None:
@@ -636,9 +608,34 @@ class CheckpointConfig(MTrainCheckpointConfig):
         if self.load_main_params_from_ckpt:
             assert not self.load_optim, "load_main_params_from_ckpt must be used with load_optim=False"
 
+        if self.stage_precision_aware_optimizer_state_on_cpu and self.ckpt_format != "torch_dist":
+            raise ValueError("stage_precision_aware_optimizer_state_on_cpu=True requires ckpt_format='torch_dist'.")
+
         if self.async_save:
             assert self.save is not None, "async_save is enabled, but save is not set. Set save to a valid path."
             assert self.use_persistent_ckpt_worker, "async_save requires use_persistent_ckpt_worker=True."
+
+        if self.save_retain_interval is not None:
+            if self.save_retain_interval <= 0:
+                raise ValueError("save_retain_interval must be positive.")
+            if self.save_interval is None or self.save_interval <= 0:
+                raise ValueError("save_retain_interval requires a positive save_interval.")
+            if self.save_retain_interval % self.save_interval != 0:
+                raise ValueError("save_retain_interval must be divisible by save_interval.")
+            if self.most_recent_k != -1:
+                raise ValueError("save_retain_interval and most_recent_k cannot be enabled together.")
+
+        if self.also_save_hf_checkpoint:
+            if self.ckpt_format == "fsdp_dtensor":
+                raise ValueError(
+                    "also_save_hf_checkpoint=True is not supported together with ckpt_format='fsdp_dtensor'. "
+                    "Use ckpt_format='torch_dist' when exporting additional HF weights during training."
+                )
+            if self.non_persistent_ckpt_type == "local":
+                raise ValueError(
+                    "also_save_hf_checkpoint=True is not compatible with local non-persistent checkpoints. "
+                    "Use non_persistent_ckpt_type='global' or disable non-persistent saving."
+                )
 
         # Validate ckpt_step if specified
         if self.ckpt_step is not None:
@@ -683,6 +680,12 @@ class LoggerConfig(MTrainLoggerConfig):
     mlflow_tags: Optional[dict[str, str]] = None
     """Optional tags to apply to the MLFlow run."""
 
+    mlflow_description: Optional[str] = None
+    """Optional description for the MLFlow run, rendered in the UI Description panel."""
+
+    mlflow_log_artifacts: bool = True
+    """Whether to upload checkpoint artifacts to MLFlow via HTTP after each save."""
+
     comet_project: Optional[str] = None
     """The Comet ML project name. Comet logging is disabled when this is None."""
 
@@ -698,8 +701,8 @@ class LoggerConfig(MTrainLoggerConfig):
     comet_tags: Optional[list[str]] = None
     """Optional list of tags to apply to the Comet ML experiment."""
 
-    logging_level: int = logging.INFO
-    """Set default logging level"""
+    logging_level: int | None = None
+    """Logging level. When unset, use the environment override or default to INFO."""
 
     def finalize(self) -> None:
         """Validate logger settings and optional MLFlow dependency."""
@@ -712,6 +715,7 @@ class LoggerConfig(MTrainLoggerConfig):
                 self.mlflow_run_name,
                 self.mlflow_tracking_uri,
                 self.mlflow_tags,
+                self.mlflow_description,
             ]
         )
 
@@ -755,6 +759,22 @@ class LoggerConfig(MTrainLoggerConfig):
 class ProfilingConfig(MTrainProfilingConfig):
     """Configuration settings for profiling the training process."""
 
+    profile_ranks: list[int] = field(default_factory=lambda: [0])
+    """Ranks to capture in memory snapshots / nsys / pytorch profiler.
+
+    Memory-snapshot and recording-start guards use a strict membership check,
+    so an empty list disables capture. Default ``[0]`` gives rank-0 capture
+    whenever ``record_memory_history=True`` or an nsys/pytorch profiler is
+    enabled, with no further override required.
+    """
+
+    memory_snapshot_path: str = "/nemo_run/snapshot.pickle"
+    """Path the per-rank pickle is written to (``_{rank}`` is inserted before
+    the extension). Defaults to ``/nemo_run/snapshot.pickle`` so the file lands
+    directly under the NeMo-Run experiment directory (bound at ``/nemo_run``
+    inside the container). Override for non-NeMo-Run setups.
+    """
+
     def finalize(self) -> None:
         """Validate profiling configuration."""
         assert not (self.use_pytorch_profiler and self.use_nsys_profiler), (
@@ -762,8 +782,8 @@ class ProfilingConfig(MTrainProfilingConfig):
         )
         assert self.profile_step_start >= 0, f"profile_step_start must be >= 0, got {self.profile_step_start}"
         assert self.profile_step_end >= 0, f"profile_step_end must be >= 0, got {self.profile_step_end}"
-        assert self.profile_step_end >= self.profile_step_start, (
-            f"profile_step_end ({self.profile_step_end}) must be >= profile_step_start ({self.profile_step_start})"
+        assert self.profile_step_end > self.profile_step_start, (
+            f"profile_step_end ({self.profile_step_end}) must be > profile_step_start ({self.profile_step_start})"
         )
 
 
@@ -780,11 +800,16 @@ class TensorInspectConfig:
     feature_dirs: list[str] | None = None
     """Directories containing feature implementations (searched recursively)."""
 
+    allow_custom_feature_dirs: bool = False
+    """Allow user-provided feature implementation directories."""
+
     log_dir: str | None = None
     """Root directory to store inspection logs/statistics. Defaults to checkpoint save dir if unset."""
 
     init_training_step: int = 0
     """Initial training step for the inspector (used when resuming)."""
+
+    _feature_dirs_from_default: bool = field(default=False, init=False, repr=False)
 
     def finalize(self) -> None:
         """Populate sensible defaults when inspection is enabled.
@@ -802,6 +827,7 @@ class TensorInspectConfig:
                 te_features_dir = Path(te_features_mod.__file__).parent
                 if te_features_dir.exists():
                     self.feature_dirs = [str(te_features_dir)]
+                    self._feature_dirs_from_default = True
             except Exception:
                 pass
 
@@ -959,11 +985,23 @@ class InProcessRestartConfig:
 class ConfigContainer(Container):
     """Top-level container holding all configuration objects."""
 
+    env_vars: dict[str, str | int | float | bool] = field(default_factory=dict)
+    """Environment variable defaults applied before runtime config finalization.
+
+    Values already present in the process environment take precedence, allowing
+    launchers and users to override recipe defaults.
+    """
+
     rng: RNGConfig = field(default_factory=RNGConfig)
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     train: TrainingConfig
     model: (
-        GPTModelProvider | T5ModelProvider | MambaModelProvider | MimoModelProvider | GPTModelConfig | MambaModelConfig
+        GPTModelProvider
+        | T5ModelProvider
+        | HybridModelProvider
+        | MegatronMIMOProvider
+        | GPTModelConfig
+        | HybridModelConfig
     )
     optimizer: OptimizerConfig
     optimizer_config_override_provider: OptimizerConfigOverrideProvider = field(
@@ -972,7 +1010,14 @@ class ConfigContainer(Container):
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     scheduler: SchedulerConfig
-    dataset: GPTDatasetConfig | FinetuningDatasetConfig | DatasetProvider
+    dataset: (
+        GPTDatasetConfig
+        | GPTSFTDatasetConfig
+        | DirectHFSFTDatasetConfig
+        | EnergonDatasetConfig
+        | MockVLMSFTDatasetConfig
+        | DatasetProvider
+    )
     logger: LoggerConfig
     tokenizer: TokenizerConfig
     checkpoint: CheckpointConfig
@@ -986,10 +1031,14 @@ class ConfigContainer(Container):
     mixed_precision: Optional[Union[MixedPrecisionConfig, str]] = None
     tensor_inspect: TensorInspectConfig | None = None
     inprocess_restart: Optional[InProcessRestartConfig] = None
+    _checkpoint_load_required: bool = field(default=False, init=False, repr=False)
 
     def get_data_parallel_size(self, world_size: int) -> int:
         """Calculate the data parallel size based on the model configuration."""
         model_cfg = self.model
+        if hasattr(model_cfg, "dist_train") and getattr(model_cfg.dist_train, "use_dist_train", False) is True:
+            # use language world size to calculate data parallel size for dist train
+            world_size = model_cfg.dist_train.language_world_size
         total_model_size = (
             model_cfg.tensor_model_parallel_size
             * model_cfg.pipeline_model_parallel_size
@@ -1023,10 +1072,6 @@ class ConfigContainer(Container):
         if not getattr(self.model, "deterministic_mode", False):
             return
 
-        # Disallow flash attention when running deterministically
-        if getattr(self.model, "attention_backend", None) == AttnBackend.flash:
-            raise AssertionError("Flash attention can not be used in deterministic mode.")
-
         # Disallow cross-entropy loss fusion as it is not deterministic
         assert not getattr(self.model, "cross_entropy_loss_fusion", False), (
             "Cross Entropy Fusion is currently not deterministic."
@@ -1040,17 +1085,330 @@ class ConfigContainer(Container):
         # Enable deterministic algorithms in torch
         torch.use_deterministic_algorithms(True)
 
+    def _validate_and_apply_megatron_fsdp_configs(self) -> None:
+        """Validate and apply configuration required by the selected Megatron-FSDP version."""
+        # Set configs needed for Megatron-FSDP.
+        self.dist.use_megatron_fsdp = True
+        self.ddp.use_megatron_fsdp = True
+
+        megatron_fsdp_version = getattr(self.ddp, "megatron_fsdp_version", 1)
+        if not MCORE_HAS_MEGATRON_FSDP_V2 or megatron_fsdp_version == 1:
+            self._validate_and_apply_megatron_fsdp_v1_configs()
+        elif megatron_fsdp_version == 2:
+            self._validate_and_apply_megatron_fsdp_v2_configs()
+        else:
+            raise ValueError(f"Unsupported megatron_fsdp_version: {megatron_fsdp_version}")
+
+    def _validate_and_apply_megatron_fsdp_v1_configs(self) -> None:
+        """Validate and apply the established MFSDP V1 training contract."""
+        # Megatron-FSDP always uses a distributed optimizer.
+        if not self.ddp.use_distributed_optimizer or not self.optimizer.use_distributed_optimizer:
+            print_rank_0("use_distributed_optimizer=True is required for Megatron-FSDP. Activating...")
+        self.ddp.use_distributed_optimizer = True
+        self.optimizer.use_distributed_optimizer = True
+
+        if self.optimizer.use_precision_aware_optimizer:
+            print_rank_0("Megatron-FSDP installs gradients in `param.decoupled_grad` when using FusedAdam.")
+            # Megatron-FSDP uses a decoupled gradient for FusedAdam.
+            # Aligned with FusedAdam(use_decoupled_grad=True) and
+            # clip_grad_norm(use_decoupled_grad=True)!
+            self.ddp.megatron_fsdp_use_decoupled_grad = True
+
+        if self.ddp.average_in_collective and not self.ddp.disable_symmetric_registration:
+            print_rank_0("average_in_collective not supported with NCCL symmetric registration. Deactivating...")
+            self.ddp.average_in_collective = False
+
+        # reuse_grad_buf_for_mxfp8_param_ag is not implemented for Megatron-FSDP
+        if self.ddp.reuse_grad_buf_for_mxfp8_param_ag or self.optimizer.reuse_grad_buf_for_mxfp8_param_ag:
+            print_rank_0("reuse_grad_buf_for_mxfp8_param_ag not implemented for Megatron FSDP. Deactivating...")
+            self.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+            self.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
+
+        # Assertions / Guards
+        if self.checkpoint.save is not None or self.checkpoint.load is not None:
+            # only check if saving or loading
+            assert self.checkpoint.ckpt_format == "fsdp_dtensor", (
+                "Megatron-FSDP requires the fsdp_dtensor checkpointing format!"
+            )
+        assert os.getenv("CUDA_DEVICE_MAX_CONNECTIONS") != "1", (
+            "FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset."
+        )
+        if self.ddp.nccl_ub:
+            # Without manual registration, UBR is really slow.
+            self.ddp.fsdp_manual_registration = True
+        else:
+            # Only compatible with NCCL UBR.
+            assert not self.ddp.fsdp_manual_registration, "DDP.fsdp_manual_registration requires DDP.nccl_ub!"
+        if self.ddp.data_parallel_sharding_strategy == "optim_grads_params":
+            assert self.train.check_weight_hash_across_dp_replicas_interval is None, (
+                "TrainingConfig.check_weight_hash_across_dp_replicas_interval is not "
+                "supported with the Megatron-FSDP optim_grads_params sharding strategy"
+            )
+        assert not self.dist.use_tp_pp_dp_mapping, "use_tp_pp_dp_mapping is not supported with Megatron FSDP"
+
+    def _validate_and_apply_megatron_fsdp_v2_configs(self) -> None:
+        """Validate and apply the experimental MFSDP V2 training contract.
+
+        MFSDP V2 owns its sharded parameter and gradient storage, so it must use
+        its dedicated optimizer rather than Bridge's distributed-optimizer path.
+        Checkpointing and model-parallel topologies remain intentionally unsupported
+        upstream and are rejected here before model construction.
+        """
+        if not self.model.bf16 or self.model.fp16 or not self.optimizer.bf16 or self.optimizer.fp16:
+            raise ValueError("MFSDP V2 requires BF16 training (model.bf16=True and optimizer.bf16=True).")
+        if self.model.params_dtype != torch.bfloat16:
+            raise ValueError("MFSDP V2 requires model.params_dtype=torch.bfloat16.")
+
+        unsupported_parallelisms = (
+            "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "context_parallel_size",
+            "expert_model_parallel_size",
+        )
+        configured_parallelisms = [
+            f"{name}={getattr(self.model, name)}"
+            for name in unsupported_parallelisms
+            if getattr(self.model, name) != 1
+        ]
+        if configured_parallelisms:
+            raise ValueError(
+                "MFSDP V2 currently supports DP-only training; unsupported settings: "
+                + ", ".join(configured_parallelisms)
+            )
+        if self.model.num_moe_experts is not None:
+            raise ValueError("MFSDP V2 does not currently support MoE models.")
+        if self.model.virtual_pipeline_model_parallel_size is not None:
+            raise ValueError("MFSDP V2 does not currently support multiple model chunks.")
+        if self.dist.use_tp_pp_dp_mapping:
+            raise ValueError("MFSDP V2 does not support use_tp_pp_dp_mapping.")
+        if self.rng.data_parallel_random_init:
+            raise ValueError("MFSDP V2 does not support data_parallel_random_init.")
+        if self.ddp.num_distributed_optimizer_instances != 1:
+            raise ValueError("MFSDP V2 does not currently support HSDP.")
+        if self.ddp.outer_dp_sharding_strategy != "no_shard":
+            raise ValueError("MFSDP V2 does not currently support outer DP sharding.")
+        if self.checkpoint.save is not None or self.checkpoint.load is not None:
+            raise ValueError("MFSDP V2 checkpoint save and load are not yet supported.")
+        if self.checkpoint.pretrained_checkpoint is not None:
+            raise ValueError("MFSDP V2 checkpoint loading is not yet supported.")
+        if self.optimizer.loss_scale is not None:
+            raise ValueError("MFSDP V2 does not support loss scaling.")
+        if self.optimizer.clip_grad > 0.0:
+            raise ValueError("MFSDP V2 does not currently support gradient clipping.")
+        if self.optimizer.use_precision_aware_optimizer:
+            raise ValueError("MFSDP V2 does not support precision-aware optimizer.")
+        if self.optimizer.optimizer_cpu_offload:
+            raise ValueError("MFSDP V2 does not support optimizer CPU offload.")
+        if self.optimizer.use_layer_wise_distributed_optimizer:
+            raise ValueError("MFSDP V2 does not support layer-wise distributed optimizer.")
+        if self.optimizer.optimizer_cuda_graph:
+            raise ValueError("MFSDP V2 does not support optimizer CUDA graphs.")
+        if self.model.calculate_per_token_loss:
+            raise ValueError("MFSDP V2 does not support per-token loss normalization.")
+        if self.model.fp8 or self.model.fp4 or self.ddp.fp8_param_gather or self.ddp.fp4_param_gather:
+            raise ValueError("MFSDP V2 does not support FP8 or FP4.")
+        if self.model.cuda_graph_impl != "none" or self.ddp.megatron_fsdp_cuda_graph_mode:
+            raise ValueError("MFSDP V2 does not support CUDA graphs.")
+
+        self.ddp.data_parallel_sharding_strategy = "optim_grads_params"
+        self.ddp.use_distributed_optimizer = False
+        self.optimizer.use_distributed_optimizer = False
+        self.ddp.overlap_grad_reduce = False
+        self.ddp.overlap_param_gather = False
+        self.optimizer.overlap_param_gather = False
+        self.optimizer.overlap_param_gather_with_optimizer_step = False
+        self.model.gradient_accumulation_fusion = False
+        self.ddp.fsdp_all_gather_in_start_param_sync = False
+
+    def _validate_hf_checkpoint_export_source(self) -> None:
+        """Validate that HF sidecar export has a source for HF config/tokenizer assets."""
+        if not self.checkpoint.also_save_hf_checkpoint:
+            return
+        if self.checkpoint.hf_source_path:
+            return
+        if getattr(self.model, "hf_model_id", None):
+            return
+        if getattr(self.tokenizer, "tokenizer_model", None):
+            return
+
+        raise ValueError(
+            "also_save_hf_checkpoint=True requires an HF source to template config/tokenizer files. "
+            "Set cfg.checkpoint.hf_source_path, cfg.model.hf_model_id "
+            "(via AutoBridge / recipe metadata), or cfg.tokenizer.tokenizer_model when it points at "
+            "an HF model id."
+        )
+
+    def _disable_native_energon_packing_moe_overlap(self) -> None:
+        """Disable EP overlap until packed VLM schedule plans preserve every model input."""
+        enable_energon_packing = isinstance(self.dataset, EnergonDatasetConfig) and (
+            self.dataset.packing_buffer_size is not None
+        )
+        if not enable_energon_packing:
+            return
+
+        # The same request can live on the model, on CommOverlapConfig, and on
+        # its resolved user config. CommOverlapConfig.setup() runs after this
+        # method and copies its value back to the model, so clearing only the
+        # model would allow a stale wrapper value to re-enable the unsafe path.
+        overlap_configs: list[object] = [self.model]
+        if self.comm_overlap is not None:
+            overlap_configs.append(self.comm_overlap)
+            resolved_overlap = getattr(self.comm_overlap, "user_comm_overlap_cfg", None)
+            if resolved_overlap is not None:
+                overlap_configs.append(resolved_overlap)
+
+        overlap_fields = ("overlap_moe_expert_parallel_comm", "delay_wgrad_compute")
+        overlap_requested = any(
+            getattr(config, field_name, False) is True for config in overlap_configs for field_name in overlap_fields
+        )
+        if not overlap_requested:
+            return
+
+        warnings.warn(
+            "Disabling MoE expert-parallel communication overlap and delayed weight-gradient compute because "
+            "overlap switches MCore to combined-1F1B schedule-plan execution, but the current VLM path does not "
+            "forward visual inputs or packed-sequence metadata through that plan.",
+            stacklevel=3,
+        )
+        for config in overlap_configs:
+            for field_name in overlap_fields:
+                if hasattr(config, field_name):
+                    setattr(config, field_name, False)
+
     def validate(self) -> None:
         """Performs validation checks on the combined configuration.
 
         Calculates dependent values like data_parallel_size and scheduler steps.
         Ensures compatibility between different configuration settings.
         """
+        if self.train.num_epochs is not None and not isinstance(self.dataset, GPTSFTDatasetConfig):
+            raise ValueError(
+                "num_epochs is only supported for finite GPTSFTDatasetConfig datasets because other dataset "
+                "providers may build a requested number of samples instead of exposing their true dataset size."
+            )
+        if self.train.num_epochs is not None and self.dataset.dataloader_type != "batch":
+            raise ValueError('num_epochs is currently supported only with dataloader_type="batch"')
+
+        enable_in_batch_packing = getattr(self.dataset, "enable_in_batch_packing", False)
+        enable_energon_packing = isinstance(self.dataset, EnergonDatasetConfig) and (
+            self.dataset.packing_buffer_size is not None
+        )
+        enable_offline_packing = getattr(self.dataset, "enable_offline_packing", False)
+        offline_packing_specs = getattr(self.dataset, "offline_packing_specs", None)
+
+        if enable_offline_packing and enable_in_batch_packing:
+            raise ValueError("enable_offline_packing and enable_in_batch_packing are mutually exclusive.")
+        if enable_offline_packing and offline_packing_specs is None:
+            raise ValueError("offline_packing_specs must be set when enable_offline_packing=True.")
+        if offline_packing_specs is not None and not enable_offline_packing:
+            raise ValueError("enable_offline_packing must be True when offline_packing_specs is set.")
+
+        if offline_packing_specs is not None:
+            pad_cu_seqlens = offline_packing_specs.pad_cu_seqlens
+            dataset_kwargs = getattr(self.dataset, "dataset_kwargs", None) or {}
+            pad_to_max_length = (
+                getattr(self.dataset, "pad_to_max_length", False) is True
+                or dataset_kwargs.get("pad_to_max_length", False) is True
+            )
+            if pad_cu_seqlens and not pad_to_max_length:
+                raise ValueError("offline_packing_specs.pad_cu_seqlens=True requires dataset pad_to_max_length=True.")
+
+            cuda_graph_impl = getattr(self.model, "cuda_graph_impl", "none")
+            cuda_graph_modules = cuda_graph_module_names(self.model)
+            is_full_iteration_graph = is_full_iteration_cuda_graph(self.model)
+            # Every training graph needs a static token width. Only graphs that include
+            # packed attention also consume cu_seqlens and require static boundary shapes.
+            uses_training_cuda_graphs = is_full_iteration_graph or cuda_graph_impl == "transformer_engine"
+            if uses_training_cuda_graphs and not pad_to_max_length:
+                raise ValueError("Offline packing with CUDA graphs requires dataset pad_to_max_length=True.")
+
+            captures_packed_attention = is_full_iteration_graph or (
+                cuda_graph_impl == "transformer_engine" and (not cuda_graph_modules or "attn" in cuda_graph_modules)
+            )
+            if captures_packed_attention and not pad_cu_seqlens:
+                raise ValueError(
+                    "Packed attention CUDA graphs require offline_packing_specs.pad_cu_seqlens=True. "
+                    "Enable it for full-iteration, whole-layer, or attention-scoped capture."
+                )
+
+        # Validate declarative SFT values before deriving runtime padding
+        # multiples so normalization cannot hide an invalid user value.
+        if isinstance(
+            self.dataset,
+            (GPTSFTDatasetConfig, DirectHFSFTDatasetConfig, EnergonDatasetConfig, MockVLMSFTDatasetConfig),
+        ):
+            self.dataset.validate()
+
+        if isinstance(self.dataset, EnergonDatasetConfig) and (
+            self.dataset.micro_batch_size != self.train.micro_batch_size
+        ):
+            raise ValueError(
+                "EnergonDatasetConfig.micro_batch_size must match train.micro_batch_size "
+                f"({self.dataset.micro_batch_size} != {self.train.micro_batch_size})."
+            )
+
+        if enable_energon_packing:
+            if self.train.micro_batch_size != 1:
+                raise ValueError("Energon native sequence packing requires train.micro_batch_size=1.")
+            if not self.model.calculate_per_token_loss:
+                raise ValueError("Energon native sequence packing requires model.calculate_per_token_loss=True.")
+            if self.ddp.average_in_collective:
+                raise ValueError("Energon native sequence packing requires ddp.average_in_collective=False.")
+            if (getattr(self.model, "mtp_num_layers", None) or 0) > 0:
+                raise ValueError("Energon native sequence packing does not support MTP.")
+            if getattr(self.model, "cuda_graph_impl", None) not in (None, "none") or getattr(
+                self.model, "vision_cuda_graph_impl", None
+            ) not in (None, "none"):
+                raise ValueError("Energon native sequence packing does not support CUDA graphs.")
+            dist_train = getattr(self.model, "dist_train", None)
+            if dist_train is not None and getattr(dist_train, "use_dist_train", False):
+                raise ValueError("Energon native sequence packing does not support Qwen3-VL DistTrain.")
+            if getattr(self.model, "pipeline_model_parallel_size", 1) > 1:
+                raise ValueError("Energon native sequence packing does not yet support pipeline parallelism.")
+            self._disable_native_energon_packing_moe_overlap()
+
+        if hasattr(self.dataset, "pad_to_max_length"):
+            requires_fixed_seq_len = (
+                getattr(self.model, "pipeline_model_parallel_size", 1) > 1
+                or getattr(self.model, "expert_model_parallel_size", 1) > 1
+            )
+            self.dataset.pad_to_max_length = self.dataset.pad_to_max_length or requires_fixed_seq_len
+
+        cp_size = getattr(self.model, "context_parallel_size", 1)
+        eval_cp_size = self.dist.eval_context_parallel_size
+        cp_sizes = {cp_size, eval_cp_size} if eval_cp_size is not None else {cp_size}
+        tp_size = getattr(self.model, "tensor_model_parallel_size", 1)
+        has_sp = getattr(self.model, "sequence_parallel", False)
+        cp_multiples = [2 * size if size > 1 else 1 for size in cp_sizes]
+        sp_multiples = [size * tp_size if has_sp and tp_size > 1 else 1 for size in cp_sizes]
+        collate_padding_multiple = math.lcm(*cp_multiples, *sp_multiples)
+        if (
+            isinstance(
+                self.dataset,
+                (DirectHFSFTDatasetConfig, EnergonDatasetConfig, MockVLMSFTDatasetConfig),
+            )
+            or (isinstance(self.dataset, GPTSFTDatasetConfig) and enable_in_batch_packing)
+        ) and self.dataset.seq_length % collate_padding_multiple != 0:
+            raise ValueError(
+                f"{type(self.dataset).__name__}.seq_length must be divisible by the CP/SP collate padding multiple "
+                f"({collate_padding_multiple})."
+            )
 
         # Propagate in-batch packing flag to model config so TransformerConfig.finalize()
         # can enable variable_seq_lengths for pipeline parallelism.
-        if getattr(self.dataset, "pack_sequences_in_batch", False):
-            self.model._pack_sequences_in_batch = True
+        if enable_in_batch_packing or enable_energon_packing:
+            transformer_config = getattr(self.model, "transformer", self.model)
+            transformer_config._enable_in_batch_packing = True
+            if hasattr(self.dataset, "in_batch_packing_pad_to_multiple_of"):
+                self.dataset.in_batch_packing_pad_to_multiple_of = collate_padding_multiple
+        elif isinstance(
+            self.dataset,
+            (DirectHFSFTDatasetConfig, EnergonDatasetConfig, MockVLMSFTDatasetConfig),
+        ):
+            self.dataset.pad_to_multiple_of = math.lcm(
+                self.dataset.pad_to_multiple_of,
+                collate_padding_multiple,
+            )
 
         if hasattr(self.dataset, "finalize"):
             self.dataset.finalize()
@@ -1058,6 +1416,10 @@ class ConfigContainer(Container):
             self.ddp.finalize()
         if hasattr(self.optimizer, "finalize"):
             self.optimizer.finalize()
+
+        # Guard post-construction CUDA graph overrides before MCore post-init can
+        # migrate deprecated scope fields into a different implementation.
+        validate_cuda_graph_configuration(self.model)
         if hasattr(self.model, "finalize"):
             self.model.finalize()
 
@@ -1090,6 +1452,74 @@ class ConfigContainer(Container):
             if self.comm_overlap is not None:
                 self.comm_overlap.data_parallel_size = self.data_parallel_size
 
+        # Resolve eval batch size defaults from training config
+        if self.validation.eval_global_batch_size is None:
+            assert self.train.global_batch_size is not None, (
+                "train.global_batch_size must be set when eval_global_batch_size is not explicitly configured"
+            )
+            self.validation.eval_global_batch_size = self.train.global_batch_size
+        if self.validation.eval_micro_batch_size is None:
+            assert self.train.micro_batch_size is not None, (
+                "train.micro_batch_size must be set when eval_micro_batch_size is not explicitly configured"
+            )
+            self.validation.eval_micro_batch_size = self.train.micro_batch_size
+        if (
+            isinstance(self.dataset, EnergonDatasetConfig)
+            and self.dataset.do_validation
+            and self.dataset.micro_batch_size != self.validation.eval_micro_batch_size
+        ):
+            raise ValueError(
+                "EnergonDatasetConfig.micro_batch_size must match validation.eval_micro_batch_size "
+                f"({self.dataset.micro_batch_size} != {self.validation.eval_micro_batch_size})."
+            )
+
+        # Eval batch size divisibility check. Eval-time CP changes the DP degree,
+        # so validation batch semantics must use the eval layout rather than the
+        # training layout stored in ``self.data_parallel_size``.
+        eval_data_parallel_size = self.data_parallel_size
+        if self.dist.eval_context_parallel_size is not None:
+            model_cfg = self.model
+            eval_world_size = get_world_size_safe()
+            if hasattr(model_cfg, "dist_train") and getattr(model_cfg.dist_train, "use_dist_train", False) is True:
+                eval_world_size = model_cfg.dist_train.language_world_size
+            eval_model_parallel_size = (
+                model_cfg.tensor_model_parallel_size
+                * model_cfg.pipeline_model_parallel_size
+                * self.dist.eval_context_parallel_size
+            )
+            assert eval_world_size % eval_model_parallel_size == 0, (
+                f"world size ({eval_world_size}) is not divisible by eval model parallel size "
+                f"({eval_model_parallel_size})"
+            )
+            eval_data_parallel_size = eval_world_size // eval_model_parallel_size
+
+        eval_dp_product = self.validation.eval_micro_batch_size * eval_data_parallel_size
+        assert self.validation.eval_global_batch_size % eval_dp_product == 0, (
+            f"eval_global_batch_size ({self.validation.eval_global_batch_size}) must be divisible by "
+            f"eval_micro_batch_size * eval_data_parallel_size ({self.validation.eval_micro_batch_size} * "
+            f"{eval_data_parallel_size} = {eval_dp_product})"
+        )
+
+        # Megatron-FSDP and Torch FSDP2 are mutually-exclusive.
+        if self.dist.use_megatron_fsdp and self.dist.use_torch_fsdp2:
+            raise ValueError("use_megatron_fsdp and use_torch_fsdp2 are mutually exclusive.")
+        # Validate Megatron-FSDP configuration.
+        if self.dist.use_megatron_fsdp or self.ddp.use_megatron_fsdp:
+            self._validate_and_apply_megatron_fsdp_configs()
+
+        # Validate reuse_grad_buf_for_mxfp8_param_ag when FSDP is not enabled
+        is_fsdp = self.dist.use_megatron_fsdp or self.ddp.use_megatron_fsdp
+        if (
+            not is_fsdp
+            and self.mixed_precision is not None
+            and self.mixed_precision.fp8_param_gather
+            and self.mixed_precision.fp8_recipe == "mxfp8"
+        ):
+            assert self.mixed_precision.reuse_grad_buf_for_mxfp8_param_ag, (
+                "When fp8_param_gather=True and fp8_recipe='mxfp8', "
+                "reuse_grad_buf_for_mxfp8_param_ag must be set to True"
+            )
+
         # Deterministic mode validations and settings
         self._validate_and_apply_deterministic_mode()
 
@@ -1099,43 +1529,12 @@ class ConfigContainer(Container):
         _validate_fine_grained_activation_offloading(self)
 
         # CUDA graph scope validation: check_for_nan_in_loss must be disabled with full_iteration graph
-        if self.model.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in self.model.cuda_graph_scope:
+        if is_full_iteration_cuda_graph(self.model):
             assert not self.rerun_state_machine.check_for_nan_in_loss, (
                 "check_for_nan_in_loss must be disabled when using full_iteration CUDA graph. "
                 "Set rerun_state_machine.check_for_nan_in_loss=False."
             )
-        if self.model.cuda_graph_impl == "none":
-            self.model.cuda_graph_scope = []
-
-        if self.dist.use_megatron_fsdp and self.dist.use_torch_fsdp2:
-            raise ValueError("Using use_megatron_fsdp and use_torch_fsdp2 at the same time is not supported.")
-
-        # Megatron FSDP Config checks
-        if self.dist.use_megatron_fsdp or self.ddp.use_megatron_fsdp:
-            # Set Megatron FSDP Configs
-            self.dist.use_megatron_fsdp = True
-            self.ddp.use_megatron_fsdp = True
-
-            assert not self.dist.use_tp_pp_dp_mapping, "use_tp_pp_dp_mapping is not supported with Megatron FSDP"
-
-            if self.checkpoint.save is not None or self.checkpoint.load is not None:
-                # only check if saving or loading
-                assert self.checkpoint.ckpt_format == "fsdp_dtensor", (
-                    "Megatron FSDP only supports fsdp_dtensor checkpoint format"
-                )
-
-            if self.ddp.average_in_collective and not self.ddp.disable_symmetric_registration:
-                print_rank_0(
-                    "average_in_collective is not supported with NCCL symmetric registration, setting to False"
-                )
-                self.ddp.average_in_collective = False
-
-            # reuse_grad_buf_for_mxfp8_param_ag is not supported with Megatron FSDP
-            if self.ddp.reuse_grad_buf_for_mxfp8_param_ag:
-                print_rank_0("reuse_grad_buf_for_mxfp8_param_ag is not supported with Megatron FSDP, setting to False")
-                self.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
-            if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag:
-                self.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
+        validate_cuda_graph_configuration(self.model)
 
         # ModelOpt/Quantization checks
         if getattr(self.model, "restore_modelopt_state", False):
@@ -1143,8 +1542,12 @@ class ConfigContainer(Container):
                 "Gradient accumulation fusion is not supported with ModelOpt/Quantized models. "
                 "Please set model.gradient_accumulation_fusion=False"
             )
+            from megatron.bridge.training.post_training.checkpointing import _validate_modelopt_checkpointing
+
+            _validate_modelopt_checkpointing(self.checkpoint.non_persistent_ckpt_type)
 
         # Checkpoint
+        self._validate_hf_checkpoint_export_source()
         if self.checkpoint.save is not None or self.checkpoint.load is not None:
             # only check if saving or loading
             if self.checkpoint.ckpt_format == "fsdp_dtensor":
@@ -1154,8 +1557,8 @@ class ConfigContainer(Container):
 
         # Enforce async_save format restriction
         if self.checkpoint.async_save:
-            assert self.checkpoint.ckpt_format == "torch_dist", (
-                "async_save is only supported with ckpt_format='torch_dist'"
+            assert self.checkpoint.ckpt_format in ["torch_dist", "fsdp_dtensor"], (
+                "async_save is only supported with ckpt_format='torch_dist','fsdp_dtensor'"
             )
 
         # Set defaults for tensor inspect callback
@@ -1180,19 +1583,30 @@ class ConfigContainer(Container):
                 # If using distributed optimizer, must use distributed checkpointing.
                 # Legacy checkpointing uses Gloo process groups to collect full distributed
                 # optimizer state in the CPU memory of DP rank 0.
-                assert self.checkpoint.ckpt_format == "torch_dist"
+                assert self.checkpoint.ckpt_format in ["torch_dist", "fsdp_dtensor"], (
+                    "Legacy checkpointing requires ckpt_format='torch_dist' or 'fsdp_dtensor'"
+                )
 
         # Cross-validation between training and scheduler configs
         self._validate_training_scheduler_compatibility()
 
-        # Calculate scheduler steps for both iteration-based and sample-based training
-        self._calculate_scheduler_steps()
+        # Epoch-based training is resolved after the finite dataset is built.
+        if self.train.train_iters is not None:
+            self._calculate_scheduler_steps()
 
         if self.model.context_parallel_size > 1:
             assert self.model.seq_length % (self.model.context_parallel_size * 2) == 0, (
                 "Sequence length must be divisible by 2 * context parallel size if context parallel is used."
             )
-            if isinstance(self.dataset, FinetuningDatasetConfig):
+            if isinstance(
+                self.dataset,
+                (
+                    GPTSFTDatasetConfig,
+                    DirectHFSFTDatasetConfig,
+                    EnergonDatasetConfig,
+                    MockVLMSFTDatasetConfig,
+                ),
+            ):
                 # check calculate_per_token_loss to be True
                 # check average_in_collective to be False
                 # for context parallel to solve the issue of nan loss on ranks with all tokens masked
@@ -1206,29 +1620,28 @@ class ConfigContainer(Container):
 
         self._validate_cp_comm_type()
 
-        if (
-            isinstance(self.dataset, FinetuningDatasetConfig)
-            and self.dataset.packed_sequence_specs is not None
-            and self.dataset.packed_sequence_specs.packed_sequence_size > 0
-            and self.train.micro_batch_size > 1
-        ):
-            packed_sequence_size = self.dataset.packed_sequence_specs.packed_sequence_size
-            raise ValueError(
-                "Micro batch size should be 1 when training with packed sequence, but your micro batch size "
-                f"is {self.train.micro_batch_size}. \nThe following config is equivalent to your current setting for "
-                f"a packed dataset. Please update your config to the following: \n"
-                f"Set micro batch size to 1 (currently {self.train.micro_batch_size})\n"
-                f"Set global batch size to {self.train.global_batch_size // self.train.micro_batch_size} "
-                f"(currently {self.train.global_batch_size}) \n"
-                f"Set packed sequence length to {packed_sequence_size * self.train.micro_batch_size} "
-                f"(currently {packed_sequence_size}) \n"
-                f"For details please visit "
-                f"https://docs.nvidia.com/nemo-framework/user-guide/latest/sft_peft/packed_sequence.html"
-            )
+        if enable_offline_packing:
+            assert offline_packing_specs is not None
+            if offline_packing_specs.packed_sequence_size <= 0:
+                raise ValueError("offline_packing_specs.packed_sequence_size must be greater than 0.")
+            packed_sequence_size = offline_packing_specs.packed_sequence_size
+            if self.train.micro_batch_size > 1:
+                raise ValueError(
+                    "Micro batch size should be 1 when training with packed sequence, but your micro batch size "
+                    f"is {self.train.micro_batch_size}. \nThe following config is equivalent to your current setting "
+                    f"for a packed dataset. Please update your config to the following: \n"
+                    f"Set micro batch size to 1 (currently {self.train.micro_batch_size})\n"
+                    f"Set global batch size to {self.train.global_batch_size // self.train.micro_batch_size} "
+                    f"(currently {self.train.global_batch_size}) \n"
+                    f"Set packed sequence length to {packed_sequence_size * self.train.micro_batch_size} "
+                    f"(currently {packed_sequence_size}) \n"
+                    f"For details please visit "
+                    f"https://docs.nvidia.com/nemo-framework/user-guide/latest/sft_peft/packed_sequence.html"
+                )
 
-        if getattr(self.dataset, "pack_sequences_in_batch", False) and self.train.micro_batch_size == 1:
+        if enable_in_batch_packing and self.train.micro_batch_size == 1:
             raise ValueError(
-                "micro_batch_size should be greater than 1 when using pack_sequences_in_batch=True. "
+                "micro_batch_size should be greater than 1 when using enable_in_batch_packing=True. "
                 "In-batch packing concatenates multiple sequences within a microbatch, so at least 2 sequences "
                 "are required per micro-batch."
             )
@@ -1237,14 +1650,19 @@ class ConfigContainer(Container):
             assert self.checkpoint.pretrained_checkpoint is not None, "PEFT requires a pretrained checkpoint path"
 
         if self.dataset is not None:
-            # Only validate sequence length for GPTDatasetConfig or FinetuningDatasetConfig
+            # Only validate sequence length for canonical dataset configs.
             # DatasetProvider instances may not have sequence_length attributes
-            if isinstance(self.dataset, (GPTDatasetConfig, FinetuningDatasetConfig)):
-                data_seq_length = (
-                    self.dataset.seq_length
-                    if isinstance(self.dataset, FinetuningDatasetConfig)
-                    else self.dataset.seq_length
-                )
+            if isinstance(
+                self.dataset,
+                (
+                    GPTDatasetConfig,
+                    GPTSFTDatasetConfig,
+                    DirectHFSFTDatasetConfig,
+                    EnergonDatasetConfig,
+                    MockVLMSFTDatasetConfig,
+                ),
+            ):
+                data_seq_length = self.dataset.seq_length
 
                 assert self.model.seq_length == data_seq_length, (
                     f"Please ensure sequence length configuration in model config and "
@@ -1253,7 +1671,7 @@ class ConfigContainer(Container):
                 )
 
         # Validate DeepEP or HybridEP is supported for the current GPU architecture
-        if isinstance(self.model, (GPTModelConfig, MambaModelConfig)):
+        if isinstance(self.model, (GPTModelConfig, HybridModelConfig)):
             validate_flex_dispatcher_backend(self.model.transformer)
         else:
             validate_flex_dispatcher_backend(self.model)
@@ -1307,6 +1725,10 @@ class ConfigContainer(Container):
 
         if has_train_samples:
             # Sample-based training validation
+            assert self.scheduler.max_steps is None, (
+                "scheduler.max_steps is only supported for iteration-based training; "
+                "use sample-based scheduler fields with train_samples"
+            )
             assert self.scheduler.lr_decay_iters is None, (
                 "Use lr_decay_samples for sample-based training, not lr_decay_iters"
             )
@@ -1328,6 +1750,22 @@ class ConfigContainer(Container):
                 "Can only specify one of lr_warmup_fraction or lr_warmup_iters"
             )
 
+    def _resolve_num_epochs(self, train_dataset_size: int) -> None:
+        """Calculate training iterations from the size of a finite training dataset."""
+        assert self.train.num_epochs is not None, "num_epochs must be set before resolving epoch-based training"
+        assert train_dataset_size > 0, "train dataset must contain at least one sample"
+        assert self.train.global_batch_size is not None, "global_batch_size must be set when using num_epochs"
+
+        train_iters_per_epoch = math.ceil(train_dataset_size / self.train.global_batch_size)
+        self.train.train_iters = math.ceil(self.train.num_epochs * train_iters_per_epoch)
+        self.train._train_iters_from_num_epochs = True
+        print_rank_0(
+            f"Setting training iterations to {self.train.train_iters} based on {self.train.num_epochs} epochs, "
+            f"{train_dataset_size} train samples, {train_iters_per_epoch} iterations per epoch, "
+            f"and global batch size {self.train.global_batch_size}"
+        )
+        self._calculate_scheduler_steps()
+
     def _calculate_scheduler_steps(self) -> None:
         """Calculate scheduler steps for both iteration-based and sample-based training."""
         is_sample_based = self.train.train_samples is not None
@@ -1348,12 +1786,21 @@ class ConfigContainer(Container):
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
         else:
             # Iteration-based training
-            if self.scheduler.lr_decay_iters is None:
+            scheduler_max_steps = self.scheduler.max_steps
+            if scheduler_max_steps is not None:
+                if scheduler_max_steps < self.train.train_iters:
+                    raise ValueError(
+                        f"scheduler.max_steps ({scheduler_max_steps}) must be greater than or equal to "
+                        f"train.train_iters ({self.train.train_iters})."
+                    )
+                self.scheduler.lr_decay_iters = scheduler_max_steps
+            elif self.scheduler.lr_decay_iters is None:
                 self.scheduler.lr_decay_iters = self.train.train_iters
             if self.scheduler.lr_wsd_decay_iters is None and self.scheduler.lr_decay_style == "WSD":
                 self.scheduler.lr_wsd_decay_iters = self.scheduler.lr_decay_iters
             self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
-            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
+            weight_decay_iters = scheduler_max_steps or self.train.train_iters
+            self.scheduler.wd_incr_steps = weight_decay_iters * self.train.global_batch_size
 
             if self.scheduler.lr_wsd_decay_iters is not None:
                 self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
@@ -1392,7 +1839,7 @@ class ConfigContainer(Container):
         For configs that don't inherit from Mcore, key values are logged via
         `_get_key_config_values`, which excludes None values and callables.
         """
-        if isinstance(self.model, (GPTModelConfig, MambaModelConfig)):
+        if isinstance(self.model, (GPTModelConfig, HybridModelConfig)):
             transformer_cfg = self.model.transformer
         else:
             transformer_cfg = self.model
@@ -1544,6 +1991,27 @@ def _get_key_config_values(config_obj: Any) -> Dict[str, Any]:
     return values
 
 
+def apply_environment_variables(cfg: ConfigContainer) -> None:
+    """Apply recipe environment variable defaults to the current process.
+
+    Existing process values are preserved so explicit launcher or shell
+    settings take precedence over recipe defaults.
+
+    Args:
+        cfg: Configuration container with environment variable defaults.
+
+    Raises:
+        ValueError: If an environment variable name is empty.
+        TypeError: If an environment variable value is not a scalar.
+    """
+    for name, value in cfg.env_vars.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("Environment variable names must be non-empty strings.")
+        if not isinstance(value, (str, int, float, bool)):
+            raise TypeError(f"Environment variable {name!r} must have a scalar value, got {type(value).__name__}.")
+        os.environ.setdefault(name, str(value))
+
+
 def runtime_config_update(cfg: ConfigContainer) -> None:
     """Apply runtime configuration updates prior to initialization.
 
@@ -1560,6 +2028,9 @@ def runtime_config_update(cfg: ConfigContainer) -> None:
     Args:
         cfg: Configuration container to update
     """
+    # Environment settings may affect runtime finalization and must be applied first.
+    apply_environment_variables(cfg)
+
     # Apply mixed precision configuration if provided
     if cfg.mixed_precision is not None:
         if isinstance(cfg.mixed_precision, str):
@@ -1570,6 +2041,11 @@ def runtime_config_update(cfg: ConfigContainer) -> None:
     # Calculate data parallel size (needed for comm overlap methods)
     cfg.set_data_parallel_size()
 
+    # EP overlap switches MCore to combined-1F1B schedule-plan execution. The current
+    # VLM plan does not forward visual inputs or packed-sequence metadata, so clear every
+    # user-facing copy before CommOverlapConfig can apply the requested value to the model.
+    cfg._disable_native_energon_packing_moe_overlap()
+
     # Apply communication overlap configuration if provided
     if cfg.comm_overlap is not None:
         cfg.comm_overlap.finalize()
@@ -1577,6 +2053,74 @@ def runtime_config_update(cfg: ConfigContainer) -> None:
 
     # Validate configuration after all modifications
     cfg.validate()
+
+
+def megatron_mimo_runtime_config_update(cfg: ConfigContainer) -> None:
+    """MegatronMIMO-equivalent of ``runtime_config_update``.
+
+    The standard ``runtime_config_update`` cannot be used directly because it
+    accesses ``cfg.model`` attributes (``bf16``, ``tensor_model_parallel_size``,
+    ``cuda_graph_impl``, …) that do not exist on ``MegatronMIMOProvider``.
+
+    This function cherry-picks the safe, model-agnostic parts:
+
+    Keeps (safe for MegatronMIMO):
+    - Recipe environment variable defaults
+    - ``data_parallel_size = 1`` (MegatronMIMO-specific hard-code)
+    - Sub-config finalization (dataset, optimizer, ddp, logger, train, scheduler, checkpoint)
+    - Distributed optimizer sync validation
+    - Deterministic mode validation
+
+    Skips (would crash or is N/A):
+    - Mixed precision resolution (per-module, not container-level)
+    - Communication overlap setup (not supported for MegatronMIMO)
+    - Model-level validations (FSDP, CUDA graphs, TE RNG tracker sync, etc.)
+
+    See ``playground/runtime_config_update_analysis.md`` for the full analysis.
+    """
+    apply_environment_variables(cfg)
+
+    if cfg.train.num_epochs is not None:
+        raise ValueError("num_epochs is not supported for MegatronMIMO datasets")
+
+    # MegatronMIMO: data_parallel_size is always 1 from the training loop's perspective.
+    cfg.data_parallel_size = 1
+
+    # Finalize sub-configs that don't depend on model construction order.
+    # NOTE: cfg.model.finalize() is NOT called here — it validates parallelism
+    # config and is called inside setup_megatron_mimo() right before build_infra().
+    if hasattr(cfg.dataset, "finalize"):
+        cfg.dataset.finalize()
+    if hasattr(cfg.optimizer, "finalize"):
+        cfg.optimizer.finalize()
+    if hasattr(cfg.ddp, "finalize"):
+        cfg.ddp.finalize()
+    cfg.logger.finalize()
+    cfg.train.finalize()
+    cfg.scheduler.finalize()
+    cfg.checkpoint.finalize()
+
+    if cfg.validation.eval_global_batch_size is None:
+        assert cfg.train.global_batch_size is not None, (
+            "train.global_batch_size must be set when eval_global_batch_size is not explicitly configured"
+        )
+        cfg.validation.eval_global_batch_size = cfg.train.global_batch_size
+    if cfg.validation.eval_micro_batch_size is None:
+        assert cfg.train.micro_batch_size is not None, (
+            "train.micro_batch_size must be set when eval_micro_batch_size is not explicitly configured"
+        )
+        cfg.validation.eval_micro_batch_size = cfg.train.micro_batch_size
+
+    if cfg.profiling is not None:
+        cfg.profiling.finalize()
+        if cfg.profiling.nvtx_ranges:
+            from megatron.core.utils import configure_nvtx_profiling
+
+            configure_nvtx_profiling(enabled=True)
+
+    # Safe validations
+    _validate_and_sync_distributed_optimizer_settings(cfg)
+    cfg._validate_and_apply_deterministic_mode()
 
 
 def _validate_and_sync_distributed_optimizer_settings(config: ConfigContainer) -> None:
@@ -1602,6 +2146,20 @@ def _validate_and_sync_distributed_optimizer_settings(config: ConfigContainer) -
             )
         config.ddp.use_distributed_optimizer = True
         config.optimizer.use_distributed_optimizer = True
+
+    ddp_overlap = config.ddp.overlap_param_gather
+    optimizer_overlap = config.optimizer.overlap_param_gather
+
+    if ddp_overlap or optimizer_overlap:
+        if ddp_overlap != optimizer_overlap:
+            warn_rank_0(
+                f"overlap_param_gather settings were not in sync: "
+                f"ddp.overlap_param_gather={ddp_overlap}, "
+                f"optimizer.overlap_param_gather={optimizer_overlap}. "
+                f"Automatically enabling overlap_param_gather for both settings."
+            )
+        config.ddp.overlap_param_gather = True
+        config.optimizer.overlap_param_gather = True
 
 
 def _validate_mixed_precision_consistency(config: ConfigContainer) -> None:

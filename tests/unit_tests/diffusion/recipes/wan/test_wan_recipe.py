@@ -15,12 +15,21 @@
 import pytest
 
 from megatron.bridge.diffusion.data.wan.wan_energon_datamodule import WanDatasetConfig
-from megatron.bridge.diffusion.models.wan.wan_provider import WanModelProvider1_3B, WanModelProvider14B
+from megatron.bridge.diffusion.data.wan.wan_mock_datamodule import mock_batch
+from megatron.bridge.diffusion.models.wan.wan_provider import WanModelProvider
 from megatron.bridge.diffusion.recipes.wan.wan import (
-    wan_1_3B_pretrain_config,
-    wan_1_3B_sft_config,
-    wan_14B_pretrain_config,
-    wan_14B_sft_config,
+    wan_1_3b_pretrain_config,
+    wan_1_3b_sft_config,
+    wan_1_3b_text2image_pretrain_config,
+    wan_1_3b_text2video_pretrain_config,
+    wan_14b_pretrain_config,
+    wan_14b_sft_config,
+)
+from megatron.bridge.recipes.wan import (
+    wan_1_3b_text2image_pretrain_config as canonical_wan_1_3b_text2image_pretrain_config,
+)
+from megatron.bridge.recipes.wan import (
+    wan_1_3b_text2video_pretrain_config as canonical_wan_1_3b_text2video_pretrain_config,
 )
 from megatron.bridge.training.config import ConfigContainer
 
@@ -29,13 +38,13 @@ pytestmark = [pytest.mark.unit]
 
 
 class TestWan1_3BPretrainConfig:
-    """Tests for wan_1_3B_pretrain_config function (no-arg API)."""
+    """Tests for wan_1_3b_pretrain_config function (no-arg API)."""
 
     def test_pretrain_config_returns_complete_config(self):
-        config = wan_1_3B_pretrain_config()
+        config = wan_1_3b_pretrain_config()
 
         assert isinstance(config, ConfigContainer)
-        assert isinstance(config.model, WanModelProvider1_3B)
+        assert isinstance(config.model, WanModelProvider)
         assert isinstance(config.dataset, WanDatasetConfig)
         assert config.dataset.path is None  # default: mock/synthetic data
 
@@ -47,31 +56,33 @@ class TestWan1_3BPretrainConfig:
         assert hasattr(config, "checkpoint")
 
     def test_pretrain_config_directory_structure(self):
-        config = wan_1_3B_pretrain_config()
+        config = wan_1_3b_pretrain_config()
 
         assert "default" in config.checkpoint.save
         assert "default" in config.logger.tensorboard_dir
         assert config.checkpoint.save.endswith("checkpoints")
 
     def test_pretrain_config_default_training_parameters(self):
-        config = wan_1_3B_pretrain_config()
+        config = wan_1_3b_pretrain_config()
 
         assert config.train.train_iters == 10000
         assert config.train.global_batch_size == 2
         assert config.train.micro_batch_size == 1
 
     def test_pretrain_config_default_model_parameters(self):
-        config = wan_1_3B_pretrain_config()
+        config = wan_1_3b_pretrain_config()
 
         assert config.model.num_layers == 30
         assert config.model.hidden_size == 1536
         assert config.model.num_attention_heads == 12
         assert config.model.ffn_hidden_size == 8960
+        assert config.model.crossattn_emb_size == 1536
+        assert config.model.seq_length == 1024
         assert config.model.tensor_model_parallel_size == 1
         assert config.model.context_parallel_size == 8
 
     def test_pretrain_config_default_dataset_configuration(self):
-        config = wan_1_3B_pretrain_config()
+        config = wan_1_3b_pretrain_config()
 
         assert config.dataset.path is None
         assert config.dataset.F_latents == 24
@@ -79,7 +90,7 @@ class TestWan1_3BPretrainConfig:
         assert config.dataset.W_latents == 60
 
     def test_pretrain_config_dataset_accepts_path(self):
-        config = wan_1_3B_pretrain_config()
+        config = wan_1_3b_pretrain_config()
         assert config.dataset.path is None
 
         # WanDatasetConfig accepts a path to switch to real data
@@ -87,33 +98,33 @@ class TestWan1_3BPretrainConfig:
         assert config.dataset.path == "/some/data/path"
 
     def test_pretrain_config_checkpoint_format(self):
-        config = wan_1_3B_pretrain_config()
+        config = wan_1_3b_pretrain_config()
         assert config.checkpoint.ckpt_format == "torch_dist"
 
     def test_pretrain_config_precision(self):
-        config = wan_1_3B_pretrain_config()
+        config = wan_1_3b_pretrain_config()
         assert config.mixed_precision is not None
         assert config.mixed_precision.grad_reduce_in_fp32 is False
 
     def test_pretrain_config_ddp_settings(self):
-        config = wan_1_3B_pretrain_config()
+        config = wan_1_3b_pretrain_config()
         assert config.ddp.use_distributed_optimizer is True
         assert config.ddp.check_for_nan_in_grad is True
 
 
 class TestWan14BPretrainConfig:
-    """Tests for wan_14B_pretrain_config function (no-arg API)."""
+    """Tests for wan_14b_pretrain_config function (no-arg API)."""
 
     def test_pretrain_config_returns_complete_config(self):
-        config = wan_14B_pretrain_config()
+        config = wan_14b_pretrain_config()
 
         assert isinstance(config, ConfigContainer)
-        assert isinstance(config.model, WanModelProvider14B)
+        assert isinstance(config.model, WanModelProvider)
         assert isinstance(config.dataset, WanDatasetConfig)
         assert config.dataset.path is None
 
     def test_pretrain_config_default_model_parameters(self):
-        config = wan_14B_pretrain_config()
+        config = wan_14b_pretrain_config()
 
         assert config.model.num_layers == 40
         assert config.model.hidden_size == 5120
@@ -128,25 +139,74 @@ class TestWanFinetuneConfigs:
     """Tests for wan finetune config functions."""
 
     def test_1_3B_finetune_config_no_checkpoint(self):
-        config = wan_1_3B_sft_config()
+        config = wan_1_3b_sft_config()
 
         assert isinstance(config, ConfigContainer)
-        assert isinstance(config.model, WanModelProvider1_3B)
+        assert isinstance(config.model, WanModelProvider)
         assert config.checkpoint.pretrained_checkpoint is None
 
     def test_1_3B_finetune_config_with_checkpoint(self):
-        config = wan_1_3B_sft_config(pretrained_checkpoint="/path/to/ckpt")
+        config = wan_1_3b_sft_config(pretrained_checkpoint="/path/to/ckpt")
 
         assert config.checkpoint.pretrained_checkpoint == "/path/to/ckpt"
 
     def test_14B_finetune_config_no_checkpoint(self):
-        config = wan_14B_sft_config()
+        config = wan_14b_sft_config()
 
         assert isinstance(config, ConfigContainer)
-        assert isinstance(config.model, WanModelProvider14B)
+        assert isinstance(config.model, WanModelProvider)
         assert config.checkpoint.pretrained_checkpoint is None
 
     def test_14B_finetune_config_with_checkpoint(self):
-        config = wan_14B_sft_config(pretrained_checkpoint="/path/to/ckpt")
+        config = wan_14b_sft_config(pretrained_checkpoint="/path/to/ckpt")
 
         assert config.checkpoint.pretrained_checkpoint == "/path/to/ckpt"
+
+
+class TestWan1_3BText2ImageText2VideoConfigs:
+    """Tests for wan_1_3b text2image / text2video pretrain config variants."""
+
+    def test_text2image_overrides(self):
+        config = wan_1_3b_text2image_pretrain_config()
+
+        assert isinstance(config, ConfigContainer)
+        assert config.model.seq_length == 4096
+        assert config.dataset.seq_length == 4096
+        assert config.model.context_parallel_size == 1
+        assert config.optimizer.lr == 1e-4
+        assert config.optimizer.min_lr == 1e-4
+        assert config.optimizer.weight_decay == 0.001
+
+    def test_text2video_overrides(self):
+        config = wan_1_3b_text2video_pretrain_config()
+
+        assert isinstance(config, ConfigContainer)
+        assert config.model.seq_length == 43008
+        assert config.dataset.seq_length == 43008
+        assert config.model.context_parallel_size == 4
+        assert config.optimizer.lr == 1e-4
+        assert config.optimizer.min_lr == 1e-4
+        assert config.optimizer.weight_decay == 0.001
+
+    @pytest.mark.parametrize(
+        "recipe_factory",
+        [
+            wan_1_3b_text2image_pretrain_config,
+            canonical_wan_1_3b_text2image_pretrain_config,
+        ],
+    )
+    def test_text2image_mock_uses_single_temporal_latent(self, recipe_factory):
+        config = recipe_factory()
+        batch = mock_batch(
+            F_latents=config.dataset.F_latents,
+            H_latents=4,
+            W_latents=4,
+            patch_temporal=config.dataset.patch_temporal,
+            patch_spatial=config.dataset.patch_spatial,
+            number_packed_samples=1,
+            context_seq_len=2,
+            context_embeddings_dim=4,
+        )
+
+        assert batch["grid_sizes"][0, 0].item() == 1
+        assert canonical_wan_1_3b_text2video_pretrain_config().dataset.F_latents > 1

@@ -14,12 +14,13 @@
 
 """Functional smoke tests for Mcore WAN pretrain mock runs.
 
-Uses the generic run_recipe.py entry point with wan_1_3B_pretrain_config and wan_step.
+Uses the generic run_recipe.py entry point with wan_1_3b_pretrain_config and wan_step.
 Mock/synthetic data is used when dataset.path is not set (no --mock flag).
 """
 
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -52,12 +53,12 @@ class TestMcoreWanPretrain:
             "-m",
             "coverage",
             "run",
-            "--data-file=/opt/Megatron-Bridge/.coverage",
-            "--source=/opt/Megatron-Bridge/",
+            f"--data-file={Path(__file__).resolve().parents[5] / '.coverage'}",
+            f"--source={Path(__file__).resolve().parents[5]}",
             "--parallel-mode",
             "scripts/training/run_recipe.py",
             "--recipe",
-            "wan_1_3B_pretrain_config",
+            "wan_1_3b_pretrain_config",
             "--step_func",
             "wan_step",
             "model.tensor_model_parallel_size=1",

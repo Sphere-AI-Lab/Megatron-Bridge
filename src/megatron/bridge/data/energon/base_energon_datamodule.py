@@ -12,14 +12,155 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import logging
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.energon import WorkerConfig, get_savable_loader, get_train_dataset
+from megatron.energon import Sample, WorkerConfig, get_savable_loader, get_train_dataset
+from megatron.energon import dataset_config as _energon_dataset_config
+from megatron.energon.epathlib import EPath
+from megatron.energon.flavors.webdataset.default_generic_webdataset import DefaultGenericWebdatasetFactory
+from megatron.energon.typed_converter import JsonParser
 
 
 logger = logging.getLogger(__name__)
+
+_ORIGINAL_METHOD_ATTRIBUTE = "__megatron_bridge_original_method__"
+_TRUSTED_DATASET_FACTORY_MODULE_PREFIXES = (
+    "megatron.bridge.data.energon",
+    "megatron.energon",
+)
+_TRUSTED_DATASET_FACTORY_MODULE_ALIASES = frozenset(
+    {
+        "megatron.bridge.models.qwen_vl.data.energon",
+    }
+)
+_energon_factory_init = getattr(
+    DefaultGenericWebdatasetFactory.__init__,
+    _ORIGINAL_METHOD_ATTRIBUTE,
+    DefaultGenericWebdatasetFactory.__init__,
+)
+_energon_load_config = getattr(
+    _energon_dataset_config.load_config,
+    _ORIGINAL_METHOD_ATTRIBUTE,
+    _energon_dataset_config.load_config,
+)
+
+
+def _validate_energon_dataset_metadata(value: Any, *, root: bool = True) -> None:
+    """Reject executable object references in untrusted dataset factory metadata."""
+    if isinstance(value, list):
+        for item in value:
+            _validate_energon_dataset_metadata(item, root=False)
+        return
+    if not isinstance(value, dict):
+        return
+
+    module_name = value.get("__module__")
+    function_name = value.get("__function__")
+    class_name = value.get("__class__")
+    if function_name is not None:
+        raise ValueError(
+            "Energon dataset metadata cannot resolve serialized Python functions. "
+            "Use declarative configuration or pass a Python callable from trusted application code."
+        )
+    if class_name is not None:
+        trusted_class = (
+            isinstance(module_name, str)
+            and isinstance(class_name, str)
+            and (
+                module_name in _TRUSTED_DATASET_FACTORY_MODULE_ALIASES
+                or any(
+                    module_name == prefix or module_name.startswith(f"{prefix}.")
+                    for prefix in _TRUSTED_DATASET_FACTORY_MODULE_PREFIXES
+                )
+            )
+        )
+        if trusted_class:
+            module = importlib.import_module(module_name)
+            referenced_type = getattr(module, class_name, None)
+            required_base = DefaultGenericWebdatasetFactory if root else Sample
+            trusted_class = isinstance(referenced_type, type) and issubclass(referenced_type, required_base)
+        if not trusted_class:
+            raise ValueError(
+                "Energon dataset metadata cannot instantiate serialized Python classes. "
+                "Only packaged Energon dataset factory and sample classes are allowed."
+            )
+
+    for item in value.values():
+        _validate_energon_dataset_metadata(item, root=False)
+
+
+def _secure_energon_load_config(
+    path: EPath | dict[str, Any],
+    *,
+    default_type: type,
+    default_kwargs: dict[str, Any] | None = None,
+    parser: JsonParser = JsonParser(strict=True),
+) -> Any:
+    """Validate dataset metadata before Energon resolves serialized objects."""
+    is_dataset_factory = isinstance(default_type, type) and issubclass(default_type, DefaultGenericWebdatasetFactory)
+    if not is_dataset_factory:
+        return _energon_load_config(
+            path,
+            default_type=default_type,
+            default_kwargs=default_kwargs,
+            parser=parser,
+        )
+
+    if isinstance(path, dict):
+        data = path
+    else:
+        with path.open("rb") as config_file:
+            data = _energon_dataset_config.load_yaml(config_file)
+    _validate_energon_dataset_metadata(data)
+    return _energon_load_config(
+        data,
+        default_type=default_type,
+        default_kwargs=default_kwargs,
+        parser=parser,
+    )
+
+
+def _secure_energon_factory_init(
+    self: DefaultGenericWebdatasetFactory,
+    path: EPath,
+    *,
+    subflavors: dict[str, Any] | None = None,
+    field_map: dict[str, str] | None = None,
+    sample_loader: str | Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    part_filter: str | list[str] | Callable[[str], bool] | None = None,
+    **kwargs: Any,
+) -> None:
+    """Reject dataset-local Python hooks before Energon resolves their files."""
+    executable_fields = [
+        name
+        for name, value in (("sample_loader", sample_loader), ("part_filter", part_filter))
+        if isinstance(value, str)
+    ]
+    if executable_fields:
+        raise ValueError(
+            "Energon dataset metadata cannot load Python files through "
+            f"{', '.join(executable_fields)}. Use a declarative field_map instead."
+        )
+    _energon_factory_init(
+        self,
+        path,
+        subflavors=subflavors,
+        field_map=field_map,
+        sample_loader=sample_loader,
+        part_filter=part_filter,
+        **kwargs,
+    )
+
+
+# Energon constructs this factory internally after reading dataset.yaml, so
+# Bridge must install the guard before calling get_train_dataset().
+setattr(_secure_energon_load_config, _ORIGINAL_METHOD_ATTRIBUTE, _energon_load_config)
+_energon_dataset_config.load_config = _secure_energon_load_config
+setattr(_secure_energon_factory_init, _ORIGINAL_METHOD_ATTRIBUTE, _energon_factory_init)
+DefaultGenericWebdatasetFactory.__init__ = _secure_energon_factory_init
 
 
 class EnergonMultiModalDataModule:
@@ -34,7 +175,6 @@ class EnergonMultiModalDataModule:
     Attributes:
     path (str): Path to the energon dataset.
     tokenizer (Tokenizer): The tokenizer used for processing text.
-    image_processor (ImageProcessor): The image processor used for preprocessing images.
     seq_length (int): The maximum sequence length for tokenized text.
     micro_batch_size (int): The batch size for training and validation.
     num_workers (int): Number of workers for data loading.
@@ -50,10 +190,8 @@ class EnergonMultiModalDataModule:
         self,
         path: str,
         tokenizer,
-        image_processor,
         seq_length: int = 2048,
         micro_batch_size: int = 1,
-        global_batch_size: int = 1,
         num_workers: int = 1,
         num_val_workers: int | None = None,
         pin_memory: bool = True,
@@ -73,7 +211,6 @@ class EnergonMultiModalDataModule:
         Parameters:
         path (str): Path to the dataset.
         tokenizer (Tokenizer): The tokenizer used for processing text.
-        image_processor (ImageProcessor): The image processor used for preprocessing images.
         seq_length (int, optional): The maximum sequence length for tokenized text. Defaults to 2048.
         micro_batch_size (int, optional): The batch size for training and validation. Defaults to 1.
         num_workers (int, optional): Number of workers for data loading. Defaults to 1.
@@ -98,11 +235,9 @@ class EnergonMultiModalDataModule:
         super().__init__()
         self.path = path
         self.tokenizer = tokenizer
-        self.image_processor = image_processor
         self.seq_length = seq_length
         self.decoder_seq_length = decoder_seq_length
         self.micro_batch_size = micro_batch_size
-        self.global_batch_size = global_batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.multimodal_sample_config = multimodal_sample_config
@@ -114,7 +249,7 @@ class EnergonMultiModalDataModule:
         self.val_dataloader_object = None
         self.packing_buffer_size = packing_buffer_size
         self.validation_task_encoder = validation_task_encoder or self.task_encoder
-        self.num_val_workers = num_val_workers or self.num_workers
+        self.num_val_workers = self.num_workers if num_val_workers is None else num_val_workers
         self.pg_collection = pg_collection
         self.kwargs = kwargs
 
@@ -225,12 +360,11 @@ class EnergonMultiModalDataModule:
         Returns:
         EVAL_DATALOADERS: The DataLoader for the validation dataset.
         """
-        if self.val_dataloader_object:
-            return self.val_dataloader_object
-        worker_config = self._build_worker_config(self.num_val_workers, split="val")
-        val_dataset = self.datasets_provider(worker_config, split="val")
-        energon_loader = get_savable_loader(val_dataset, worker_config=worker_config)
-        self.val_dataloader_object = energon_loader
+        if self.val_dataloader_object is None:
+            worker_config = self._build_worker_config(self.num_val_workers, split="val")
+            val_dataset = self.datasets_provider(worker_config, split="val")
+            energon_loader = get_savable_loader(val_dataset, worker_config=worker_config)
+            self.val_dataloader_object = energon_loader
         return EnergonDataloader(self.val_dataloader_object)
 
     def test_dataloader(self) -> None:
@@ -262,6 +396,15 @@ class EnergonDataloader:
 
     def save_state(self):
         return self._dataloader.save_state_rank()
+
+    def restore_state(self, state):
+        """Restore the underlying Energon loader to a saved stream position and rebuild the iterator.
+
+        Must run before iteration starts (no workers spawned yet), which holds when called right
+        after dataloader construction on resume.
+        """
+        self._dataloader.restore_state_rank(state)
+        self._iter = iter(cyclic_iter(self._dataloader))
 
 
 def cyclic_iter(iter):

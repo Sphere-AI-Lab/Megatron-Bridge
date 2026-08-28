@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.qwen_audio.qwen2_audio_bridge import Qwen2AudioBridge
 from megatron.bridge.models.qwen_audio.qwen2_audio_provider import Qwen2AudioModelProvider
 
@@ -76,7 +76,7 @@ def mock_hf_config(mock_text_config, mock_audio_config):
 @pytest.fixture
 def mock_hf_pretrained(mock_hf_config):
     """Create a mock HF pretrained VLM."""
-    pretrained = Mock(spec=PreTrainedVLM)
+    pretrained = Mock(spec=PreTrainedCausalLM)
     pretrained.config = mock_hf_config
     return pretrained
 
@@ -85,22 +85,6 @@ def mock_hf_pretrained(mock_hf_config):
 def qwen2_audio_bridge():
     """Create a Qwen2AudioBridge instance."""
     return Qwen2AudioBridge()
-
-
-class TestQwen2AudioBridgeInitialization:
-    """Test Qwen2AudioBridge initialization and basic functionality."""
-
-    def test_bridge_initialization(self, qwen2_audio_bridge):
-        """Test that bridge can be initialized."""
-        assert isinstance(qwen2_audio_bridge, Qwen2AudioBridge)
-
-    def test_bridge_has_required_methods(self, qwen2_audio_bridge):
-        """Test that bridge has required methods."""
-        assert hasattr(qwen2_audio_bridge, "provider_bridge")
-        assert callable(qwen2_audio_bridge.provider_bridge)
-
-        assert hasattr(qwen2_audio_bridge, "mapping_registry")
-        assert callable(qwen2_audio_bridge.mapping_registry)
 
 
 class TestQwen2AudioBridgeProviderBridge:
@@ -268,13 +252,83 @@ class TestQwen2AudioBridgeMappingRegistry:
         has_mlp = any("mlp" in name for name in mapping_names)
         assert has_mlp, "Should contain MLP mappings"
 
+    def test_mapping_registry_accepts_transformers_save_layout(self, qwen2_audio_bridge, tmp_path):
+        """A checkpoint saved by the pinned HF class must satisfy Bridge mappings."""
+        from safetensors import safe_open
+        from transformers import Qwen2AudioConfig, Qwen2AudioForConditionalGeneration
+
+        config = Qwen2AudioConfig(
+            audio_token_index=30,
+            audio_config={
+                "num_mel_bins": 8,
+                "d_model": 8,
+                "encoder_layers": 1,
+                "encoder_attention_heads": 1,
+                "encoder_ffn_dim": 16,
+                "max_source_positions": 8,
+            },
+            text_config={
+                "vocab_size": 32,
+                "max_position_embeddings": 32,
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "tie_word_embeddings": False,
+            },
+        )
+        model = Qwen2AudioForConditionalGeneration(config)
+        model.save_pretrained(tmp_path, safe_serialization=True)
+        with safe_open(tmp_path / "model.safetensors", framework="pt") as checkpoint:
+            hf_keys = set(checkpoint.keys())
+
+        qwen2_audio_bridge.hf_config = config
+        qwen2_audio_bridge.hf_pretrained = SimpleNamespace(
+            state=SimpleNamespace(source=SimpleNamespace(get_all_keys=lambda: hf_keys))
+        )
+        registry = qwen2_audio_bridge.mapping_registry()
+        language_params = [
+            "language_model.embedding.word_embeddings.weight",
+            "language_model.output_layer.weight",
+            "language_model.decoder.final_layernorm.weight",
+            "language_model.decoder.layers.0.self_attention.linear_qkv.layer_norm_weight",
+            "language_model.decoder.layers.0.mlp.linear_fc1.layer_norm_weight",
+            "language_model.decoder.layers.0.self_attention.linear_proj.weight",
+            "language_model.decoder.layers.0.mlp.linear_fc2.weight",
+            "language_model.decoder.layers.0.self_attention.linear_qkv.weight",
+            "language_model.decoder.layers.0.self_attention.linear_qkv.bias",
+            "language_model.decoder.layers.0.mlp.linear_fc1.weight",
+        ]
+        mappings = qwen2_audio_bridge._validate_conversion_mappings(
+            registry,
+            language_params,
+            hf_keys,
+        )
+
+        mapped_hf_names = set()
+        for mapping in mappings.values():
+            if isinstance(mapping.hf_param, str):
+                mapped_hf_names.add(mapping.hf_param)
+            else:
+                mapped_hf_names.update(mapping.hf_param.values())
+        assert mapped_hf_names <= hf_keys
+
+    def test_mapping_registry_defaults_to_released_layout(self, qwen2_audio_bridge):
+        """Published Qwen2-Audio checkpoints retain the existing mapping layout."""
+        mapping = qwen2_audio_bridge.mapping_registry().megatron_to_hf_lookup(
+            "language_model.embedding.word_embeddings.weight"
+        )
+
+        assert mapping.hf_param == "language_model.model.embed_tokens.weight"
+
 
 class TestQwen2AudioBridgeEdgeCases:
     """Test edge cases and error conditions."""
 
     def test_provider_bridge_with_minimal_config(self, qwen2_audio_bridge):
         """Test provider_bridge with minimal HF config."""
-        minimal_pretrained = Mock(spec=PreTrainedVLM)
+        minimal_pretrained = Mock(spec=PreTrainedCausalLM)
         minimal_config = Mock()
 
         text_config = SimpleNamespace(

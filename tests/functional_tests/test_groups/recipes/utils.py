@@ -36,6 +36,8 @@ def run_pretrain_recipe_test(
     pipeline_model_parallel_size: Optional[int] = None,
     expert_model_parallel_size: Optional[int] = None,
     model_overrides: Optional[dict] = None,
+    checkpoint_overrides: Optional[dict] = None,
+    ddp_overrides: Optional[dict] = None,
 ):
     """
     Common test implementation for pretrain recipe configurations.
@@ -114,7 +116,23 @@ def run_pretrain_recipe_test(
         # Apply any model-specific overrides provided by the caller
         if model_overrides:
             for attribute_name, attribute_value in model_overrides.items():
+                if not hasattr(config.model, attribute_name):
+                    raise ValueError(f"Attempted to test a foreign attribute ({attribute_name}) in {config.model}.")
                 setattr(config.model, attribute_name, attribute_value)
+
+        if checkpoint_overrides:
+            for attribute_name, attribute_value in checkpoint_overrides.items():
+                if not hasattr(config.checkpoint, attribute_name):
+                    raise ValueError(
+                        f"Attempted to test a foreign attribute ({attribute_name}) in {config.checkpoint}."
+                    )
+                setattr(config.checkpoint, attribute_name, attribute_value)
+
+        if ddp_overrides:
+            for attribute_name, attribute_value in ddp_overrides.items():
+                if not hasattr(config.ddp, attribute_name):
+                    raise ValueError(f"Attempted to test a foreign attribute ({attribute_name}) in {config.ddp}.")
+                setattr(config.ddp, attribute_name, attribute_value)
 
         pretrain(config, forward_step)
 
@@ -134,6 +152,7 @@ def run_pretrain_recipe_perf_test(
     config_func: Callable,
     recipe_name: str,
     config_overrides: Optional[dict] = None,
+    tmp_path: Optional[Path] = None,
 ):
     """
     Common test implementation for pretrain perf recipe configurations.
@@ -147,11 +166,17 @@ def run_pretrain_recipe_perf_test(
         config_func: The recipe's pretrain_config function (parameterless API)
         recipe_name: Name of the recipe for logging/debugging
         config_overrides: Optional mapping of config attribute overrides to apply
+        tmp_path: Optional isolated output directory for checkpoints and logs
     """
     initialize_distributed()
 
     # Pretrain configs use parameterless API - call without arguments
     config: ConfigContainer = config_func()
+    if tmp_path is not None:
+        shared_base_dir = Path(broadcast_path(tmp_path))
+        config.checkpoint.save = str(shared_base_dir / "checkpoints")
+        config.checkpoint.load = str(shared_base_dir / "checkpoints")
+        config.logger.tensorboard_dir = str(shared_base_dir / "tb_logs")
     # Keep runs short and consistent across tests
     config.train.train_iters = 10
     config.validation.eval_interval = 5
@@ -169,8 +194,11 @@ def run_pretrain_recipe_perf_test(
     # Apply any model-specific overrides provided by the caller
     if config_overrides:
         for obj_name, overrides_dict in config_overrides.items():
+            config_obj = getattr(config, obj_name)
             for key, value in overrides_dict.items():
-                setattr(getattr(config, obj_name), key, value)
+                if not hasattr(config_obj, key):
+                    raise ValueError(f"Attempted to test a foreign attribute ({key}) in {config_obj}.")
+                setattr(config_obj, key, value)
 
     pretrain(config, forward_step)
 
@@ -222,7 +250,7 @@ def run_pretrain_vl_recipe_test(
         model_overrides: Optional mapping of model attribute overrides to apply
         dataset_overrides: Optional mapping of dataset attribute overrides to apply
     """
-    from megatron.bridge.data.vlm_datasets.mock_provider import MockVLMConversationProvider
+    from megatron.bridge.data.builders import MockVLMSFTDatasetConfig
 
     if forward_step_func is None:
         # Import locally to avoid loading VLM stack for non-VL tests
@@ -246,6 +274,8 @@ def run_pretrain_vl_recipe_test(
 
         # Keep runs short and consistent across tests
         config.train.train_iters = 10
+        config.train.eval_interval = None
+        config.train.eval_iters = None
         config.validation.eval_interval = 5
         config.validation.eval_iters = 2
         # Standardize batch sizes for functional tests
@@ -257,15 +287,23 @@ def run_pretrain_vl_recipe_test(
 
         # Get the HF processor path from the original dataset config before replacing
         hf_processor_path = getattr(config.dataset, "hf_processor_path", None)
-        pack_sequences_in_batch = getattr(config.dataset, "pack_sequences_in_batch", False)
+        enable_in_batch_packing = getattr(config.dataset, "enable_in_batch_packing", False)
+        defer_in_batch_packing_to_step = getattr(config.dataset, "defer_in_batch_packing_to_step", False)
+        pad_to_max_length = getattr(config.dataset, "pad_to_max_length", False)
+        pad_to_multiple_of = getattr(config.dataset, "pad_to_multiple_of", 128)
+        in_batch_packing_pad_to_multiple_of = getattr(config.dataset, "in_batch_packing_pad_to_multiple_of", 1)
 
         # Replace the real dataset with a mock dataset provider for tests
-        # MockVLMConversationProvider generates synthetic data and doesn't need a split attribute
+        # MockVLMSFTDatasetConfig generates synthetic data and doesn't need a split attribute.
         # since the DatasetBuildContext calculates sample counts from training configuration
-        config.dataset = MockVLMConversationProvider(
+        config.dataset = MockVLMSFTDatasetConfig(
             seq_length=test_seq_length,
             hf_processor_path=hf_processor_path,
-            pack_sequences_in_batch=pack_sequences_in_batch,
+            enable_in_batch_packing=enable_in_batch_packing,
+            defer_in_batch_packing_to_step=defer_in_batch_packing_to_step,
+            pad_to_max_length=pad_to_max_length,
+            pad_to_multiple_of=pad_to_multiple_of,
+            in_batch_packing_pad_to_multiple_of=in_batch_packing_pad_to_multiple_of,
         )
 
         if tensor_model_parallel_size is not None:
@@ -278,14 +316,18 @@ def run_pretrain_vl_recipe_test(
         # Apply any model-specific overrides provided by the caller
         if model_overrides:
             for attribute_name, attribute_value in model_overrides.items():
+                if not hasattr(config.model, attribute_name):
+                    raise ValueError(f"Attempted to test a foreign attribute ({attribute_name}) in {config.model}.")
                 setattr(config.model, attribute_name, attribute_value)
 
         # Apply any dataset-specific overrides provided by the caller
         if dataset_overrides:
             for attribute_name, attribute_value in dataset_overrides.items():
+                if not hasattr(config.dataset, attribute_name):
+                    raise ValueError(f"Attempted to test a foreign attribute ({attribute_name}) in {config.dataset}.")
                 setattr(config.dataset, attribute_name, attribute_value)
 
-        if hasattr(config.dataset, "pack_sequences_in_batch") and config.dataset.pack_sequences_in_batch:
+        if hasattr(config.dataset, "enable_in_batch_packing") and config.dataset.enable_in_batch_packing:
             config.train.micro_batch_size = 2
 
         pretrain(config, vlm_forward_step)

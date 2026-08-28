@@ -121,6 +121,7 @@ class Qwen25OmniThinkerModel(MegatronModule):
             post_process=self.post_process,
             rotary_base=language_transformer_config.rotary_base,
             fp16_lm_cross_entropy=language_transformer_config.fp16_lm_cross_entropy,
+            logit_dtype=language_transformer_config.logit_dtype,
             share_embeddings_and_output_weights=language_transformer_config.share_embeddings_and_output_weights,
             scatter_embedding_sequence_parallel=False,
             pg_collection=pg_collection,
@@ -296,7 +297,9 @@ class Qwen25OmniThinkerModel(MegatronModule):
                 sp_pad_len = (tp_size - seq_len % tp_size) % tp_size
                 if sp_pad_len > 0:
                     combined_embeddings = torch.nn.functional.pad(combined_embeddings, (0, 0, 0, 0, 0, sp_pad_len))
-                combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(combined_embeddings)
+                combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                    combined_embeddings, group=self.pg_collection.tp
+                )
                 combined_embeddings = combined_embeddings.contiguous()
         else:
             combined_embeddings = None

@@ -17,13 +17,13 @@ Functional tests for Qwen3 VL HF to Megatron generation.
 
 Example run commands:
     # Run all generation tests
-    pytest tests/functional_tests/models/qwen_vl/test_qwen3_vl_generation.py
+    pytest tests/functional_tests/test_groups/models/qwen_vl/test_qwen3_vl_generation.py
 
     # Run specific test (dense model)
-    pytest tests/functional_tests/models/qwen_vl/test_qwen3_vl_generation.py::TestQwen3VLGeneration::test_qwen3_vl_8b_image_generation
+    pytest tests/functional_tests/test_groups/models/qwen_vl/test_qwen3_vl_generation.py::TestQwen3VLGeneration::test_qwen3_vl_8b_image_generation
 
     # Run specific test (MOE model)
-    pytest tests/functional_tests/models/qwen_vl/test_qwen3_vl_generation.py::TestQwen3VLGeneration::test_qwen3_vl_30b_a3b_moe_image_generation
+    pytest tests/functional_tests/test_groups/models/qwen_vl/test_qwen3_vl_generation.py::TestQwen3VLGeneration::test_qwen3_vl_30b_a3b_moe_image_generation
 
 Note: These tests use small proxy/toy models for fast generation testing.
 """
@@ -41,6 +41,8 @@ from transformers import (
     Qwen3VLMoeForConditionalGeneration,
 )
 from transformers.models.qwen3_vl import Qwen3VLConfig
+
+from tests.functional_tests.fixture_utils import resolve_test_data_file
 
 
 HF_QWEN3_VL_TOY_MODEL_CONFIG = {
@@ -325,6 +327,10 @@ class TestQwen3VLGeneration:
         Args:
             qwen3_vl_toy_model_path: Path to the toy Qwen3 VL model (from fixture)
         """
+        image_path = resolve_test_data_file(
+            "megatron_bridge/assets/demo.jpeg",
+            "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+        )
         cmd = [
             "python",
             "-m",
@@ -332,7 +338,7 @@ class TestQwen3VLGeneration:
             "--nproc_per_node=2",
             "examples/conversion/hf_to_megatron_generate_vlm.py",
             f"--hf_model_path={qwen3_vl_toy_model_path}",
-            "--image_path=https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+            f"--image_path={image_path}",
             "--prompt=Describe this image.",
         ]
 

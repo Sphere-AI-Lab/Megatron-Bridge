@@ -25,14 +25,14 @@ from megatron.bridge.models.conversion.param_mapping import (
     GatedMLPMapping,
     ReplicatedMapping,
 )
-from megatron.bridge.models.deepseek.common import get_common_mapping_list
-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
-from megatron.bridge.models.kimi_vl.kimi_k25_vl_provider import KimiK25VLModelProvider
-from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import KimiK25VLModel
-from megatron.bridge.orbit.low_precision.int4 import (
+from megatron.bridge.models.conversion.quantization_utils import (
     dequantize_int4,
     quantize_to_int4,
 )
+from megatron.bridge.models.deepseek.common import get_common_mapping_list
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+from megatron.bridge.models.kimi_vl.kimi_k25_vl_provider import KimiK25VLModelProvider
+from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import KimiK25VLModel
 
 
 try:
@@ -58,7 +58,7 @@ class KimiK25VLBridge(MegatronModelBridge):
     The language backbone shares the same architecture as Kimi K2 (MoE with MLA).
     """
 
-    def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> KimiK25VLModelProvider:
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> KimiK25VLModelProvider:
         hf_config = hf_pretrained.config
         text_config = hf_config.text_config
         vision_config = hf_config.vision_config
@@ -86,7 +86,10 @@ class KimiK25VLBridge(MegatronModelBridge):
         # MoE settings
         provider.moe_grouped_gemm = True
         provider.moe_router_pre_softmax = True
-        provider.moe_token_dispatcher_type = "alltoall"
+        provider.moe_token_dispatcher_type = "flex"
+        provider.moe_flex_dispatcher_backend = "hybridep"
+        provider.moe_flex_dispatcher_num_sms = 16
+        provider.moe_permute_fusion_into_hybridep = False
         provider.moe_router_load_balancing_type = "seq_aux_loss"
         provider.moe_shared_expert_overlap = True
         provider.moe_router_score_function = "sigmoid"
@@ -127,7 +130,8 @@ class KimiK25VLBridge(MegatronModelBridge):
 
         # VL-specific overrides
         provider.vision_config = vision_config
-        provider.hf_model_path = hf_pretrained._model_name_or_path
+        provider.hf_model_path = hf_pretrained.model_name_or_path
+        provider.trust_remote_code = bool(getattr(hf_pretrained, "trust_remote_code", False))
         provider.generation_config = hf_pretrained.generation_config
 
         # media_placeholder_token_id is on the top-level KimiK25Config, not on text_config
@@ -183,6 +187,9 @@ class KimiK25VLBridge(MegatronModelBridge):
         hf_state_dict: Mapping[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """Re-quantize converted expert weights to INT4 format."""
+        if task.weight_dtype is not None:
+            return converted_weights_dict
+
         result = {}
         for fqn, tensor in converted_weights_dict.items():
             if self._is_quantized_expert_key(fqn):
@@ -204,6 +211,7 @@ class KimiK25VLBridge(MegatronModelBridge):
         self,
         hf_pretrained,
         megatron_model,
+        weight_dtype=None,
     ) -> List:
         """Override to synthesize virtual weight keys from INT4 quantized triplets.
 
@@ -227,18 +235,12 @@ class KimiK25VLBridge(MegatronModelBridge):
 
         hf_pretrained.state.source.get_all_keys = _get_all_keys_with_virtual
         try:
-            return super().build_conversion_tasks(hf_pretrained, megatron_model)
+            return super().build_conversion_tasks(hf_pretrained, megatron_model, weight_dtype=weight_dtype)
         finally:
             hf_pretrained.state.source.get_all_keys = original_get_all_keys
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         mapping_list = get_common_mapping_list()
-        param_mappings = {
-            "decoder.layers.*.mlp.router.expert_bias": "model.layers.*.mlp.gate.e_score_correction_bias",
-        }
-
-        for megatron_param, hf_param in param_mappings.items():
-            mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
 
         # In HF Kimi K2.5 VL models, the language component is nested under
         # "language_model.model" instead of just "model", so we need to add the prefix.

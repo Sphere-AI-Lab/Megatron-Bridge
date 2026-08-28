@@ -16,9 +16,12 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import List, Optional
 
+import torch
 import torch.nn.functional as F
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+
+from megatron.bridge.utils.cuda_graph import clear_cuda_graph_modules, set_cuda_graph_modules
 
 
 @dataclass
@@ -26,6 +29,8 @@ class Qwen3VLTransformerConfig(TransformerConfig):
     """Configuration for Qwen3-VL transformer with vision and language components."""
 
     vocab_size: int = 64000
+    make_vocab_size_divisible_by: int = 128
+    should_pad_vocab: bool = False
     language_max_sequence_length: int = 4096
 
     patch_size: int = 16
@@ -38,6 +43,7 @@ class Qwen3VLTransformerConfig(TransformerConfig):
     apply_rotary_pos_emb_in_fp32: bool = False
     deepstack_visual_indexes: List[int] = field(default_factory=lambda: [8, 16, 24])
     fp16_lm_cross_entropy: bool = False
+    logit_dtype: torch.dtype | None = None
     share_embeddings_and_output_weights: bool = False
     rotary_percent: float = 1.0
     rotary_base: float = 10000
@@ -52,6 +58,8 @@ class Qwen3VLTransformerConfig(TransformerConfig):
     hf_text_config: Optional[Qwen3VLTextConfig] = None
     vision_dp_when_cp: bool = False
     use_hf_vision_model: bool = False
+    # Maximum sequence length for vision encoder CUDA graphs.
+    max_vision_cuda_graph_seq_length: Optional[int] = None
 
 
 def get_vision_model_config(hf_config, megatron_config=None):
@@ -78,8 +86,6 @@ def get_vision_model_config(hf_config, megatron_config=None):
     config.cuda_graph_retain_backward_graph = megatron_config.cuda_graph_retain_backward_graph
     config.cuda_graph_warmup_steps = megatron_config.cuda_graph_warmup_steps
     config.external_cuda_graph = megatron_config.external_cuda_graph
-    config.cuda_graph_impl = megatron_config.cuda_graph_impl
-    config.cuda_graph_scope = megatron_config.cuda_graph_scope
 
     config.num_moe_experts = None
     config.expert_model_parallel_size = 1
@@ -96,7 +102,13 @@ def get_vision_model_config(hf_config, megatron_config=None):
     config.spatial_merge_size = hf_config.spatial_merge_size
     config.num_position_embeddings = hf_config.num_position_embeddings
     config.out_hidden_size = hf_config.out_hidden_size
-    config.deepstack_visual_indexes = deepcopy(hf_config.deepstack_visual_indexes)
+    # ``deepstack_visual_indexes`` is a Qwen3-VL-only field. Qwen3.5/3.6-VL HF
+    # configs do not declare it in the schema, so the field is sometimes
+    # absent — e.g. after a YAML round-trip through
+    # ``PretrainedConfig.to_dict()`` / ``from_dict()`` which only persists
+    # declared fields. ``Qwen3VLModel.__init__`` already reads it
+    # defensively with the same default (``modelling_qwen3_vl/model.py:193``).
+    config.deepstack_visual_indexes = deepcopy(getattr(hf_config, "deepstack_visual_indexes", []))
 
     config.apply_rope_fusion = False
     config.gated_linear_unit = False  # no gated
@@ -120,4 +132,29 @@ def get_vision_model_config(hf_config, megatron_config=None):
     config.pipeline_model_parallel_layout = None
     config.account_for_embedding_in_pipeline_split = None
     config.account_for_loss_in_pipeline_split = None
+
+    # Vision encoder CUDA graph settings
+    # Check megatron_config (the provider / language config) for vision-specific CUDA graph
+    # settings. The provider stores these as vision_cuda_graph_impl / vision_cuda_graph_scope.
+    # If present, use them; otherwise default to "none" for backward compatibility.
+    if (
+        megatron_config is not None
+        and hasattr(megatron_config, "vision_cuda_graph_impl")
+        and megatron_config.vision_cuda_graph_impl != "none"
+    ):
+        config.cuda_graph_impl = megatron_config.vision_cuda_graph_impl
+        if hasattr(megatron_config, "vision_cuda_graph_scope") and megatron_config.vision_cuda_graph_scope:
+            set_cuda_graph_modules(config, megatron_config.vision_cuda_graph_scope)
+        else:
+            clear_cuda_graph_modules(config)
+    else:
+        config.cuda_graph_impl = "none"
+        clear_cuda_graph_modules(config)
+    # Propagate max vision CUDA graph sequence length from provider
+    if megatron_config is not None and hasattr(megatron_config, "max_vision_cuda_graph_seq_length"):
+        config.max_vision_cuda_graph_seq_length = megatron_config.max_vision_cuda_graph_seq_length
+
+    if megatron_config is not None and hasattr(megatron_config, "use_cpu_initialization"):
+        config.use_cpu_initialization = megatron_config.use_cpu_initialization
+
     return config

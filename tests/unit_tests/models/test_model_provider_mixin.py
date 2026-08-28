@@ -15,6 +15,7 @@
 from unittest.mock import Mock, call, patch
 
 import pytest
+import torch
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -34,8 +35,20 @@ class MockMegatronModule(MegatronModule):
 class TestProvider(ModelProviderMixin):
     """A concrete implementation of ModelProviderMixin for testing."""
 
+    def __init__(self) -> None:
+        self.tensor_model_parallel_size = 1
+        self.pipeline_model_parallel_size = 1
+        self.expert_model_parallel_size = 1
+        self.expert_tensor_parallel_size = 1
+        self.virtual_pipeline_model_parallel_size = None
+        self.context_parallel_size = 1
+        self.sequence_parallel = False
+
     def provide(self, pre_process=None, post_process=None) -> MockMegatronModule:
         return MockMegatronModule()
+
+    def finalize(self) -> None:
+        self.finalized = True
 
 
 @pytest.fixture
@@ -48,6 +61,35 @@ def provider():
 def ddp_config():
     """Fixture to create a DistributedDataParallelConfig instance."""
     return DistributedDataParallelConfig()
+
+
+def test_apply_overrides_and_finalize(provider):
+    provider.params_dtype = torch.float32
+    provider.fp16 = False
+    provider.bf16 = False
+    provider.sequence_parallel = False
+    provider.finalize = Mock()
+
+    result = provider.apply_overrides_and_finalize(
+        dtype=torch.bfloat16,
+        overrides={"sequence_parallel": True},
+    )
+
+    assert result is provider
+    assert provider.params_dtype == torch.bfloat16
+    assert provider.fp16 is False
+    assert provider.bf16 is True
+    assert provider.sequence_parallel is True
+    provider.finalize.assert_called_once_with()
+
+
+def test_apply_overrides_rejects_unknown_attributes(provider):
+    provider.finalize = Mock()
+
+    with pytest.raises(AttributeError, match="has no attribute 'unknown_option'"):
+        provider.apply_overrides_and_finalize(overrides={"unknown_option": True})
+
+    provider.finalize.assert_not_called()
 
 
 @patch("megatron.bridge.models.model_provider.ProcessGroupCollection.use_mpu_process_groups")

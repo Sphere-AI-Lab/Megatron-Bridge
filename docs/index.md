@@ -3,12 +3,18 @@
 ```
 
 ```{toctree}
+:caption: Performance
+:hidden:
+
+performance-summary.md
+performance-summary-archive.md
+```
+
+```{toctree}
 :caption: Guides
 :hidden:
 
 parallelisms.md
-performance-summary.md
-performance-summary-archive.md
 performance-guide.md
 recipe-usage.md
 nemo2-migration-guide.md
@@ -27,8 +33,27 @@ bridge-tech-details.md
 :caption: Supported Models
 :hidden:
 
-models/llm/index.md
-models/vlm/index.md
+models/README.md
+models/bailing/index.md
+models/deepseek/index.md
+models/ernie/ernie45.md
+models/exaone/exaone.md
+models/falcon/index.md
+models/gemma/index.md
+models/glm/index.md
+models/gpt_oss/index.md
+models/hy_v3/hy-v3.md
+models/kimi/index.md
+models/llama/index.md
+models/minimax/index.md
+models/mistral/index.md
+models/mimo/index.md
+models/moonlight/index.md
+models/nemotron/index.md
+models/olmoe/index.md
+models/qwen/index.md
+models/sarvam/index.md
+models/stepfun/index.md
 ```
 
 ```{toctree}
@@ -37,25 +62,27 @@ models/vlm/index.md
 
 training/config-container-overview.md
 training/entry-points.md
+training/data-preparation.md
 training/training-loop-settings.md
 training/optimizer-scheduler.md
 training/logging.md
 training/profiling.md
+training/memory-estimator.md
 training/checkpointing.md
 training/megatron-fsdp.md
 training/resiliency.md
 training/mixed-precision.md
 training/cuda-graphs.md
-training/hybrid-context-parallel.md
+training/hierarchical-context-parallel.md
 training/communication-overlap.md
 training/attention-optimizations.md
 training/activation-recomputation.md
 training/cpu-offloading.md
+training/moe-optimization.md
 training/peft.md
 training/packed-sequences.md
 training/multi-token-prediction.md
-training/distillation.md
-training/pruning.md
+training/dspark-speculative-decoding.md
 training/callbacks.md
 ```
 
@@ -64,6 +91,8 @@ training/callbacks.md
 :hidden:
 
 modelopt/quantization.md
+modelopt/distillation.md
+modelopt/pruning.md
 ```
 
 ```{toctree}
@@ -81,6 +110,7 @@ apidocs/index.rst
 :hidden:
 
 releases/release-process.md
+releases/cherrypick-policy.md
 releases/software-versions.md
 releases/changelog.md
 releases/known-issues.md
@@ -98,9 +128,6 @@ skills-index
 :hidden:
 
 README.md
-models/README.md
-models/llm/README.md
-models/vlm/README.md
 releases/README.md
 training/README.md
 modelopt/README.md

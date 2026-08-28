@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -107,6 +108,82 @@ class MockModule(torch.nn.Module):
         if has_bias:
             self.bias = torch.nn.Parameter(torch.randn(weight_shape[0], device=device))
         self.config = config
+
+
+def test_ep_gather_preserves_expert_scale_singleton_dimensions(mock_distributed_env):
+    """EP gathering must remove only its own staging dimension."""
+    mock_mpu, mock_dist = mock_distributed_env()
+    mapping = FusedExpertMapping(
+        "decoder.layers.0.mlp.experts.linear_fc2.weight0",
+        "model.layers.0.mlp.experts.down_proj",
+    )
+
+    class _MockGroup:
+        def size(self):
+            return 2
+
+        def rank(self):
+            return 0
+
+    mapping.ep_group = _MockGroup()
+    mock_mpu.get_expert_model_parallel_group.return_value = mapping.ep_group
+
+    def fake_all_gather(output, tensor, group):
+        assert group is mapping.ep_group
+        output[0].copy_(tensor)
+        output[1].copy_(tensor + 10)
+
+    mock_dist.all_gather.side_effect = fake_all_gather
+    local_scale = torch.tensor([[1.0], [2.0]])
+
+    result = mapping.gather_from_ep_ranks(
+        local_scale,
+        SimpleNamespace(config=SimpleNamespace(num_moe_experts=4)),
+        "model.layers.0.mlp.experts.down_proj",
+    )
+
+    gathered_scale = result["model.layers.0.mlp.experts.down_proj"]
+    assert gathered_scale.shape == (2, 2, 1)
+    torch.testing.assert_close(gathered_scale[0], local_scale)
+    torch.testing.assert_close(gathered_scale[1], local_scale + 10)
+
+
+def test_ep_scale_gather_preserves_singleton_block_grid_dimensions(mock_distributed_env):
+    """Scale gathering must remove only its own staging dimension."""
+    mock_mpu, mock_dist = mock_distributed_env()
+    mapping = FusedExpertMapping(
+        "decoder.layers.0.mlp.experts.linear_fc2.weight0",
+        "model.layers.0.mlp.experts.down_proj",
+    )
+
+    class _MockGroup:
+        def size(self):
+            return 2
+
+        def rank(self):
+            return 0
+
+    mapping.ep_group = _MockGroup()
+    mock_mpu.get_expert_model_parallel_group.return_value = mapping.ep_group
+
+    def fake_all_gather(output, tensor, group):
+        assert group is mapping.ep_group
+        output[0].copy_(tensor)
+        output[1].copy_(tensor + 10)
+
+    mock_dist.all_gather.side_effect = fake_all_gather
+    local_scale = torch.tensor([[[1.0], [2.0]]])
+
+    result = mapping.gather_from_ep_ranks_scale(
+        local_scale,
+        SimpleNamespace(config=SimpleNamespace(num_moe_experts=4)),
+        "model.layers.0.mlp.experts.down_proj",
+    )
+
+    gathered_scale = result["model.layers.0.mlp.experts.down_proj"]
+    assert gathered_scale.shape == (2, 1, 2, 1)
+    torch.testing.assert_close(gathered_scale[0], local_scale)
+    torch.testing.assert_close(gathered_scale[1], local_scale + 10)
 
 
 class TestDirectMapping:
@@ -506,6 +583,22 @@ class TestGatedMLPMapping:
 class TestMappingEdgeCases:
     """Test edge cases and error handling in param mappings."""
 
+    def test_get_shard_spec_handles_replicated_tp_shards(self, mock_distributed_env):
+        mock_distributed_env(tp_size=4, tp_rank=3)
+        mapping = DirectMapping("weight", "weight")
+
+        megatron_module = torch.nn.Module()
+        megatron_module.global_dim = 8
+
+        shard_world_size, shard_rank = mapping._get_shard_spec(
+            shard_size=4,
+            megatron_module=megatron_module,
+            global_size_attr="global_dim",
+        )
+
+        assert shard_world_size == 2
+        assert shard_rank == 1
+
     def test_wildcard_pattern_validation(self):
         """Test that wildcard patterns are validated correctly."""
         # Valid patterns - should not raise
@@ -594,6 +687,95 @@ class TestMappingEdgeCases:
 
             with pytest.raises(ValueError, match="Object must exist on at least one PP rank"):
                 mapping.broadcast_from_pp_rank(None)
+
+    def test_broadcast_from_pp_rank_multi_owner(self, mock_distributed_env):
+        """Test PP broadcast handles tensors present on multiple PP ranks.
+
+        MLA (Multi-Latent Attention) architectures such as DeepSeek-V3 and
+        MTP models can place the same weight tensor on more than one PP stage.
+        broadcast_from_pp_rank must pick the first owner deterministically
+        rather than raising ValueError.
+        """
+        _, mock_dist = mock_distributed_env(pp_size=2, pp_rank=0)
+        mapping = DirectMapping("weight", "weight")
+
+        tensor = torch.randn(16, 16)
+        spec = (tensor.shape, tensor.dtype, None, None)
+
+        # Simulate both PP ranks owning the tensor
+        mock_dist.all_gather_object.side_effect = lambda output, obj, group: output.__setitem__(
+            slice(None), [spec, spec]
+        )
+        mock_dist.broadcast.side_effect = lambda t, src, group: None
+
+        # Must not raise — should pick rank 0 as source
+        result = mapping.broadcast_from_pp_rank(tensor)
+        assert result is not None
+
+        # Verify broadcast was called with src=rank 0
+        mock_dist.broadcast.assert_called_once()
+        call_kwargs = mock_dist.broadcast.call_args
+        assert call_kwargs[1]["src"] == 0 or call_kwargs[0][1] == 0
+
+    def test_broadcast_from_pp_rank_multi_owner_with_cache(self, mock_distributed_env):
+        """Test PP broadcast with cache_key when tensor exists on multiple ranks.
+
+        Every real mapping calls broadcast_from_pp_rank with
+        cache_key=str(self.hf_param). Verify that the cached path also
+        handles multi-owner tensors correctly and that the second call
+        skips the all_gather_object collective.
+        """
+        _, mock_dist = mock_distributed_env(pp_size=2, pp_rank=0)
+        mapping = DirectMapping("weight", "weight")
+
+        tensor = torch.randn(16, 16)
+        spec = (tensor.shape, tensor.dtype, None, None)
+
+        mock_dist.all_gather_object.side_effect = lambda output, obj, group: output.__setitem__(
+            slice(None), [spec, spec]
+        )
+        mock_dist.broadcast.side_effect = lambda t, src, group: None
+
+        cache_key = "model.layers.0.self_attn.kv_b_proj.weight"
+
+        # First call — populates cache
+        result1 = mapping.broadcast_from_pp_rank(tensor, cache_key=cache_key)
+        assert result1 is not None
+        assert mock_dist.all_gather_object.call_count == 1
+
+        # Second call with same cache_key — must reuse cached spec
+        result2 = mapping.broadcast_from_pp_rank(tensor, cache_key=cache_key)
+        assert result2 is not None
+        # all_gather_object should NOT be called again
+        assert mock_dist.all_gather_object.call_count == 1
+        # broadcast should be called twice (once per call)
+        assert mock_dist.broadcast.call_count == 2
+
+    def test_broadcast_obj_from_pp_rank_multi_owner(self, mock_distributed_env):
+        """Test PP object broadcast handles objects present on multiple PP ranks.
+
+        Similar to tensor broadcast, shared objects must not cause errors and
+        the first owning rank must be selected deterministically.
+        """
+        _, mock_dist = mock_distributed_env(pp_size=2, pp_rank=0)
+        mapping = DirectMapping("weight", "weight")
+
+        test_obj = {"config": "value"}
+
+        # Simulate both PP ranks owning the object
+        mock_dist.all_gather_object.side_effect = lambda output, obj, group: output.__setitem__(
+            slice(None), [True, True]
+        )
+        mock_dist.broadcast_object_list.side_effect = lambda obj_list, src, group: None
+
+        # Must not raise — should pick rank 0 as source
+        result = mapping.broadcast_obj_from_pp_rank(test_obj)
+        assert result == test_obj
+
+        # Verify broadcast_object_list was called with src=rank 0
+        mock_dist.broadcast_object_list.assert_called_once()
+        call_args = mock_dist.broadcast_object_list.call_args
+        assert call_args[1].get("src", call_args[0][1] if len(call_args[0]) > 1 else None) == 0
 
     def test_tp_aware_unknown_module_error(self, transformer_config):
         """Test AutoMapping error for unknown module types."""
@@ -785,17 +967,18 @@ class TestAutoMappingWithPermute:
         mapping = AutoMapping("transpose.weight", "hf.weight", permute_dims=(1, 0))
 
         hf_weight = torch.randn(4, 8)
-        megatron_module = MockModule(transformer_config, weight_shape=(4, 4))
+        megatron_module = MockModule(transformer_config, weight_shape=(8, 4))
 
         with patch.object(mapping, "_mapping") as mock_delegate:
-            mock_delegate.hf_to_megatron.return_value = torch.randn(4, 4)
+            mock_delegate.hf_to_megatron.return_value = torch.randn(8, 4)
             with patch.object(mapping, "_detect_parallelism_type", return_value="column"):
                 mapping.hf_to_megatron(hf_weight, megatron_module)
 
-            # On non-rank-0, permutation is skipped, original tensor passed to delegate
+            # Permutation is applied on ALL ranks so delegate mappings
+            # (e.g. ReplicatedMapping) always receive the correct shape.
             mock_delegate.hf_to_megatron.assert_called_once()
             passed_tensor = mock_delegate.hf_to_megatron.call_args[0][0]
-            assert torch.equal(passed_tensor, hf_weight)
+            assert torch.equal(passed_tensor, hf_weight.permute(1, 0).contiguous())
 
     def test_transpose_identity_permutation(self, mock_distributed_env, transformer_config):
         """Test AutoMapping with identity permutation."""

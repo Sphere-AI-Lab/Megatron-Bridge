@@ -9,8 +9,13 @@ and verification steps.
 :caption: Getting Started
 :maxdepth: 1
 
-skills/developer-guide/SKILL
-skills/mlm-bridge-training/SKILL
+skills/build-and-dependency/SKILL
+skills/bump-dependency/SKILL
+skills/testing/SKILL
+skills/cicd/SKILL
+skills/review-pr/SKILL
+skills/nemo-mbridge-mlm-bridge-training/SKILL
+skills/nemo-mbridge-recipe-recommender/SKILL
 ```
 
 ```{toctree}
@@ -22,33 +27,55 @@ skills/adding-model-support/llm-patterns
 skills/adding-model-support/vlm-patterns
 skills/adding-model-support/recipe-patterns
 skills/adding-model-support/tests-and-examples
+skills/create-model-verification-card/SKILL
+skills/verl-e2e-testing/SKILL
+skills/nemo-rl-e2e-testing/SKILL
 ```
 
 ```{toctree}
 :caption: Performance Techniques
 :maxdepth: 1
 
-skills/perf-techniques/parallelism-strategies/SKILL
-skills/perf-techniques/cuda-graphs/SKILL
-skills/perf-techniques/tp-dp-comm-overlap/SKILL
-skills/perf-techniques/megatron-fsdp/SKILL
-skills/perf-techniques/packed-sequences-long-context/SKILL
-skills/perf-techniques/sequence-packing/SKILL
-skills/perf-techniques/hybrid-context-parallel/SKILL
-skills/perf-techniques/expert-parallel-overlap/SKILL
-skills/perf-techniques/moe-comm-overlap/SKILL
+skills/nemo-mbridge-perf-cpu-offloading/SKILL
+skills/nemo-mbridge-perf-moe-long-context/SKILL
+skills/nemo-mbridge-perf-moe-optimization-workflow/SKILL
+skills/nemo-mbridge-perf-nsys-analysis/SKILL
+skills/nemo-mbridge-perf-moe-vlm-training/SKILL
+skills/nemo-mbridge-perf-memory-tuning/SKILL
+skills/nemo-mbridge-perf-moe-dispatcher-selection/SKILL
+skills/nemo-mbridge-perf-moe-hardware-configs/SKILL
+skills/nemo-mbridge-perf-parallelism-strategies/SKILL
+skills/nemo-mbridge-perf-cuda-graphs/SKILL
+skills/nemo-mbridge-perf-tp-dp-comm-overlap/SKILL
+skills/nemo-mbridge-perf-megatron-fsdp/SKILL
+skills/nemo-mbridge-perf-sequence-packing/SKILL
+skills/nemo-mbridge-perf-hierarchical-context-parallel/SKILL
+skills/nemo-mbridge-perf-vision-dp-over-cp/SKILL
+skills/nemo-mbridge-perf-expert-parallel-overlap/SKILL
+skills/nemo-mbridge-perf-moe-comm-overlap/SKILL
+skills/nemo-mbridge-perf-activation-recompute/SKILL
+```
+
+```{toctree}
+:hidden:
+
+skills/nemo-mbridge-recipe-recommender/references/recipe-index
+skills/nemo-mbridge-perf-nsys-analysis/references/pitfalls
+skills/nemo-mbridge-perf-nsys-analysis/references/sql-recipes
 ```
 
 ```{toctree}
 :caption: Cluster & Debugging
 :maxdepth: 1
 
-skills/multi-node-slurm/SKILL
+skills/nemo-mbridge-multi-node-slurm/SKILL
+skills/nemo-mbridge-multi-node-slurm/references/templates
+skills/nemo-mbridge-memory-snapshot-analysis/SKILL
 ```
 
 ```{toctree}
 :caption: Resiliency
 :maxdepth: 1
 
-skills/resiliency/SKILL
+skills/nemo-mbridge-resiliency/SKILL
 ```

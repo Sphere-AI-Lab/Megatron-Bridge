@@ -12,23 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+import warnings
+from dataclasses import fields
 from typing import Any, Optional, Union
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from megatron.core.transformer.enums import CudaGraphScope
 
+from megatron.bridge.data.builders import (
+    DirectHFSFTDatasetConfig,
+    EnergonDatasetConfig,
+    GPTSFTDatasetConfig,
+    HFDatasetSourceConfig,
+    HFEnergonTaskEncoderConfig,
+    MockVLMSFTDatasetConfig,
+    QwenVLEnergonTaskEncoderConfig,
+)
+from megatron.bridge.models.gpt.model_config import BridgeGPTModelConfig
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.mla_provider import MLAModelProvider
+from megatron.bridge.models.qwen_vl.qwen3_vl_provider import Qwen3VLModelProvider
 from megatron.bridge.models.t5_provider import T5ModelProvider
+from megatron.bridge.models.transformer_config import HeterogeneousTransformerConfig, TransformerConfig
 from megatron.bridge.training.comm_overlap import CommOverlapConfig
 from megatron.bridge.training.config import (
     CheckpointConfig,
     ConfigContainer,
+    DatasetProvider,
     DistributedDataParallelConfig,
     DistributedInitConfig,
-    FinetuningDatasetConfig,
     GPTDatasetConfig,
     GPTFIMDatasetConfig,
     LoggerConfig,
@@ -39,10 +54,19 @@ from megatron.bridge.training.config import (
     RerunStateMachineConfig,
     RNGConfig,
     SchedulerConfig,
-    TokenizerConfig,
     TrainingConfig,
+    ValidationConfig,
     _validate_and_sync_distributed_optimizer_settings,
     _validate_mixed_precision_consistency,
+    apply_environment_variables,
+    megatron_mimo_runtime_config_update,
+)
+from megatron.bridge.training.mixed_precision import MixedPrecisionConfig
+from megatron.bridge.training.tokenizers.config import TokenizerConfig
+from megatron.bridge.utils.cuda_graph import (
+    cuda_graph_module_names,
+    set_cuda_graph_modules,
+    set_full_iteration_cuda_graph,
 )
 
 
@@ -76,6 +100,19 @@ def create_test_gpt_config(**kwargs: Any) -> GPTModelProvider:
     return GPTModelProvider(**defaults)
 
 
+def create_test_qwen3_vl_config(**kwargs: Any) -> Qwen3VLModelProvider:
+    """Create a minimal Qwen3-VL provider for configuration validation."""
+    defaults = {
+        "num_layers": 1,
+        "hidden_size": 128,
+        "num_attention_heads": 4,
+        "seq_length": 512,
+        "apply_rope_fusion": False,
+    }
+    defaults.update(kwargs)
+    return Qwen3VLModelProvider(**defaults)
+
+
 def create_test_deepseek_config(**kwargs: Any) -> MLAModelProvider:
     """Creates an instance of MLAModelProvider for testing."""
     defaults = {
@@ -106,6 +143,7 @@ def create_test_training_config(**kwargs: Any) -> TrainingConfig:
     """Creates an instance of TrainingConfig with defaults for testing."""
     defaults = {
         "global_batch_size": 32,
+        "micro_batch_size": 1,
         "train_iters": 1000,
     }
     defaults.update(kwargs)
@@ -143,9 +181,43 @@ def create_test_gpt_dataset_config(sequence_length: int) -> GPTDatasetConfig:
     )
 
 
-def create_test_finetuning_dataset_config(sequence_length: int) -> FinetuningDatasetConfig:
-    """Creates an instance of FinetuningDatasetConfig with defaults for testing."""
-    return FinetuningDatasetConfig(seq_length=sequence_length)
+def create_test_gpt_sft_dataset_config(sequence_length: int) -> GPTSFTDatasetConfig:
+    """Create a GPTSFTDatasetConfig with defaults for testing."""
+    return GPTSFTDatasetConfig(seq_length=sequence_length, dataset_root="/tmp/dataset")
+
+
+def create_test_direct_hf_sft_dataset_config(sequence_length: int) -> DirectHFSFTDatasetConfig:
+    """Create a DirectHFSFTDatasetConfig with defaults for testing."""
+    return DirectHFSFTDatasetConfig(
+        seq_length=sequence_length,
+        source=HFDatasetSourceConfig(path_or_dataset="json"),
+    )
+
+
+def create_test_energon_dataset_config(sequence_length: int, micro_batch_size: int = 1) -> EnergonDatasetConfig:
+    """Create a serializable Energon config with generic HF task encoding."""
+    return EnergonDatasetConfig(
+        path="/tmp/energon",
+        seq_length=sequence_length,
+        micro_batch_size=micro_batch_size,
+        task_encoder=HFEnergonTaskEncoderConfig(hf_processor_path="org/model"),
+    )
+
+
+def create_test_qwen_native_energon_dataset_config(sequence_length: int) -> EnergonDatasetConfig:
+    """Create an Energon config using Qwen-VL native online packing."""
+    return EnergonDatasetConfig(
+        path="/tmp/energon",
+        seq_length=sequence_length,
+        micro_batch_size=1,
+        packing_buffer_size=32,
+        task_encoder=QwenVLEnergonTaskEncoderConfig(hf_processor_path="Qwen/model"),
+    )
+
+
+def create_test_mock_vlm_dataset_config(sequence_length: int) -> MockVLMSFTDatasetConfig:
+    """Create a synthetic VLM config with no runtime processor."""
+    return MockVLMSFTDatasetConfig(seq_length=sequence_length, hf_processor_path="org/model", num_images=0)
 
 
 def create_test_logger_config(**kwargs: Any) -> LoggerConfig:
@@ -208,13 +280,14 @@ def create_test_config_container(
     train_config: Optional[TrainingConfig] = None,
     optimizer_config: Optional[OptimizerConfig] = None,
     scheduler_config: Optional[SchedulerConfig] = None,
-    dataset_config_override: Optional[Union[GPTDatasetConfig, FinetuningDatasetConfig]] = None,
+    dataset_config_override: GPTDatasetConfig | DatasetProvider | None = None,
     logger_config: Optional[LoggerConfig] = None,
     tokenizer_config: Optional[TokenizerConfig] = None,
     checkpoint_config: Optional[CheckpointConfig] = None,
     dist_config: Optional[DistributedInitConfig] = None,
     profiling_config: Optional[ProfilingConfig] = None,
     ddp_config: Optional[DistributedDataParallelConfig] = None,
+    validation_config: Optional[ValidationConfig] = None,
 ):
     """
     Helper to create a ConfigContainer with specified or default test configurations.
@@ -239,7 +312,7 @@ def create_test_config_container(
         `get_world_size_safe` function, and the config module reference.
     """
 
-    final_dataset_config: Union[GPTDatasetConfig, FinetuningDatasetConfig]
+    final_dataset_config: GPTDatasetConfig | DatasetProvider
     if dataset_config_override:
         final_dataset_config = dataset_config_override
     elif isinstance(model_config, (GPTModelProvider, T5ModelProvider)):  # T5 also uses GPTDataset for these tests
@@ -261,6 +334,7 @@ def create_test_config_container(
         rng=RNGConfig(),
         rerun_state_machine=RerunStateMachineConfig(),
         profiling=profiling_config,
+        validation=validation_config or ValidationConfig(),
     )
 
     # Monkeypatch get_world_size_safe for this test
@@ -294,11 +368,16 @@ def create_test_cp_config_container(cp_size, calc_per_token_loss, avg_in_collect
         pipeline_model_parallel_size=1,
     )
 
-    dataset_cfg = (
-        create_test_finetuning_dataset_config(sequence_length=512)
-        if dataset_type == "finetuning"
-        else create_test_gpt_dataset_config(sequence_length=512)
-    )
+    if dataset_type == "finetuning":
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+    elif dataset_type == "conversation":
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=512)
+    elif dataset_type == "energon":
+        dataset_cfg = create_test_energon_dataset_config(sequence_length=512)
+    elif dataset_type == "mock_vlm":
+        dataset_cfg = create_test_mock_vlm_dataset_config(sequence_length=512)
+    else:
+        dataset_cfg = create_test_gpt_dataset_config(sequence_length=512)
 
     ddp_cfg = DistributedDataParallelConfig(average_in_collective=avg_in_collective)
 
@@ -424,27 +503,19 @@ class TestMockGPTDatasetConfig:
 
 
 class TestConfigContainerValidation:
-    def test_deterministic_mode_disallows_flash_and_ce_fusion(self, monkeypatch):
-        """Test that deterministic mode disallows flash attention and cross-entropy loss fusion."""
-        from megatron.core.transformer.enums import AttnBackend
-
+    def test_deterministic_mode_disallows_ce_fusion(self, monkeypatch):
+        """Test that deterministic mode disallows cross-entropy loss fusion."""
         gpt_model_cfg = create_test_gpt_config(
             deterministic_mode=True,
-            attention_backend=AttnBackend.flash,
             cross_entropy_loss_fusion=True,
         )
 
-        # Ensure NCCL_ALGO present but valid, so we fail earlier on flash/ce fusion
+        # Ensure NCCL_ALGO present but valid, so we fail on CE fusion
         monkeypatch.setenv("NCCL_ALGO", "Tree")
 
         container, og_ws, cfg_mod = create_test_config_container(world_size_override=1, model_config=gpt_model_cfg)
 
         try:
-            with pytest.raises(AssertionError, match="Flash attention can not be used in deterministic mode"):
-                container.validate()
-
-            # Fix attention, still CE fusion should fail
-            container.model.attention_backend = AttnBackend.local
             with pytest.raises(AssertionError, match="Cross Entropy Fusion is currently not deterministic"):
                 container.validate()
         finally:
@@ -530,7 +601,9 @@ class TestConfigContainerValidation:
             pipeline_dtype=torch.bfloat16,
         )
         container, og_ws, cfg_mod = create_test_config_container(
-            world_size_override=world_size, model_config=gpt_model_cfg
+            world_size_override=world_size,
+            model_config=gpt_model_cfg,
+            validation_config=ValidationConfig(eval_global_batch_size=10, eval_micro_batch_size=1),
         )
 
         try:
@@ -634,6 +707,39 @@ class TestConfigContainerValidation:
             container.validate()
             assert container.scheduler.lr_decay_iters == custom_lr_decay_iters
             assert container.scheduler.lr_decay_steps == custom_lr_decay_iters * train_cfg.global_batch_size
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_scheduler_max_steps_preserves_full_run_schedules(self, monkeypatch):
+        """A short test run can use the schedules from the full training run."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(train_iters=1000, global_batch_size=32)
+        sched_cfg = create_test_scheduler_config(max_steps=48000)
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1, model_config=gpt_model_cfg, train_config=train_cfg, scheduler_config=sched_cfg
+        )
+        try:
+            container.validate()
+            assert container.train.train_iters == 1000
+            assert container.scheduler.max_steps == 48000
+            assert container.scheduler.lr_decay_iters == 48000
+            assert container.scheduler.lr_decay_steps == 48000 * train_cfg.global_batch_size
+            assert container.scheduler.wd_incr_steps == 48000 * train_cfg.global_batch_size
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_scheduler_max_steps_rejects_value_shorter_than_training(self, monkeypatch):
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(train_iters=1000)
+        sched_cfg = create_test_scheduler_config(max_steps=999)
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1, model_config=gpt_model_cfg, train_config=train_cfg, scheduler_config=sched_cfg
+        )
+        try:
+            with pytest.raises(ValueError, match="must be greater than or equal to train.train_iters"):
+                container.validate()
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
@@ -809,9 +915,9 @@ class TestConfigContainerValidation:
         "profile_step_start, profile_step_end, expect_assertion_error, expected_error_match",
         [
             (10, 20, False, None),  # Valid: end > start
-            (10, 10, False, None),  # Valid: end == start (single step)
+            (10, 10, True, "profile_step_end .* must be > profile_step_start"),  # Invalid: empty range
             (0, 5, False, None),  # Valid: start at 0
-            (20, 10, True, "profile_step_end .* must be >= profile_step_start"),  # Invalid: end < start
+            (20, 10, True, "profile_step_end .* must be > profile_step_start"),  # Invalid: end < start
             (-1, 10, True, "profile_step_start must be >= 0"),  # Invalid: start < 0
             (10, -1, True, "profile_step_end must be >= 0"),  # Invalid: end < 0
             (-5, -1, True, "profile_step_start must be >= 0"),  # Invalid: both < 0
@@ -835,7 +941,7 @@ class TestConfigContainerValidation:
 
     def test_packed_sequence_micro_batch_size_validation_error(self, monkeypatch):
         """Test validation error when micro_batch_size > 1 with packed sequences."""
-        from megatron.bridge.data.datasets.packed_sequence import PackedSequenceSpecs
+        from megatron.bridge.data.packing import PackedSequenceSpecs
 
         # Create config with micro_batch_size > 1 and packed sequences
         gpt_model_cfg = create_test_gpt_config()
@@ -843,8 +949,9 @@ class TestConfigContainerValidation:
 
         # Create packed sequence specs with packed_sequence_size > 0
         packed_specs = PackedSequenceSpecs(packed_sequence_size=512)
-        dataset_cfg = create_test_finetuning_dataset_config(sequence_length=512)
-        dataset_cfg.packed_sequence_specs = packed_specs
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_offline_packing = True
+        dataset_cfg.offline_packing_specs = packed_specs
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -861,7 +968,7 @@ class TestConfigContainerValidation:
 
     def test_packed_sequence_micro_batch_size_validation_passes(self, monkeypatch):
         """Test validation passes when micro_batch_size = 1 with packed sequences."""
-        from megatron.bridge.data.datasets.packed_sequence import PackedSequenceSpecs
+        from megatron.bridge.data.packing import PackedSequenceSpecs
 
         # Create config with micro_batch_size = 1 and packed sequences
         gpt_model_cfg = create_test_gpt_config()
@@ -869,8 +976,9 @@ class TestConfigContainerValidation:
 
         # Create packed sequence specs with packed_sequence_size > 0
         packed_specs = PackedSequenceSpecs(packed_sequence_size=512)
-        dataset_cfg = create_test_finetuning_dataset_config(sequence_length=512)
-        dataset_cfg.packed_sequence_specs = packed_specs
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_offline_packing = True
+        dataset_cfg.offline_packing_specs = packed_specs
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -884,13 +992,52 @@ class TestConfigContainerValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
+    def test_packed_sequence_micro_batch_size_validation_error_for_dataset_provider(self, monkeypatch):
+        """Test packed sequence validation for DatasetProvider configs."""
+        from dataclasses import dataclass
+        from typing import Optional, Tuple
+
+        from megatron.bridge.data.packing import PackedSequenceSpecs
+        from megatron.bridge.training.config import DatasetBuildContext, DatasetProvider
+
+        @dataclass
+        class PackedDatasetProvider(DatasetProvider):
+            seq_length: int = 512
+            enable_offline_packing: bool = False
+            offline_packing_specs: PackedSequenceSpecs | None = None
+
+            def build_datasets(
+                self, context: DatasetBuildContext
+            ) -> Tuple[Optional[Any], Optional[Any], Optional[Any]]:
+                return None, None, None
+
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(micro_batch_size=4, global_batch_size=32)
+        dataset_cfg = PackedDatasetProvider(
+            enable_offline_packing=True,
+            offline_packing_specs=PackedSequenceSpecs(packed_sequence_size=512),
+        )
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="Micro batch size should be 1 when training with packed sequence"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
     def test_packed_sequence_validation_skipped_when_specs_none(self, monkeypatch):
-        """Test validation skipped when packed_sequence_specs is None."""
+        """Test validation skipped when offline_packing_specs is None."""
         # Create config with micro_batch_size > 1 but no packed sequences
         gpt_model_cfg = create_test_gpt_config()
         train_cfg = create_test_training_config(micro_batch_size=4, global_batch_size=32)
-        dataset_cfg = create_test_finetuning_dataset_config(sequence_length=512)
-        # packed_sequence_specs defaults to None
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        # offline_packing_specs defaults to None
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -905,12 +1052,12 @@ class TestConfigContainerValidation:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
     def test_packed_sequence_validation_skipped_for_gpt_dataset(self, monkeypatch):
-        """Test validation skipped when using GPTDatasetConfig instead of FinetuningDatasetConfig."""
+        """Test validation skipped when using GPTDatasetConfig instead of GPTSFTDatasetConfig."""
         # Create config with micro_batch_size > 1 and GPTDatasetConfig
         gpt_model_cfg = create_test_gpt_config()
         train_cfg = create_test_training_config(micro_batch_size=4, global_batch_size=32)
         dataset_cfg = create_test_gpt_dataset_config(sequence_length=512)
-        # GPTDatasetConfig doesn't have packed_sequence_specs
+        # GPTDatasetConfig doesn't have offline_packing_specs
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -924,12 +1071,13 @@ class TestConfigContainerValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
-    def test_pack_sequences_in_batch_requires_micro_batch_size_gt_1(self, monkeypatch):
-        """Test validation error when micro_batch_size == 1 with pack_sequences_in_batch=True."""
+    def test_enable_in_batch_packing_requires_micro_batch_size_gt_1(self, monkeypatch):
+        """Test validation error when micro_batch_size == 1 with enable_in_batch_packing=True."""
         gpt_model_cfg = create_test_gpt_config()
         train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=32)
-        dataset_cfg = create_test_finetuning_dataset_config(sequence_length=512)
-        dataset_cfg.pack_sequences_in_batch = True
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_in_batch_packing = True
+        dataset_cfg.dataloader_type = "single"
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -938,7 +1086,7 @@ class TestConfigContainerValidation:
             dataset_config_override=dataset_cfg,
         )
         error_msg = (
-            "micro_batch_size should be greater than 1 when using pack_sequences_in_batch=True. "
+            "micro_batch_size should be greater than 1 when using enable_in_batch_packing=True. "
             "In-batch packing concatenates multiple sequences within a microbatch, so at least 2 sequences "
             "are required per micro-batch."
         )
@@ -951,12 +1099,12 @@ class TestConfigContainerValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
-    def test_pack_sequences_in_batch_passes_with_micro_batch_size_gt_1(self, monkeypatch):
-        """Test validation passes when micro_batch_size > 1 with pack_sequences_in_batch=True."""
+    def test_enable_in_batch_packing_passes_with_micro_batch_size_gt_1(self, monkeypatch):
+        """Test validation passes when micro_batch_size > 1 with enable_in_batch_packing=True."""
         gpt_model_cfg = create_test_gpt_config()
         train_cfg = create_test_training_config(micro_batch_size=4, global_batch_size=32)
-        dataset_cfg = create_test_finetuning_dataset_config(sequence_length=512)
-        dataset_cfg.pack_sequences_in_batch = True
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_in_batch_packing = True
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -967,6 +1115,782 @@ class TestConfigContainerValidation:
 
         try:
             container.validate()  # Should pass without error
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_in_batch_packing_enables_variable_pp_shapes_for_builder_model(self, monkeypatch):
+        """Test builder-backed GPT configs use dynamic PP shapes for packed batches."""
+        model_cfg = BridgeGPTModelConfig(
+            transformer=TransformerConfig(
+                num_layers=2,
+                hidden_size=128,
+                num_attention_heads=4,
+                ffn_hidden_size=256,
+                pipeline_model_parallel_size=2,
+                use_cpu_initialization=True,
+            ),
+            vocab_size=256,
+            seq_length=512,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=2, global_batch_size=8)
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_in_batch_packing = True
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=2,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            container.validate()
+            assert model_cfg.transformer.variable_seq_lengths is True
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_in_batch_packing_enables_variable_pp_shapes_for_heterogeneous_model(self):
+        """Test heterogeneous GPT configs use dynamic PP shapes for packed batches."""
+        block = {
+            "attention": {"no_op": False, "replace_with_linear": False, "num_query_groups": 4},
+            "mlp": {"no_op": False, "replace_with_linear": False, "ffn_hidden_size": 256},
+        }
+        model_cfg = BridgeGPTModelConfig(
+            transformer=HeterogeneousTransformerConfig(
+                num_layers=2,
+                hidden_size=128,
+                num_attention_heads=4,
+                ffn_hidden_size=256,
+                pipeline_model_parallel_size=2,
+                use_cpu_initialization=True,
+                heterogeneous_layers_config_encoded_json=json.dumps({"block_configs": [block, block]}),
+            ),
+            vocab_size=256,
+            seq_length=512,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=2, global_batch_size=8)
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_in_batch_packing = True
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=2,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            container.validate()
+            assert model_cfg.transformer.variable_seq_lengths is True
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_native_energon_packing_marks_builder_transformer_config(self, monkeypatch):
+        """Test native Energon packing marks the nested builder transformer config."""
+        model_cfg = BridgeGPTModelConfig(
+            transformer=TransformerConfig(
+                num_layers=2,
+                hidden_size=128,
+                num_attention_heads=4,
+                ffn_hidden_size=256,
+                calculate_per_token_loss=True,
+                use_cpu_initialization=True,
+            ),
+            vocab_size=256,
+            seq_length=512,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=4)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert model_cfg.transformer._enable_in_batch_packing is True
+            assert "_enable_in_batch_packing" not in model_cfg.__dict__
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_enable_in_batch_packing_sets_collate_padding_multiple(self, monkeypatch):
+        """Test in-batch packing forwards CP/SP divisibility requirements to collate-time packers."""
+        gpt_model_cfg = create_test_gpt_config(
+            context_parallel_size=2,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            calculate_per_token_loss=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=2, global_batch_size=8)
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_in_batch_packing = True
+        dataset_cfg.dataloader_type = "single"
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert dataset_cfg.in_batch_packing_pad_to_multiple_of == 8
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_direct_hf_in_batch_padding_includes_train_eval_cp_and_sp(self, monkeypatch):
+        """Test direct-HF packing reserves one shape for train/eval CP with SP."""
+        gpt_model_cfg = create_test_gpt_config(
+            context_parallel_size=2,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            calculate_per_token_loss=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=2, global_batch_size=8)
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_in_batch_packing = True
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.dist.eval_context_parallel_size = 4
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert dataset_cfg.in_batch_packing_pad_to_multiple_of == 8
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_direct_hf_non_packed_padding_multiple_includes_cp_and_sp_requirements(self, monkeypatch):
+        """Test non-packed direct-HF batches are divisible for CP/SP slicing."""
+        gpt_model_cfg = create_test_gpt_config(
+            context_parallel_size=2,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            calculate_per_token_loss=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=8)
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=512)
+        dataset_cfg.pad_to_multiple_of = 3
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert dataset_cfg.pad_to_multiple_of == 24
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_energon_packing_and_non_packed_padding_include_cp_sp_requirements(self, monkeypatch):
+        """Test Energon receives the same CP/SP-safe collate multiples as direct HF."""
+        model_cfg = create_test_qwen3_vl_config(
+            context_parallel_size=2,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            calculate_per_token_loss=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=2, global_batch_size=8)
+        dataset_cfg = create_test_energon_dataset_config(sequence_length=512, micro_batch_size=2)
+        dataset_cfg.enable_in_batch_packing = True
+        dataset_cfg.defer_in_batch_packing_to_step = True
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert dataset_cfg.in_batch_packing_pad_to_multiple_of == 8
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+        model_cfg = create_test_gpt_config(
+            context_parallel_size=2,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            calculate_per_token_loss=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=8)
+        dataset_cfg = create_test_energon_dataset_config(sequence_length=512)
+        dataset_cfg.pad_to_multiple_of = 3
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert dataset_cfg.pad_to_multiple_of == 24
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_native_energon_packing_sets_variable_sequences_and_cp_sp_alignment(self, monkeypatch):
+        """Native Energon packing uses MBS1 while deriving the same THD alignment."""
+        model_cfg = create_test_qwen3_vl_config(
+            context_parallel_size=2,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            calculate_per_token_loss=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=8)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert dataset_cfg.in_batch_packing_pad_to_multiple_of == 8
+            assert model_cfg._enable_in_batch_packing is True
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_native_energon_packing_requires_per_token_loss(self, monkeypatch):
+        """Variable source samples per pack require token-normalized loss."""
+        model_cfg = create_test_qwen3_vl_config(calculate_per_token_loss=False)
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=4)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="requires model.calculate_per_token_loss=True"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_native_energon_packing_requires_non_averaged_collective(self, monkeypatch):
+        """MCore per-token loss requires sum-reduced DDP gradients."""
+        model_cfg = create_test_qwen3_vl_config(calculate_per_token_loss=True)
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=4)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = True
+
+        try:
+            with pytest.raises(ValueError, match="requires ddp.average_in_collective=False"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    @pytest.mark.parametrize(
+        ("field_name", "value", "world_size", "message"),
+        [
+            ("mtp_num_layers", 1, 1, "does not support MTP"),
+            ("cuda_graph_impl", "local", 1, "does not support CUDA graphs"),
+            ("vision_cuda_graph_impl", "transformer_engine", 1, "does not support CUDA graphs"),
+            ("pipeline_model_parallel_size", 2, 2, "does not yet support pipeline parallelism"),
+        ],
+    )
+    def test_native_energon_packing_rejects_unsupported_execution_modes(
+        self, monkeypatch, field_name, value, world_size, message
+    ):
+        """Native online packs fail fast for fixed-width or unvalidated execution modes."""
+        model_cfg = create_test_qwen3_vl_config(calculate_per_token_loss=True)
+        if not hasattr(model_cfg, field_name):
+            raise ValueError(f"Test model config has no field {field_name!r}.")
+        setattr(model_cfg, field_name, value)
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=4)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=world_size,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            with pytest.raises(ValueError, match=message):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_native_energon_packing_allows_expert_parallelism(self):
+        """Allow native packing configuration with expert parallelism."""
+        model_cfg = create_test_qwen3_vl_config(
+            calculate_per_token_loss=True,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=64,
+            expert_model_parallel_size=8,
+            moe_token_dispatcher_type="alltoall",
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=8)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    @pytest.mark.parametrize("dispatcher", ["allgather", "flex"])
+    def test_native_energon_packing_allows_other_ep_dispatchers_with_fixed_width(self, dispatcher):
+        """Allow dispatcher selection while deriving fixed-width native EP packs."""
+        model_cfg = create_test_qwen3_vl_config(
+            calculate_per_token_loss=True,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=64,
+            expert_model_parallel_size=8,
+            moe_token_dispatcher_type=dispatcher,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=8)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert dataset_cfg.pad_to_max_length is True
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_native_energon_packing_disables_moe_ep_overlap(self):
+        """Fall back to non-overlapped EP instead of rejecting native packing."""
+        model_cfg = create_test_qwen3_vl_config(
+            calculate_per_token_loss=True,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=64,
+            expert_model_parallel_size=8,
+            moe_token_dispatcher_type="alltoall",
+            overlap_moe_expert_parallel_comm=True,
+            delay_wgrad_compute=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=8)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            with pytest.warns(UserWarning, match="Disabling MoE expert-parallel communication overlap"):
+                container.validate()
+            assert model_cfg.overlap_moe_expert_parallel_comm is False
+            assert model_cfg.delay_wgrad_compute is False
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_native_energon_packing_rejects_qwen_dist_train(self, monkeypatch):
+        """Native online packing has not been validated with split vision/language worlds."""
+        model_cfg = create_test_qwen3_vl_config(calculate_per_token_loss=True)
+        model_cfg.dist_train.use_dist_train = True
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=4)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            with pytest.raises(ValueError, match="does not support Qwen3-VL DistTrain"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_native_energon_packing_does_not_require_model_capability_flag(self, monkeypatch):
+        """Native packing is selected and constrained by the dataset path, not a model allowlist."""
+        model_cfg = create_test_gpt_config(calculate_per_token_loss=True)
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=4)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert model_cfg._enable_in_batch_packing is True
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_mock_vlm_padding_includes_cp_sp_with_sft_loss_safeguards(self, monkeypatch):
+        """Mock conversation data gets safe shapes and valid CP loss reduction."""
+        model_cfg = create_test_gpt_config(
+            context_parallel_size=2,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            calculate_per_token_loss=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=2, global_batch_size=8)
+        dataset_cfg = create_test_mock_vlm_dataset_config(sequence_length=512)
+        dataset_cfg.enable_in_batch_packing = True
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert dataset_cfg.in_batch_packing_pad_to_multiple_of == 8
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+        model_cfg = create_test_gpt_config(
+            context_parallel_size=2,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            calculate_per_token_loss=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=8)
+        dataset_cfg = create_test_mock_vlm_dataset_config(sequence_length=512)
+        dataset_cfg.pad_to_multiple_of = 3
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            container.validate()
+            assert dataset_cfg.pad_to_multiple_of == 24
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_direct_hf_preserves_explicit_fixed_length_padding(self, monkeypatch):
+        """Test explicit fixed-length padding remains enabled without PP or EP."""
+        gpt_model_cfg = create_test_gpt_config(
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+        )
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=512)
+        dataset_cfg.pad_to_max_length = True
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            container.validate()
+            assert dataset_cfg.pad_to_max_length is True
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_direct_hf_seq_length_must_support_cp_and_sp_collate_slicing(self, monkeypatch):
+        """Test the sequence cap cannot undo CP/SP-safe collate padding."""
+        gpt_model_cfg = create_test_gpt_config(
+            seq_length=20,
+            context_parallel_size=2,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            calculate_per_token_loss=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=8)
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=20)
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            with pytest.raises(ValueError, match="seq_length must be divisible by the CP/SP collate padding"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_direct_hf_padding_multiple_is_validated_before_runtime_derivation(self, monkeypatch):
+        """Test runtime LCM derivation cannot normalize an invalid declarative value."""
+        gpt_model_cfg = create_test_gpt_config(
+            context_parallel_size=2,
+            calculate_per_token_loss=True,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=2)
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=512)
+        dataset_cfg.pad_to_multiple_of = -3
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=2,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+
+        try:
+            with pytest.raises(ValueError, match="pad_to_multiple_of must be greater than 0"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_direct_hf_padding_multiple_includes_eval_context_parallel_size(self, monkeypatch):
+        """Test validation batches remain sliceable with a different eval CP degree."""
+        gpt_model_cfg = create_test_gpt_config(seq_length=24)
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=2)
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=24)
+        dataset_cfg.pad_to_multiple_of = 3
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=2,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.dist.eval_context_parallel_size = 2
+
+        try:
+            container.validate()
+            assert dataset_cfg.pad_to_multiple_of == 12
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_enable_offline_packing_requires_specs(self, monkeypatch):
+        """Test validation error when offline packing is enabled without specs."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=32)
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_offline_packing = True
+        dataset_cfg.offline_packing_specs = None
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="offline_packing_specs must be set"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_offline_packing_specs_require_enable_offline_packing(self, monkeypatch):
+        """Test validation error when offline specs are set without enabling offline packing."""
+        from megatron.bridge.data.packing import PackedSequenceSpecs
+
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=32)
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.offline_packing_specs = PackedSequenceSpecs(packed_sequence_size=512)
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="enable_offline_packing must be True"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_offline_and_in_batch_packing_are_mutually_exclusive(self, monkeypatch):
+        """Test validation error when both packing modes are enabled."""
+        from megatron.bridge.data.packing import PackedSequenceSpecs
+
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(micro_batch_size=4, global_batch_size=32)
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_offline_packing = True
+        dataset_cfg.offline_packing_specs = PackedSequenceSpecs(packed_sequence_size=512)
+        dataset_cfg.enable_in_batch_packing = True
+        dataset_cfg.dataloader_type = "single"
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(
+                ValueError,
+                match="enable_offline_packing and enable_in_batch_packing are mutually exclusive",
+            ):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_pad_cu_seqlens_requires_fixed_token_width(self, monkeypatch):
+        """Test static packed boundaries also require a fixed packed-token width."""
+        from megatron.bridge.data.packing import PackedSequenceSpecs
+
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_offline_packing = True
+        dataset_cfg.offline_packing_specs = PackedSequenceSpecs(
+            packed_sequence_size=512,
+            pad_cu_seqlens=True,
+        )
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(),
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="pad_cu_seqlens=True requires dataset pad_to_max_length=True"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    @pytest.mark.parametrize("graph_modules", [[], ["attn"], ["attn", "mlp"]])
+    def test_packed_attention_cuda_graph_requires_padded_cu_seqlens(self, graph_modules, monkeypatch):
+        """Test whole-layer and attention-scoped graphs require static packed boundaries."""
+        from megatron.bridge.data.packing import PackedSequenceSpecs
+
+        model_cfg = create_test_gpt_config(
+            cuda_graph_impl="transformer_engine",
+            use_te_rng_tracker=True,
+        )
+        set_cuda_graph_modules(model_cfg, graph_modules)
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_offline_packing = True
+        dataset_cfg.offline_packing_specs = PackedSequenceSpecs(packed_sequence_size=512)
+        dataset_cfg.dataset_kwargs = {"pad_to_max_length": True}
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="Packed attention CUDA graphs require.*pad_cu_seqlens=True"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_mlp_only_cuda_graph_does_not_require_padded_cu_seqlens(self, monkeypatch):
+        """Test an MLP-only graph does not capture packed attention metadata."""
+        from megatron.bridge.data.packing import PackedSequenceSpecs
+
+        model_cfg = create_test_gpt_config(
+            cuda_graph_impl="transformer_engine",
+            use_te_rng_tracker=True,
+        )
+        set_cuda_graph_modules(model_cfg, ["mlp"])
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_offline_packing = True
+        dataset_cfg.offline_packing_specs = PackedSequenceSpecs(packed_sequence_size=512)
+        dataset_cfg.dataset_kwargs = {"pad_to_max_length": True}
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_mlp_only_cuda_graph_still_requires_fixed_token_width(self, monkeypatch):
+        """Test every CUDA graph over offline-packed tokens requires a static token shape."""
+        from megatron.bridge.data.packing import PackedSequenceSpecs
+
+        model_cfg = create_test_gpt_config(
+            cuda_graph_impl="transformer_engine",
+            use_te_rng_tracker=True,
+        )
+        set_cuda_graph_modules(model_cfg, ["mlp"])
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_offline_packing = True
+        dataset_cfg.offline_packing_specs = PackedSequenceSpecs(packed_sequence_size=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="Offline packing with CUDA graphs requires.*pad_to_max_length=True"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_full_iteration_cuda_graph_requires_padded_cu_seqlens_for_offline_packing(self, monkeypatch):
+        """Test full-iteration graphs require static packed attention metadata."""
+        from megatron.bridge.data.packing import PackedSequenceSpecs
+
+        model_cfg = create_test_gpt_config(use_te_rng_tracker=True)
+        set_full_iteration_cuda_graph(model_cfg)
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)
+        dataset_cfg.enable_offline_packing = True
+        dataset_cfg.offline_packing_specs = PackedSequenceSpecs(packed_sequence_size=512)
+        dataset_cfg.dataset_kwargs = {"pad_to_max_length": True}
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="Packed attention CUDA graphs require.*pad_cu_seqlens=True"):
+                container.validate()
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
@@ -1007,10 +1931,22 @@ class TestConfigContainerValidation:
     @pytest.mark.parametrize(
         "dataset_type, cp_size, calc_per_token_loss, avg_in_collective, expect_error, error_match",
         [
-            # FinetuningDatasetConfig with CP > 1 - both checks should trigger
+            # GPTSFTDatasetConfig with CP > 1 - both checks should trigger
             ("finetuning", 2, False, False, True, "calculate_per_token_loss must be True"),
             ("finetuning", 2, True, True, True, "average_in_collective must be False"),
             ("finetuning", 2, True, False, False, None),  # Valid case
+            # Direct HF conversation SFT uses the same CP loss-reduction safeguards.
+            ("conversation", 2, False, False, True, "calculate_per_token_loss must be True"),
+            ("conversation", 2, True, True, True, "average_in_collective must be False"),
+            ("conversation", 2, True, False, False, None),
+            # Energon multimodal SFT uses the same CP loss-reduction safeguards.
+            ("energon", 2, False, False, True, "calculate_per_token_loss must be True"),
+            ("energon", 2, True, True, True, "average_in_collective must be False"),
+            ("energon", 2, True, False, False, None),
+            # Synthetic VLM conversations have the same masked SFT loss semantics.
+            ("mock_vlm", 2, False, False, True, "calculate_per_token_loss must be True"),
+            ("mock_vlm", 2, True, True, True, "average_in_collective must be False"),
+            ("mock_vlm", 2, True, False, False, None),
             # GPTDatasetConfig with CP > 1 - checks should be skipped
             ("gpt", 2, False, True, False, None),
             # CP = 1 - checks should be skipped regardless of dataset type
@@ -1168,6 +2104,74 @@ class TestConfigContainerValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
+    def test_reuse_grad_buf_for_mxfp8_param_ag_required_without_fsdp(self, monkeypatch):
+        """Test that reuse_grad_buf_for_mxfp8_param_ag must be True when
+        FSDP is disabled, fp8_param_gather=True, and fp8_recipe='mxfp8'."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(train_iters=500, global_batch_size=16)
+        sched_cfg = create_test_scheduler_config()
+
+        # Case 1: Should raise when reuse_grad_buf_for_mxfp8_param_ag=False
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            scheduler_config=sched_cfg,
+        )
+        try:
+            container.mixed_precision = MixedPrecisionConfig(
+                fp8_param_gather=True, fp8_recipe="mxfp8", reuse_grad_buf_for_mxfp8_param_ag=False
+            )
+            with pytest.raises(AssertionError, match="reuse_grad_buf_for_mxfp8_param_ag must be set to True"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+        # Case 2: Should pass when reuse_grad_buf_for_mxfp8_param_ag=True
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            scheduler_config=sched_cfg,
+        )
+        try:
+            container.mixed_precision = MixedPrecisionConfig(
+                fp8_param_gather=True, fp8_recipe="mxfp8", reuse_grad_buf_for_mxfp8_param_ag=True
+            )
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+        # Case 3: Should pass when fp8_param_gather=False (guard skips)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            scheduler_config=sched_cfg,
+        )
+        try:
+            container.mixed_precision = MixedPrecisionConfig(
+                fp8_param_gather=False, fp8_recipe="mxfp8", reuse_grad_buf_for_mxfp8_param_ag=False
+            )
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+        # Case 4: Should pass when fp8_recipe is not mxfp8 (guard skips)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            scheduler_config=sched_cfg,
+        )
+        try:
+            container.mixed_precision = MixedPrecisionConfig(
+                fp8_param_gather=True, fp8_recipe="delayed", reuse_grad_buf_for_mxfp8_param_ag=False
+            )
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
     def test_megatron_fsdp_config_with_torch_fsdp2(self, monkeypatch):
         """Test MegatronFSDP config with torch_fsdp2, should raise ValueError."""
         gpt_model_cfg = create_test_gpt_config()
@@ -1210,11 +2214,10 @@ class TestConfigContainerValidation:
 
     def test_cuda_graph_full_iteration_requires_check_for_nan_disabled(self, monkeypatch):
         """Test that full_iteration CUDA graph requires check_for_nan_in_loss=False."""
-        # Create config with cuda_graph_impl="local" and TE RNG tracker (required for cuda graphs)
         gpt_model_cfg = create_test_gpt_config(
-            cuda_graph_impl="local",
             use_te_rng_tracker=True,
         )
+        set_full_iteration_cuda_graph(gpt_model_cfg)
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -1222,10 +2225,6 @@ class TestConfigContainerValidation:
         )
 
         try:
-            # Set cuda_graph_scope to include full_iteration after model creation
-            # (MCore's __post_init__ converts strings to enums during finalize)
-            container.model.cuda_graph_scope = [CudaGraphScope.full_iteration]
-
             # Default check_for_nan_in_loss is True - should fail validation
             assert container.rerun_state_machine.check_for_nan_in_loss is True
             with pytest.raises(
@@ -1243,7 +2242,29 @@ class TestConfigContainerValidation:
     def test_cuda_graph_non_full_iteration_allows_check_for_nan(self, monkeypatch):
         """Test that non-full_iteration CUDA graph allows check_for_nan_in_loss=True."""
         gpt_model_cfg = create_test_gpt_config(
+            cuda_graph_impl="transformer_engine",
+            use_te_rng_tracker=True,
+        )
+        set_cuda_graph_modules(gpt_model_cfg, ["attn", "mlp"])
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+        )
+
+        try:
+            # check_for_nan_in_loss=True should be allowed
+            assert container.rerun_state_machine.check_for_nan_in_loss is True
+            container.validate()  # Should pass without error
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    @pytest.mark.parametrize("inference_scope", ["layer", "block"])
+    def test_cuda_graph_local_inference_scope_allows_validation(self, inference_scope, monkeypatch):
+        """Test that MCore local inference graphs are not rejected as training scopes."""
+        gpt_model_cfg = create_test_gpt_config(
             cuda_graph_impl="local",
+            inference_cuda_graph_scope=inference_scope,
             use_te_rng_tracker=True,
         )
 
@@ -1253,12 +2274,142 @@ class TestConfigContainerValidation:
         )
 
         try:
-            # Set cuda_graph_scope to NOT include full_iteration
-            container.model.cuda_graph_scope = [CudaGraphScope.attn, CudaGraphScope.mlp]
+            container.validate()
+            assert container.model.cuda_graph_impl == "local"
+            assert container.model.inference_cuda_graph_scope.name == inference_scope
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
 
-            # check_for_nan_in_loss=True should be allowed
-            assert container.rerun_state_machine.check_for_nan_in_loss is True
-            container.validate()  # Should pass without error
+    def test_cuda_graph_local_inference_scope_rejects_training_modules(self, monkeypatch):
+        """Test that an inference scope does not bypass local training-scope validation."""
+        gpt_model_cfg = create_test_gpt_config(
+            cuda_graph_impl="local",
+            inference_cuda_graph_scope="block",
+            use_te_rng_tracker=True,
+        )
+        set_cuda_graph_modules(gpt_model_cfg, ["mlp"])
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match='cuda_graph_impl="local"'):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    @pytest.mark.parametrize("graph_modules", [["mlp"], ["moe_router"]])
+    def test_cuda_graph_local_scoped_modules_raise_clear_error(self, graph_modules, monkeypatch):
+        """Test that Bridge rejects local scoped graphs before MCore layer construction."""
+        gpt_model_cfg = create_test_gpt_config(
+            cuda_graph_impl="local",
+            use_te_rng_tracker=True,
+        )
+        set_cuda_graph_modules(gpt_model_cfg, graph_modules)
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+        )
+
+        try:
+            with pytest.raises(
+                ValueError,
+                match='cuda_graph_impl="local".*cuda_graph_impl="transformer_engine"',
+            ):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_cuda_graph_local_deprecated_scope_raise_clear_error(self, monkeypatch):
+        """Test post-construction cuda_graph_scope overrides fail clearly for local scoped graphs."""
+        gpt_model_cfg = create_test_gpt_config(use_te_rng_tracker=True)
+        gpt_model_cfg.cuda_graph_impl = "local"
+        gpt_model_cfg.cuda_graph_scope = ["mlp"]
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+        )
+
+        try:
+            with pytest.raises(
+                ValueError,
+                match='cuda_graph_impl="local".*cuda_graph_impl="transformer_engine"',
+            ):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_cuda_graph_local_deprecated_scope_direct_provider_raise_clear_error(self):
+        """Test direct provider construction validates local scoped graphs before MCore build."""
+        gpt_model_cfg = create_test_gpt_config(use_te_rng_tracker=True, vocab_size=128)
+        gpt_model_cfg.cuda_graph_impl = "local"
+        gpt_model_cfg.cuda_graph_scope = ["mlp"]
+
+        with pytest.raises(
+            ValueError,
+            match='cuda_graph_impl="local".*cuda_graph_impl="transformer_engine"',
+        ):
+            gpt_model_cfg.provide()
+
+    def test_cuda_graph_local_full_iteration_module_allows_validation(self, monkeypatch):
+        """Test local full_iteration compatibility input is not treated as scoped local graphs."""
+        gpt_model_cfg = create_test_gpt_config(
+            cuda_graph_impl="local",
+            use_te_rng_tracker=True,
+        )
+        gpt_model_cfg.cuda_graph_modules = "full_iteration"
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+        )
+
+        try:
+            container.rerun_state_machine.check_for_nan_in_loss = False
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_cuda_graph_impl_none_clears_modules(self, monkeypatch):
+        """Test that cuda_graph_impl=none clears module-scoped CUDA graph settings."""
+        gpt_model_cfg = create_test_gpt_config(
+            cuda_graph_impl="none",
+            use_te_rng_tracker=True,
+        )
+        set_cuda_graph_modules(gpt_model_cfg, ["attn", "mlp"])
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+        )
+
+        try:
+            container.validate()
+            assert cuda_graph_module_names(container.model) == []
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_cuda_graph_impl_none_clears_deprecated_full_iteration_scope(self, monkeypatch):
+        """Test cuda_graph_impl=none ignores deprecated full_iteration scope overrides."""
+        gpt_model_cfg = create_test_gpt_config(
+            cuda_graph_impl="none",
+            use_te_rng_tracker=True,
+        )
+        gpt_model_cfg.cuda_graph_scope = ["full_iteration"]
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+        )
+
+        try:
+            container.validate()
+            assert container.model.cuda_graph_impl == "none"
+            assert cuda_graph_module_names(container.model) == []
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
@@ -1480,6 +2631,270 @@ class TestConfigContainerValidation:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
 
+class TestEvalBatchSizeConfig:
+    """Tests for eval batch size default resolution and validation in ConfigContainer.validate()."""
+
+    def test_eval_batch_sizes_default_to_training_values(self, monkeypatch):
+        """When eval batch sizes are not set, they should be resolved from training config."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(global_batch_size=64, micro_batch_size=4)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8, model_config=gpt_model_cfg, train_config=train_cfg
+        )
+        try:
+            container.validate()
+            assert container.validation.eval_global_batch_size == 64
+            assert container.validation.eval_micro_batch_size == 4
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_eval_batch_sizes_explicit_override(self, monkeypatch):
+        """When eval batch sizes are explicitly set, they should not be overridden."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(global_batch_size=64, micro_batch_size=4)
+        val_cfg = ValidationConfig(eval_global_batch_size=16, eval_micro_batch_size=2)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            validation_config=val_cfg,
+        )
+        try:
+            container.validate()
+            assert container.validation.eval_global_batch_size == 16
+            assert container.validation.eval_micro_batch_size == 2
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_eval_global_batch_size_partial_override(self, monkeypatch):
+        """When only eval_global_batch_size is set, eval_micro_batch_size defaults to training."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(global_batch_size=64, micro_batch_size=4)
+        val_cfg = ValidationConfig(eval_global_batch_size=32)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            validation_config=val_cfg,
+        )
+        try:
+            container.validate()
+            assert container.validation.eval_global_batch_size == 32
+            assert container.validation.eval_micro_batch_size == 4
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_eval_micro_batch_size_partial_override(self, monkeypatch):
+        """When only eval_micro_batch_size is set, eval_global_batch_size defaults to training."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(global_batch_size=64, micro_batch_size=4)
+        val_cfg = ValidationConfig(eval_micro_batch_size=2)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            validation_config=val_cfg,
+        )
+        try:
+            container.validate()
+            assert container.validation.eval_global_batch_size == 64
+            assert container.validation.eval_micro_batch_size == 2
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_energon_micro_batch_size_must_match_train_and_validation(self, monkeypatch):
+        """Energon external loaders use one physical micro-batch size for both splits."""
+        dataset_cfg = create_test_energon_dataset_config(sequence_length=512, micro_batch_size=2)
+        train_cfg = create_test_training_config(global_batch_size=8, micro_batch_size=1)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(),
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        try:
+            with pytest.raises(ValueError, match="must match train.micro_batch_size"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+        dataset_cfg = create_test_energon_dataset_config(sequence_length=512, micro_batch_size=1)
+        dataset_cfg.do_validation = False
+        train_cfg = create_test_training_config(global_batch_size=8, micro_batch_size=1)
+        validation_cfg = ValidationConfig(eval_global_batch_size=8, eval_micro_batch_size=2)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(),
+            train_config=train_cfg,
+            validation_config=validation_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+        dataset_cfg = create_test_energon_dataset_config(sequence_length=512, micro_batch_size=1)
+        train_cfg = create_test_training_config(global_batch_size=8, micro_batch_size=1)
+        validation_cfg = ValidationConfig(eval_global_batch_size=8, eval_micro_batch_size=2)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(),
+            train_config=train_cfg,
+            validation_config=validation_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        try:
+            with pytest.raises(ValueError, match="must match validation.eval_micro_batch_size"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_eval_batch_size_divisibility_check_passes(self, monkeypatch):
+        """Eval GBS divisible by (eval_MBS * DP) should pass validation."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(global_batch_size=64, micro_batch_size=4)
+        # world_size=8, TP=1, PP=1 => DP=8; eval_GBS=16, eval_MBS=2 => 16 / (2*8) = 1 OK
+        val_cfg = ValidationConfig(eval_global_batch_size=16, eval_micro_batch_size=2)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            validation_config=val_cfg,
+        )
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_eval_batch_size_divisibility_check_fails(self, monkeypatch):
+        """Eval GBS not divisible by (eval_MBS * DP) should fail validation."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(global_batch_size=64, micro_batch_size=4)
+        # world_size=8, TP=1, PP=1 => DP=8; eval_GBS=10, eval_MBS=2 => 10 / (2*8) not integer
+        val_cfg = ValidationConfig(eval_global_batch_size=10, eval_micro_batch_size=2)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            validation_config=val_cfg,
+        )
+        try:
+            with pytest.raises(AssertionError, match="eval_global_batch_size.*must be divisible by"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_eval_batch_size_divisibility_uses_eval_data_parallel_size(self, monkeypatch):
+        """Eval-time CP changes the DP degree that owns validation batches."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(global_batch_size=8, micro_batch_size=1)
+        val_cfg = ValidationConfig(eval_global_batch_size=2, eval_micro_batch_size=1)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=4,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            validation_config=val_cfg,
+        )
+        container.dist.use_decentralized_pg = True
+        container.dist.use_gloo_process_groups = False
+        container.dist.eval_context_parallel_size = 2
+
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_eval_default_divisibility_check_fails(self, monkeypatch):
+        """Even with defaults from training, the divisibility check should catch mismatches."""
+        gpt_model_cfg = create_test_gpt_config()
+        # global_batch_size=10, micro_batch_size=4, DP=8 => 10 / (4*8) not integer
+        train_cfg = create_test_training_config(global_batch_size=10, micro_batch_size=4)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8, model_config=gpt_model_cfg, train_config=train_cfg
+        )
+        try:
+            with pytest.raises(AssertionError, match="eval_global_batch_size.*must be divisible by"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_eval_micro_batch_size_none_without_training_value_fails(self, monkeypatch):
+        """If train.micro_batch_size is None and eval is not explicitly set, assert should fire."""
+        gpt_model_cfg = create_test_gpt_config()
+        # micro_batch_size must be explicitly None to test this path
+        train_cfg = create_test_training_config(global_batch_size=32, micro_batch_size=None)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8, model_config=gpt_model_cfg, train_config=train_cfg
+        )
+        try:
+            with pytest.raises(AssertionError, match="train.micro_batch_size must be set"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_eval_global_batch_size_none_without_training_value_fails(self, monkeypatch):
+        """If train.global_batch_size is None and eval is not explicitly set, assert should fire."""
+        gpt_model_cfg = create_test_gpt_config()
+        # global_batch_size=None with train_samples triggers assertion in TrainingConfig.finalize()
+        train_cfg = TrainingConfig(micro_batch_size=4, train_samples=1000)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8, model_config=gpt_model_cfg, train_config=train_cfg
+        )
+        try:
+            with pytest.raises(AssertionError, match="global_batch_size must be set"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_eval_global_batch_size_none_with_train_iters_fails(self, monkeypatch):
+        """If train.global_batch_size is None (train_iters mode), eval default resolution should fail."""
+        gpt_model_cfg = create_test_gpt_config()
+        # In train_iters mode, global_batch_size=None won't crash in finalize() but will
+        # fail when resolving eval defaults
+        train_cfg = TrainingConfig(micro_batch_size=4, train_iters=1000, global_batch_size=None)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8, model_config=gpt_model_cfg, train_config=train_cfg
+        )
+        try:
+            with pytest.raises(AssertionError, match="train.global_batch_size must be set"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    @pytest.mark.parametrize(
+        "eval_gbs, eval_mbs, world_size, expect_error",
+        [
+            (32, 4, 8, False),  # 32 / (4*8) = 1
+            (64, 8, 8, False),  # 64 / (8*8) = 1
+            (32, 4, 4, False),  # 32 / (4*4) = 2
+            (32, 3, 8, True),  # 32 / (3*8) not integer
+            (15, 2, 8, True),  # 15 / (2*8) not integer
+        ],
+    )
+    def test_eval_batch_size_divisibility_parametrized(
+        self, monkeypatch, eval_gbs, eval_mbs, world_size, expect_error
+    ):
+        """Parametrized test for eval batch size divisibility."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(global_batch_size=64, micro_batch_size=4)
+        val_cfg = ValidationConfig(eval_global_batch_size=eval_gbs, eval_micro_batch_size=eval_mbs)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=world_size,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            validation_config=val_cfg,
+        )
+        try:
+            if expect_error:
+                with pytest.raises(AssertionError, match="eval_global_batch_size.*must be divisible by"):
+                    container.validate()
+            else:
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+
 class TestRerunConfigValidation:
     """
     Test that finalize() functions behave correctly when called multiple times:
@@ -1643,6 +3058,54 @@ class TestCheckpointConfig:
     """Tests for CheckpointConfig class."""
 
     @pytest.mark.parametrize(
+        "config_overrides, error_message",
+        [
+            ({"save_interval": 10, "save_retain_interval": 0}, "save_retain_interval must be positive"),
+            (
+                {"save_interval": None, "save_retain_interval": 20},
+                "save_retain_interval requires a positive save_interval",
+            ),
+            (
+                {"save_interval": 10, "save_retain_interval": 15},
+                "save_retain_interval must be divisible by save_interval",
+            ),
+            (
+                {"save_interval": 10, "save_retain_interval": 20, "most_recent_k": 1},
+                "save_retain_interval and most_recent_k cannot be enabled together",
+            ),
+        ],
+    )
+    def test_save_retain_interval_validation(self, config_overrides, error_message):
+        """Retain intervals require one valid, unambiguous persistent retention policy."""
+        ckpt_cfg = create_test_checkpoint_config(**config_overrides)
+
+        with pytest.raises(ValueError, match=error_message):
+            ckpt_cfg.finalize()
+
+    def test_save_retain_interval_accepts_multiple_of_save_interval(self):
+        """A positive retain interval divisible by the save interval is valid."""
+        ckpt_cfg = create_test_checkpoint_config(save_interval=10, save_retain_interval=20)
+
+        ckpt_cfg.finalize()
+
+    def test_precision_aware_optimizer_cpu_staging_defaults_off(self):
+        ckpt_cfg = create_test_checkpoint_config()
+
+        assert ckpt_cfg.stage_precision_aware_optimizer_state_on_cpu is False
+
+    def test_precision_aware_optimizer_cpu_staging_requires_torch_dist(self):
+        ckpt_cfg = create_test_checkpoint_config(
+            ckpt_format="torch",
+            stage_precision_aware_optimizer_state_on_cpu=True,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="stage_precision_aware_optimizer_state_on_cpu=True requires ckpt_format='torch_dist'",
+        ):
+            ckpt_cfg.finalize()
+
+    @pytest.mark.parametrize(
         "load_main_params_from_ckpt, load_optim, expect_assertion_error",
         [
             (True, False, False),  # Valid combination
@@ -1693,6 +3156,90 @@ class TestCheckpointConfig:
         ckpt_cfg.finalize()
         assert ckpt_cfg.ckpt_step == 5000
         assert ckpt_cfg.load == "/checkpoints"
+
+    def test_save_weight_format_field_is_removed(self):
+        """Test that the old save_weight_format alias is no longer part of CheckpointConfig."""
+        assert "save_weight_format" not in {field.name for field in fields(CheckpointConfig)}
+
+    def test_also_save_hf_checkpoint_rejects_fsdp_dtensor(self):
+        """Test that HF extra export is not allowed with fsdp_dtensor checkpoints."""
+        ckpt_cfg = create_test_checkpoint_config(also_save_hf_checkpoint=True, ckpt_format="fsdp_dtensor")
+
+        with pytest.raises(ValueError, match="also_save_hf_checkpoint=True is not supported"):
+            ckpt_cfg.finalize()
+
+    def test_also_save_hf_checkpoint_rejects_local_non_persistent_checkpoint(self):
+        """Test that HF extra export is not allowed for local non-persistent checkpoints."""
+        ckpt_cfg = create_test_checkpoint_config(also_save_hf_checkpoint=True, non_persistent_ckpt_type="local")
+
+        with pytest.raises(ValueError, match="also_save_hf_checkpoint=True is not compatible"):
+            ckpt_cfg.finalize()
+
+    def test_also_save_hf_checkpoint_requires_hf_source_during_container_validation(self):
+        """Test that HF extra export requires a source before training starts."""
+        checkpoint_cfg = create_test_checkpoint_config(also_save_hf_checkpoint=True)
+        model_cfg = create_test_gpt_config(hf_model_id=None)
+        tokenizer_cfg = create_test_tokenizer_config(tokenizer_model=None)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            tokenizer_config=tokenizer_cfg,
+            checkpoint_config=checkpoint_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="also_save_hf_checkpoint=True requires an HF source"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_also_save_hf_checkpoint_accepts_hf_source_path_during_container_validation(self):
+        """Test that explicit hf_source_path satisfies HF extra export validation."""
+        checkpoint_cfg = create_test_checkpoint_config(
+            also_save_hf_checkpoint=True,
+            hf_source_path="/hf/source",
+        )
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(hf_model_id=None),
+            tokenizer_config=create_test_tokenizer_config(tokenizer_model=None),
+            checkpoint_config=checkpoint_cfg,
+        )
+
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_also_save_hf_checkpoint_accepts_model_hf_model_id_during_container_validation(self):
+        """Test that model.hf_model_id satisfies HF extra export validation."""
+        checkpoint_cfg = create_test_checkpoint_config(also_save_hf_checkpoint=True)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(hf_model_id="hf/model"),
+            tokenizer_config=create_test_tokenizer_config(tokenizer_model=None),
+            checkpoint_config=checkpoint_cfg,
+        )
+
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_also_save_hf_checkpoint_accepts_tokenizer_model_during_container_validation(self):
+        """Test that tokenizer.tokenizer_model satisfies HF extra export validation."""
+        checkpoint_cfg = create_test_checkpoint_config(also_save_hf_checkpoint=True)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(hf_model_id=None),
+            tokenizer_config=create_test_tokenizer_config(tokenizer_model="hf/tokenizer-or-model"),
+            checkpoint_config=checkpoint_cfg,
+        )
+
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
 
     def test_async_save_validation_error(self):
         """Test that async_save requires both a save path and use_persistent_ckpt_worker=True."""
@@ -1783,9 +3330,7 @@ class TestCheckpointConfig:
             dist_config=dist_cfg,
         )
         try:
-            # Should raise error - async_save with fsdp_dtensor is not allowed
-            with pytest.raises(AssertionError, match="async_save is only supported with ckpt_format='torch_dist'"):
-                container.validate()
+            container.validate()
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
@@ -2141,6 +3686,102 @@ class TestMixedPrecisionConsistencyValidation:
 class TestRuntimeConfigUpdate:
     """Tests for the runtime_config_update function."""
 
+    def test_recipe_environment_variables_are_applied_before_runtime_update(self, monkeypatch):
+        """Recipe env defaults should be stringified without replacing launcher values."""
+        gpt_cfg = create_test_gpt_config()
+        full_cfg, og_ws, cfg_mod = create_test_config_container(world_size_override=1, model_config=gpt_cfg)
+        full_cfg.env_vars = {
+            "NVTE_FWD_LAYERNORM_SM_MARGIN": 16,
+            "NVTE_BWD_LAYERNORM_SM_MARGIN": 16,
+            "TORCHINDUCTOR_WORKER_START": "fork",
+            "QUANTIZATION_TYPE_DEBUG": 1,
+            "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN": 64,
+            "USE_MNNVL": 1,
+        }
+        for name in full_cfg.env_vars:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("USE_MNNVL", "launcher-value")
+
+        try:
+            from megatron.bridge.training.config import runtime_config_update
+
+            runtime_config_update(full_cfg)
+
+            assert os.environ["NVTE_FWD_LAYERNORM_SM_MARGIN"] == "16"
+            assert os.environ["NVTE_BWD_LAYERNORM_SM_MARGIN"] == "16"
+            assert os.environ["TORCHINDUCTOR_WORKER_START"] == "fork"
+            assert os.environ["QUANTIZATION_TYPE_DEBUG"] == "1"
+            assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "64"
+            assert os.environ["USE_MNNVL"] == "launcher-value"
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    @pytest.mark.parametrize("env_vars", [{"": "1"}, {1: "bad-name"}, {"VALID_NAME": ["not", "scalar"]}])
+    def test_recipe_environment_variables_reject_invalid_values(self, env_vars):
+        """Invalid recipe environment mappings should fail before training starts."""
+        config = MagicMock(spec=ConfigContainer)
+        config.env_vars = env_vars
+
+        with pytest.raises((TypeError, ValueError)):
+            apply_environment_variables(config)
+
+    def test_recipe_environment_variables_support_hydra_overrides(self):
+        """The top-level mapping should be replaceable through the shared recipe override path."""
+        from megatron.bridge.training.utils.omegaconf_utils import process_config_with_overrides
+
+        gpt_cfg = create_test_gpt_config()
+        full_cfg, og_ws, cfg_mod = create_test_config_container(world_size_override=1, model_config=gpt_cfg)
+
+        try:
+            updated_cfg = process_config_with_overrides(
+                full_cfg,
+                cli_overrides=[
+                    "++env_vars={NVTE_FWD_LAYERNORM_SM_MARGIN:16,TORCHINDUCTOR_WORKER_START:fork,USE_MNNVL:1}"
+                ],
+            )
+
+            assert updated_cfg.env_vars == {
+                "NVTE_FWD_LAYERNORM_SM_MARGIN": 16,
+                "TORCHINDUCTOR_WORKER_START": "fork",
+                "USE_MNNVL": 1,
+            }
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_recipe_environment_variables_round_trip_through_yaml(self, tmp_path):
+        """Environment mappings should be preserved in saved recipe configs."""
+        gpt_cfg = create_test_gpt_config()
+        full_cfg, og_ws, cfg_mod = create_test_config_container(world_size_override=1, model_config=gpt_cfg)
+        full_cfg.env_vars = {
+            "TORCHINDUCTOR_WORKER_START": "fork",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        }
+        config_path = tmp_path / "recipe.yaml"
+
+        try:
+            full_cfg.to_yaml(str(config_path))
+            restored_cfg = ConfigContainer.from_yaml(str(config_path))
+
+            assert restored_cfg.env_vars == full_cfg.env_vars
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_hf_model_revision_round_trip_through_yaml(self, tmp_path):
+        """Immutable Hugging Face model provenance should survive runtime config persistence."""
+        revision = "b968826d9c46dd6066d109eabc6255188de91218"  # pragma: allowlist secret
+        gpt_cfg = create_test_gpt_config(hf_model_id="Qwen/Qwen3-8B", hf_model_revision=revision)
+        full_cfg, og_ws, cfg_mod = create_test_config_container(world_size_override=1, model_config=gpt_cfg)
+        config_path = tmp_path / "recipe.yaml"
+
+        try:
+            full_cfg.to_yaml(str(config_path))
+            restored_cfg = ConfigContainer.from_yaml(str(config_path))
+
+            assert restored_cfg.model.hf_model_id == "Qwen/Qwen3-8B"
+            assert restored_cfg.model.hf_model_revision == revision
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
     def test_runtime_config_update_with_mixed_precision_string(self):
         """Test runtime_config_update with mixed precision as string."""
         from megatron.bridge.training.config import runtime_config_update
@@ -2197,6 +3838,91 @@ class TestRuntimeConfigUpdate:
             assert full_cfg.data_parallel_size == 8  # world_size / model_parallel_size
             assert full_cfg.comm_overlap.data_parallel_size == 8  # Should be set by runtime_config_update
 
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    @pytest.mark.parametrize("dispatcher", ["alltoall", "allgather"])
+    def test_runtime_config_update_disables_native_packing_moe_ep_overlap(self, dispatcher):
+        """Disable EP overlap after runtime communication settings reach the model."""
+        from megatron.bridge.training.config import runtime_config_update
+
+        model_cfg = create_test_qwen3_vl_config(
+            bf16=True,
+            calculate_per_token_loss=True,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=64,
+            expert_model_parallel_size=8,
+            moe_token_dispatcher_type=dispatcher,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=8)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        optimizer_cfg = create_test_optimizer_config(bf16=True)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            optimizer_config=optimizer_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+        container.comm_overlap = CommOverlapConfig(
+            tp_comm_overlap=False,
+            overlap_moe_expert_parallel_comm=True,
+        )
+
+        try:
+            with pytest.warns(UserWarning, match="Disabling MoE expert-parallel communication overlap") as records:
+                runtime_config_update(container)
+            assert len(records) == 1
+            assert model_cfg.overlap_moe_expert_parallel_comm is False
+            assert model_cfg.delay_wgrad_compute is False
+            assert container.comm_overlap.overlap_moe_expert_parallel_comm is False
+            assert container.comm_overlap.delay_wgrad_compute is False
+            assert container.comm_overlap.user_comm_overlap_cfg.overlap_moe_expert_parallel_comm is False
+            assert container.comm_overlap.user_comm_overlap_cfg.delay_wgrad_compute is False
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_runtime_config_update_disables_native_packing_delay_wgrad_only(self):
+        """Disable delayed weight-gradient compute before communication-overlap setup."""
+        from megatron.bridge.training.config import runtime_config_update
+
+        model_cfg = create_test_qwen3_vl_config(
+            calculate_per_token_loss=True,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=64,
+            expert_model_parallel_size=8,
+            moe_token_dispatcher_type="allgather",
+            overlap_moe_expert_parallel_comm=False,
+            delay_wgrad_compute=False,
+        )
+        train_cfg = create_test_training_config(micro_batch_size=1, global_batch_size=8)
+        dataset_cfg = create_test_qwen_native_energon_dataset_config(sequence_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=8,
+            model_config=model_cfg,
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+        container.ddp.average_in_collective = False
+        container.comm_overlap = CommOverlapConfig(
+            tp_comm_overlap=False,
+            overlap_moe_expert_parallel_comm=False,
+            delay_wgrad_compute=True,
+        )
+
+        try:
+            with pytest.warns(UserWarning, match="Disabling MoE expert-parallel communication overlap") as records:
+                runtime_config_update(container)
+            assert len(records) == 1
+            assert model_cfg.overlap_moe_expert_parallel_comm is False
+            assert model_cfg.delay_wgrad_compute is False
+            assert container.comm_overlap.overlap_moe_expert_parallel_comm is False
+            assert container.comm_overlap.delay_wgrad_compute is False
+            assert container.comm_overlap.user_comm_overlap_cfg.overlap_moe_expert_parallel_comm is False
+            assert container.comm_overlap.user_comm_overlap_cfg.delay_wgrad_compute is False
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
@@ -2394,6 +4120,63 @@ class TestDistributedOptimizerValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
+    @pytest.mark.parametrize(
+        "ddp_overlap, optimizer_overlap, expected_final_state, should_print_message, expected_message_parts",
+        [
+            (True, False, True, True, ["ddp.overlap_param_gather=True", "optimizer.overlap_param_gather=False"]),
+            (False, True, True, True, ["ddp.overlap_param_gather=False", "optimizer.overlap_param_gather=True"]),
+            (True, True, True, False, []),
+            (False, False, False, False, []),
+        ],
+    )
+    @patch("megatron.bridge.training.config.warn_rank_0")
+    def test_overlap_param_gather_sync_scenarios(
+        self,
+        mock_warn_rank_0,
+        ddp_overlap,
+        optimizer_overlap,
+        expected_final_state,
+        should_print_message,
+        expected_message_parts,
+    ):
+        """Test overlap_param_gather sync between DDP and optimizer configs."""
+        gpt_model_cfg = create_test_gpt_config()
+        ddp_cfg = create_test_ddp_config(overlap_param_gather=ddp_overlap)
+        optimizer_cfg = create_test_optimizer_config(overlap_param_gather=optimizer_overlap)
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            ddp_config=ddp_cfg,
+            optimizer_config=optimizer_cfg,
+        )
+
+        try:
+            assert container.ddp.overlap_param_gather is ddp_overlap
+            assert container.optimizer.overlap_param_gather is optimizer_overlap
+
+            _validate_and_sync_distributed_optimizer_settings(container)
+
+            assert container.ddp.overlap_param_gather is expected_final_state
+            assert container.optimizer.overlap_param_gather is expected_final_state
+
+            overlap_warnings = [
+                call
+                for call in mock_warn_rank_0.call_args_list
+                if call[0] and "overlap_param_gather settings were not in sync" in call[0][0]
+            ]
+            if should_print_message:
+                assert len(overlap_warnings) == 1
+                call_args = overlap_warnings[0][0][0]
+                assert "Automatically enabling overlap_param_gather for both settings" in call_args
+                for expected_part in expected_message_parts:
+                    assert expected_part in call_args
+            else:
+                assert len(overlap_warnings) == 0
+
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
 
 class TestSampleBasedTraining:
     """Tests for sample-based training configuration and validation."""
@@ -2453,7 +4236,7 @@ class TestSampleBasedTraining:
         )
 
         try:
-            with pytest.raises(AssertionError, match="Cannot specify both train_iters and train_samples"):
+            with pytest.raises(AssertionError, match="Cannot specify more than one"):
                 container.validate()
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
@@ -2469,7 +4252,9 @@ class TestSampleBasedTraining:
         )
 
         try:
-            with pytest.raises(AssertionError, match="Either train_iters or train_samples must be provided"):
+            with pytest.raises(
+                AssertionError, match="One of train_iters, train_samples, or num_epochs must be provided"
+            ):
                 container.validate()
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
@@ -2488,6 +4273,23 @@ class TestSampleBasedTraining:
             with pytest.raises(
                 AssertionError, match="Use lr_decay_samples for sample-based training, not lr_decay_iters"
             ):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_sample_based_training_rejects_scheduler_max_steps(self):
+        """scheduler.max_steps applies only to iteration-based training."""
+        train_cfg = create_test_training_config(train_samples=10000, train_iters=None)
+        sched_cfg = create_test_scheduler_config(max_steps=1000)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(),
+            train_config=train_cfg,
+            scheduler_config=sched_cfg,
+        )
+
+        try:
+            with pytest.raises(AssertionError, match="only supported for iteration-based training"):
                 container.validate()
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
@@ -2669,11 +4471,132 @@ class TestSampleBasedTraining:
             sched_cfg.finalize()
 
 
+class TestEpochBasedTraining:
+    """Tests for epoch-based training configuration and resolution."""
+
+    def test_epoch_based_training_sentinel_is_declared_field(self):
+        assert "_train_iters_from_num_epochs" in {field.name for field in fields(TrainingConfig)}
+
+    def test_epoch_based_training_resolves_fractional_epochs(self):
+        train_cfg = create_test_training_config(train_iters=None, num_epochs=1.5, global_batch_size=32)
+        dataset_cfg = GPTSFTDatasetConfig(dataset_root="/tmp/dataset", seq_length=512)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(),
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            container.validate()
+            assert container.train.train_iters is None
+
+            container._resolve_num_epochs(train_dataset_size=100)
+
+            assert container.train.train_iters == 6
+            assert container.train._train_iters_from_num_epochs is True
+            container.train.finalize()
+            assert container.scheduler.lr_decay_iters == 6
+            assert container.scheduler.lr_decay_steps == 192
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    @pytest.mark.parametrize(
+        "training_overrides",
+        [
+            {"train_iters": 10, "num_epochs": 1.0},
+            {"train_iters": None, "train_samples": 100, "num_epochs": 1.0},
+        ],
+    )
+    def test_epoch_based_training_rejects_other_training_modes(self, training_overrides):
+        train_cfg = create_test_training_config(**training_overrides)
+
+        with pytest.raises(AssertionError, match="Cannot specify more than one"):
+            train_cfg.finalize()
+
+    def test_epoch_based_training_rejects_rampup_batch_size(self):
+        train_cfg = create_test_training_config(
+            train_iters=None,
+            num_epochs=1.0,
+            rampup_batch_size=[16, 8, 5000],
+        )
+
+        with pytest.raises(AssertionError, match="Batch size rampup not supported with epoch-based training"):
+            train_cfg.finalize()
+
+    @pytest.mark.parametrize("num_epochs", [0.0, -1.0])
+    def test_epoch_based_training_rejects_non_positive_num_epochs(self, num_epochs):
+        train_cfg = create_test_training_config(train_iters=None, num_epochs=num_epochs)
+
+        with pytest.raises(AssertionError, match="num_epochs must be a positive number"):
+            train_cfg.finalize()
+
+    def test_epoch_based_training_requires_finite_gpt_sft_dataset(self):
+        train_cfg = create_test_training_config(train_iters=None, num_epochs=1.0)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(),
+            train_config=train_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="num_epochs is only supported for finite GPTSFTDatasetConfig"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_epoch_based_training_rejects_direct_hf_sft_dataset(self):
+        train_cfg = create_test_training_config(train_iters=None, num_epochs=1.0)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(),
+            train_config=train_cfg,
+            dataset_config_override=create_test_direct_hf_sft_dataset_config(sequence_length=512),
+        )
+
+        try:
+            with pytest.raises(ValueError, match="num_epochs is only supported for finite GPTSFTDatasetConfig"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    @pytest.mark.parametrize("dataloader_type", ["single", "cyclic"])
+    def test_epoch_based_training_rejects_non_batch_dataloader(self, dataloader_type):
+        train_cfg = create_test_training_config(train_iters=None, num_epochs=1.0)
+        dataset_cfg = GPTSFTDatasetConfig(
+            dataset_root="/tmp/dataset",
+            seq_length=512,
+            dataloader_type=dataloader_type,
+        )
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(),
+            train_config=train_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match='dataloader_type="batch"'):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_megatron_mimo_runtime_config_update_rejects_num_epochs(self, monkeypatch):
+        cfg = MagicMock()
+        cfg.env_vars = {"TORCHINDUCTOR_WORKER_START": "fork"}
+        cfg.train.num_epochs = 1.0
+        monkeypatch.delenv("TORCHINDUCTOR_WORKER_START", raising=False)
+
+        with pytest.raises(ValueError, match="num_epochs is not supported for MegatronMIMO datasets"):
+            megatron_mimo_runtime_config_update(cfg)
+        assert os.environ["TORCHINDUCTOR_WORKER_START"] == "fork"
+
+
 class TestDatasetSequenceLengthValidation:
     """Tests for dataset sequence length validation with different dataset types."""
 
     def test_custom_dataset_provider_without_seq_length_passes(self, monkeypatch):
-        """Test that custom DatasetProvider without seq_length/sequence_length attributes passes validation."""
+        """Test that a custom DatasetProvider without seq_length passes validation."""
         from dataclasses import dataclass
         from typing import Any, Optional, Tuple
 
@@ -2701,7 +4624,7 @@ class TestDatasetSequenceLengthValidation:
         )
 
         try:
-            # Should pass without trying to access seq_length or sequence_length
+            # Should pass without trying to access seq_length.
             container.validate()
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
@@ -2741,10 +4664,10 @@ class TestDatasetSequenceLengthValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
-    def test_finetuning_dataset_sequence_length_mismatch_fails(self, monkeypatch):
-        """Test that FinetuningDatasetConfig with mismatched sequence length fails validation."""
+    def test_gpt_sft_dataset_sequence_length_mismatch_fails(self, monkeypatch):
+        """Test that GPTSFTDatasetConfig with mismatched sequence length fails validation."""
         gpt_model_cfg = create_test_gpt_config(seq_length=512)
-        dataset_cfg = create_test_finetuning_dataset_config(sequence_length=1024)  # Mismatch!
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=1024)  # Mismatch!
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -2760,10 +4683,10 @@ class TestDatasetSequenceLengthValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
-    def test_finetuning_dataset_sequence_length_match_passes(self, monkeypatch):
-        """Test that FinetuningDatasetConfig with matching sequence length passes validation."""
+    def test_gpt_sft_dataset_sequence_length_match_passes(self, monkeypatch):
+        """Test that GPTSFTDatasetConfig with matching sequence length passes validation."""
         gpt_model_cfg = create_test_gpt_config(seq_length=512)
-        dataset_cfg = create_test_finetuning_dataset_config(sequence_length=512)  # Match!
+        dataset_cfg = create_test_gpt_sft_dataset_config(sequence_length=512)  # Match!
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -2776,28 +4699,56 @@ class TestDatasetSequenceLengthValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
-    def test_custom_dataset_provider_with_seq_length_validates(self, monkeypatch):
-        """Test that custom DatasetProvider with seq_length attribute is validated if it's a FinetuningDatasetConfig."""
-        # This test ensures that if someone subclasses FinetuningDatasetConfig, it still gets validated
-        from dataclasses import dataclass
-        from typing import Any, Optional, Tuple
+    def test_direct_hf_sft_dataset_sequence_length_mismatch_fails(self, monkeypatch):
+        """Test that direct HF conversation configs enforce model sequence length."""
+        gpt_model_cfg = create_test_gpt_config(seq_length=512)
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=1024)
 
-        from megatron.bridge.training.config import DatasetBuildContext, FinetuningDatasetConfig
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            with pytest.raises(
+                AssertionError, match="sequence length configuration in model config and dataset config match"
+            ):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_direct_hf_sft_dataset_sequence_length_match_passes(self, monkeypatch):
+        """Test that direct HF conversation configs accept matching sequence length."""
+        gpt_model_cfg = create_test_gpt_config(seq_length=512)
+        dataset_cfg = create_test_direct_hf_sft_dataset_config(sequence_length=512)
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            dataset_config_override=dataset_cfg,
+        )
+
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_custom_dataset_provider_with_seq_length_validates(self, monkeypatch):
+        """Test that GPTSFTDatasetConfig subclasses retain sequence-length validation."""
+        from dataclasses import dataclass
 
         @dataclass
-        class CustomFinetuningDataset(FinetuningDatasetConfig):
-            """Custom finetuning dataset that extends FinetuningDatasetConfig."""
+        class CustomGPTSFTDatasetConfig(GPTSFTDatasetConfig):
+            """Custom GPT SFT dataset that extends GPTSFTDatasetConfig."""
 
             custom_field: str = "custom"
 
-            def build_datasets(
-                self, context: DatasetBuildContext
-            ) -> Tuple[Optional[Any], Optional[Any], Optional[Any]]:
-                # Mock implementation
-                return None, None, None
-
         gpt_model_cfg = create_test_gpt_config(seq_length=512)
-        custom_dataset = CustomFinetuningDataset(seq_length=1024)  # Mismatch!
+        custom_dataset = CustomGPTSFTDatasetConfig(
+            seq_length=1024,
+            dataset_root="/tmp/dataset",
+        )
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -2806,7 +4757,7 @@ class TestDatasetSequenceLengthValidation:
         )
 
         try:
-            # Should still validate sequence length since it's a FinetuningDatasetConfig
+            # Should still validate sequence length since it's a GPTSFTDatasetConfig.
             with pytest.raises(
                 AssertionError, match="sequence length configuration in model config and dataset config match"
             ):
@@ -2936,3 +4887,38 @@ class TestLoggerConfigFinalize:
         )
         with patch("importlib.import_module"):
             config.finalize()
+
+
+class TestTokenizerConfig:
+    def test_config_success(self):
+        tokenizer_model = "/path/to/tokenizer"
+        tokenizer_type = "HuggingFaceTokenizer"
+        metadata_path = "/path/to/metadata.json"
+        use_fast = False
+        legacy = True
+
+        config = TokenizerConfig(
+            tokenizer_model=tokenizer_model,
+            tokenizer_type=tokenizer_type,
+            metadata_path=metadata_path,
+            hf_tokenizer_kwargs={"use_fast": use_fast},
+            sp_tokenizer_kwargs={"legacy": legacy},
+        )
+
+        assert config.tokenizer_model == tokenizer_model
+        assert config.metadata_path == metadata_path
+        assert config.tokenizer_hf_no_use_fast == (not use_fast)
+        assert config.tokenizer_sentencepiece_legacy == legacy
+
+    def test_config_failure(self):
+        tokenizer_model = "/path/to/tokenizer"
+        tokenizer_type = "HuggingFaceTokenizer"
+        metadata_path = "/path/to/metadata.json"
+
+        with pytest.raises(TypeError, match="got an unexpected keyword argument"):
+            TokenizerConfig(
+                tokenizer_model=tokenizer_model,
+                tokenizer_type=tokenizer_type,
+                metadata_path=metadata_path,
+                random_arg=True,
+            )

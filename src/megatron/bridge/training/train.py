@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import inspect
 import os
 import sys
 import time
@@ -23,7 +24,6 @@ from typing import Any, Callable, Optional, Union
 import torch
 import torch.profiler
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
@@ -37,7 +37,10 @@ from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.parallel_state import update_pg_timeout
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
-from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from megatron.core.pipeline_parallel.schedules import (
+    forward_backward_pipelining_without_interleaving,
+    get_forward_backward_func,
+)
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -45,9 +48,19 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator, get_rerun_state_machine
 from megatron.core.transformer import MegatronModule
-from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.utils import check_param_hashes_across_dp_replicas, get_model_config
+from megatron.core.transformer.cuda_graphs import (
+    TECudaGraphHelper,
+    VisionTECudaGraphHelper,
+    get_vision_cuda_graph_seq_length,
+)
+from megatron.core.utils import (
+    check_param_hashes_across_dp_replicas,
+    get_attr_wrapped_model,
+    get_model_config,
+    nvtx_decorator,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
 from megatron.bridge.data.iterator_utils import make_data_iterator_list
@@ -60,6 +73,7 @@ from megatron.bridge.training.checkpointing import (
 from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.eval import evaluate_and_print_results
 from megatron.bridge.training.forward_step_func_types import ForwardStepCallable
+from megatron.bridge.training.fsdp_compat import MEGATRON_FSDP_TYPES
 from megatron.bridge.training.initialize import destroy_global_state
 from megatron.bridge.training.nvrx_straggler import (
     check_nvrx_straggler_detection,
@@ -78,6 +92,7 @@ from megatron.bridge.training.tensor_inspect import (
 )
 from megatron.bridge.training.utils import flop_utils
 from megatron.bridge.training.utils.log_utils import append_to_progress_log, barrier_and_log
+from megatron.bridge.training.utils.mlflow_utils import end_active_mlflow_run
 from megatron.bridge.training.utils.train_utils import (
     calc_params_l2_norm,
     logical_and_across_model_parallel_group,
@@ -86,6 +101,25 @@ from megatron.bridge.training.utils.train_utils import (
     training_log,
 )
 from megatron.bridge.utils.common_utils import get_world_size_safe, print_rank_0
+from megatron.bridge.utils.cuda_graph import is_full_iteration_cuda_graph
+
+
+# For Paged Stashing support
+try:
+    from megatron.core.transformer.moe.paged_stash import PagedStashRunner
+
+    HAS_PAGED_STASHING = True
+except ImportError:
+    HAS_PAGED_STASHING = False
+
+
+# For Optimizer CUDA graph support
+try:
+    from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+
+    HAS_OPTIMIZER_CUDA_GRAPH = True
+except ImportError:
+    HAS_OPTIMIZER_CUDA_GRAPH = False
 
 
 def train(
@@ -234,14 +268,40 @@ def train(
     # Capture CUDA Graphs.
     cuda_graph_helper = None
     if model_config.cuda_graph_impl == "transformer_engine":
-        cuda_graph_helper = TECudaGraphHelper(
+        _te_cg_kwargs: dict[str, Any] = dict(
             model=model,
             config=model_config,
             seq_length=config.model.seq_length,
             micro_batch_size=config.train.micro_batch_size,
             optimizers=[optimizer],
         )
-
+        if "pg_collection" in inspect.signature(TECudaGraphHelper.__init__).parameters:
+            _te_cg_kwargs["pg_collection"] = pg_collection
+        cuda_graph_helper = TECudaGraphHelper(**_te_cg_kwargs)
+    # Capture Vision Encoder CUDA Graphs (separate from language model).
+    # Check if vision encoder has CUDA graph enabled
+    vision_cuda_graph_helper = None
+    vision_config = getattr(config.model, "vision_cuda_graph_impl", None)
+    if vision_config == "transformer_engine":
+        # Try to get vision config from the model
+        for model_chunk in model:
+            unwrapped = get_attr_wrapped_model(model_chunk, "vision_model", allow_none=True, return_model_obj=True)
+            if unwrapped is not None and hasattr(unwrapped, "vision_model") and unwrapped.vision_model is not None:
+                vision_model_config = unwrapped.vision_model.config
+                if vision_model_config.cuda_graph_impl == "transformer_engine":
+                    vision_seq_length = get_vision_cuda_graph_seq_length(vision_model_config)
+                    _vision_cg_kwargs: dict[str, Any] = dict(
+                        model=model,
+                        vision_config=vision_model_config,
+                        vision_seq_length=vision_seq_length,
+                        micro_batch_size=config.train.micro_batch_size,
+                        num_microbatches=get_num_microbatches(),
+                    )
+                    if "pg_collection" in inspect.signature(VisionTECudaGraphHelper.__init__).parameters:
+                        _vision_cg_kwargs["pg_collection"] = pg_collection
+                    vision_cuda_graph_helper = VisionTECudaGraphHelper(**_vision_cg_kwargs)
+                    print_rank_0(f"Vision encoder CUDA graph enabled with seq_length={vision_seq_length}")
+                break
     # Track train step elapsed time for throughput logging
     history_wct = None
     if config.logger.log_throughput_to_tensorboard:
@@ -252,16 +312,39 @@ def train(
         pp_size=pg_collection.pp.size(),
         vp_size=config.model.virtual_pipeline_model_parallel_size,
     )
-    if config.model.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in config.model.cuda_graph_scope:
+    if is_full_iteration_cuda_graph(config.model):
         forward_backward_func = FullCudaGraphWrapper(
-            forward_backward_func, cuda_graph_warmup_steps=config.model.cuda_graph_warmup_steps
+            forward_backward_func,
+            cuda_graph_warmup_steps=config.model.cuda_graph_warmup_steps,
+            use_single_mempool=config.model.cuda_graph_use_single_mempool,
+        )
+    if config.optimizer.optimizer_cuda_graph and HAS_OPTIMIZER_CUDA_GRAPH:
+        optimizer.step = OptimizerCudaGraphWrapper(
+            optimizer.step,
+            cuda_graph_warmup_steps=config.model.cuda_graph_warmup_steps,
+            use_single_mempool=config.model.cuda_graph_use_single_mempool,
+        )
+
+    # Wrap model with PagedStashRunner when moe_expert_rank_capacity_factor padding is enabled.
+    # PagedStashRunner is responsible for detecting overflow and re-running iteration in eager-mode without padding.
+    if HAS_PAGED_STASHING and config.model.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = config.optimizer.reuse_grad_buf_for_mxfp8_param_ag and config.ddp.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            model_config, copy_main_params, model, optimizer, forward_backward_func
         )
 
     start_iteration = global_state.train_state.step
     print_rank_0(f"Starting training loop at iteration {start_iteration}")
-    num_floating_point_operations_model = flop_utils.num_floating_point_operations(config, batch_size=1)
     p2p_communicator = P2PCommunicator(pp_group=pg_collection.pp, config=model_config)
     dp_size = pg_collection.dp.size()
+    # Anchor for interval-average throughput logging: training_log reports the FLOPS
+    # performed over each logging interval as the delta of
+    # floating_point_operations_so_far. Seed it with the current cumulative (0 fresh,
+    # or the checkpoint value on resume) so the first interval's delta is correct.
+    global_state._flops_at_last_log = global_state.train_state.floating_point_operations_so_far
+    if hasattr(config.model, "dist_train") and getattr(config.model.dist_train, "use_dist_train", False) is True:
+        forward_backward_func = forward_backward_pipelining_without_interleaving
+        p2p_communicator = config.model._p2p_communicator
 
     if should_fire(callback_manager, "on_train_start"):
         callback_manager.fire(
@@ -275,16 +358,20 @@ def train(
             ),
         )
 
-    # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
-    # or random initialization don't propagate to all ranks in first all-gather (which is a
-    # no-op if things work correctly).
+    # Keep the forward pre-hook enabled for MXFP8 resume so parameter gathering
+    # and MXFP8 staging match an uninterrupted iteration. Other runs retain the
+    # first-iteration validation path below.
     if should_toggle_forward_pre_hook:
-        disable_forward_pre_hook(model, param_sync=False)
-        # Also remove param_sync_func temporarily so that sync calls made in
-        # `forward_backward_func` are no-ops.
         param_sync_func = model_config.param_sync_func
-        model_config.param_sync_func = None
-        pre_hook_enabled = False
+        is_mxfp8_resume = start_iteration > 0 and str(model_config.fp8_recipe).lower().endswith("mxfp8")
+        if not is_mxfp8_resume:
+            disable_forward_pre_hook(model, param_sync=False)
+            # Also remove param_sync_func temporarily so that sync calls made in
+            # `forward_backward_func` are no-ops.
+            model_config.param_sync_func = None
+            pre_hook_enabled = False
+        else:
+            pre_hook_enabled = True
 
     # Run training iterations till done.
     while global_state.train_state.step < train_config.train_iters:
@@ -297,6 +384,9 @@ def train(
         )
         if nvtx_ctx is not None:
             nsys_nvtx_context = nvtx_ctx
+
+        nvtx_step = global_state.train_state.step
+        nvtx_range_push(suffix=f"training_step_{nvtx_step}")
 
         fault_tolerance.on_checkpointing_start(global_state)
         checkpoint_manager.finalize_async_saves(state=global_state, blocking=False)
@@ -337,6 +427,7 @@ def train(
 
         # Completely skip iteration if needed.
         if _should_skip_and_handle_iteration(global_state, train_data_iterator, pg_collection):
+            nvtx_range_pop(suffix=f"training_step_{nvtx_step}")
             continue
 
         # Capture CUDA Graphs after warmup.
@@ -352,6 +443,14 @@ def train(
             if model_config.cuda_graph_warmup_steps > 0 and should_toggle_forward_pre_hook:
                 enable_forward_pre_hook(model)
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
+        # Capture Vision Encoder CUDA Graphs after warmup (separate from language model).
+        if (
+            vision_cuda_graph_helper is not None
+            and not vision_cuda_graph_helper.graphs_created()
+            and global_state.train_state.step - start_iteration == model_config.cuda_graph_warmup_steps
+        ):
+            vision_cuda_graph_helper.create_cudagraphs()
+            vision_cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         # Run training step.
         fault_tolerance.on_training_step_start(global_state)
@@ -367,6 +466,17 @@ def train(
                     scheduler=scheduler,
                 ),
             )
+
+        # Reset per-step FLOPS accumulators (filled by forward_step micro-batches).
+        global_state._flops_seqlen_sum = 0
+        global_state._flops_seqlen_sq_sum = 0
+        global_state._flops_vision_patches = 0
+        global_state._flops_vision_patch_sum = 0
+        global_state._flops_vision_patch_sq_sum = 0
+        global_state._flops_vision_merged_token_sum = 0
+        global_state._flops_cross_seqlen_sum = 0
+        global_state._flops_cross_seqlen_product_sum = 0
+        global_state._flops_requires_global_reduce = False
 
         (
             loss_dict,
@@ -425,6 +535,7 @@ def train(
                 callback_manager=callback_manager,
             )
         if should_exit:
+            nvtx_range_pop(suffix=f"training_step_{nvtx_step}")
             break
 
         # Enable forward pre-hooks after first set of forward and backward passes.
@@ -440,7 +551,7 @@ def train(
                 # Enable forward pre-hook after training step has successfully run. All subsequent
                 # forward passes will use the forward pre-hook / `param_sync_func` in
                 # `forward_backward_func`.
-                if should_toggle_forward_pre_hook:
+                if should_toggle_forward_pre_hook and not pre_hook_enabled:
                     enable_forward_pre_hook(model)
                     model_config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
@@ -451,7 +562,13 @@ def train(
                     ):
                         assert cuda_graph_helper.graphs_created(), "CUDA Graphs should have been created."
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
-
+                    # Also set manual hooks for vision encoder CUDA graphs if enabled
+                    if (
+                        vision_cuda_graph_helper is not None
+                        and model_config.cuda_graph_warmup_steps == 0
+                        and vision_cuda_graph_helper.graphs_created()
+                    ):
+                        vision_cuda_graph_helper.cuda_graph_set_manual_hooks()
         global_state.train_state.step += 1
 
         # If fsdp_manual_registration is enabled, manually register FSDP communication buffers after one training step.
@@ -466,7 +583,38 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         global_state.train_state.skipped_train_samples += num_skipped_samples_in_batch
-        num_floating_point_operations_in_batch = num_floating_point_operations_model * batch_size
+
+        # Resolve this step's data-parallel-global FLOPS sequence stats and fold the
+        # step's FLOPS into the running total. Dense BSHD batches extrapolate exact
+        # fixed-length stats from the local DP rank; THD batches request one exact SUM
+        # all-reduce over the pure DP group because packed sub-sequence lengths can
+        # differ by rank.
+        flops_stats = flop_utils.resolve_global_flops_runtime_stats(
+            global_state,
+            data_parallel_size=dp_size,
+            vp_size=config.model.virtual_pipeline_model_parallel_size,
+            dp_group=pg_collection.dp,
+            include_vision_patch_stats=True,
+            include_cross_attention_stats=hasattr(
+                config.model, "_get_num_floating_point_operations_with_runtime_stats"
+            ),
+        )
+        num_floating_point_operations_in_batch = flop_utils.num_floating_point_operations(
+            config,
+            batch_size=batch_size,
+            seqlen_sum=flops_stats.seqlen_sum,
+            seqlen_squared_sum=flops_stats.seqlen_squared_sum,
+            num_vision_patches=0 if flops_stats.has_exact_vision_stats else flops_stats.num_vision_patches,
+            cross_seqlen_sum=flops_stats.cross_seqlen_sum,
+            cross_seqlen_product_sum=flops_stats.cross_seqlen_product_sum,
+        )
+        if flops_stats.has_exact_vision_stats:
+            num_floating_point_operations_in_batch += flop_utils.vit_flops_from_patch_stats(
+                config,
+                patch_sum=flops_stats.vision_patch_sum,
+                patch_squared_sum=flops_stats.vision_patch_squared_sum,
+                merged_token_sum=flops_stats.vision_merged_token_sum,
+            )
         global_state.train_state.floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_so_far = global_state.train_state.floating_point_operations_so_far
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
@@ -507,20 +655,28 @@ def train(
                 global_state,
                 history_wct,
                 model,
-                log_max_attention_logit,
+                pg_collection=pg_collection,
+                log_max_attention_logit=log_max_attention_logit,
                 loaded_iteration=start_iteration,
+                # training_log recomputes seqlen/FLOPS from the (log-step) accumulators
+                # itself; pass None so it uses that path (the per-step seqlen_sum is no
+                # longer materialized on the hot path).
+                seq_length=None,
             )
 
         if (
             global_state.train_state.do_valid
             and val_config.eval_interval
+            and (
+                val_config.start_eval_at_iter is None or global_state.train_state.step >= val_config.start_eval_at_iter
+            )
             and global_state.train_state.step % val_config.eval_interval == 0
         ):
             if energy_monitor is not None:
                 energy_monitor.pause()
             timers("interval-time").stop()
             if should_toggle_forward_pre_hook:
-                disable_forward_pre_hook(model)
+                disable_forward_pre_hook(model, optimizer=optimizer)
                 pre_hook_enabled = False
             if train_config.manual_gc and train_config.manual_gc_eval:
                 # Collect all objects.
@@ -564,10 +720,12 @@ def train(
         )
         maybe_check_weight_hash_across_dp_replicas(
             model,
+            optimizer,
             config.train.check_weight_hash_across_dp_replicas_interval,
             global_state.train_state.step,
             should_toggle_forward_pre_hook,
         )
+        nvtx_range_pop(suffix=f"training_step_{nvtx_step}")
         handle_profiling_stop(
             config.profiling,
             global_state.train_state.step,
@@ -590,7 +748,8 @@ def train(
             num_floating_point_operations_so_far,
             checkpoint_manager,
             train_data_iterator,
-            callback_manager,
+            pg_collection=pg_collection,
+            callback_manager=callback_manager,
         )
         if should_exit:
             break
@@ -626,7 +785,7 @@ def train(
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
-        disable_forward_pre_hook(model)
+        disable_forward_pre_hook(model, optimizer=optimizer)
 
     # This will finalize all unfinalized async request and terminate
     # a persistent async worker if persistent ckpt worker is enabled
@@ -643,20 +802,7 @@ def train(
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6} MJ")
         energy_monitor.shutdown()
 
-    # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
-    if should_exit:
-        # Close NVIDIA DLFw Inspect if enabled
-        tensor_inspect_end_if_enabled(config.tensor_inspect)
-        checkpoint_manager.finalize_async_saves(state=global_state, blocking=True, terminate=True)
-        wandb_writer = global_state.wandb_logger
-        if wandb_writer:
-            wandb_writer.finish()
-        if global_state._comet_logger:
-            global_state._comet_logger.end()
-        fault_tolerance.shutdown(global_state)
-        sys.exit(exit_code)
-
-    # Close NVIDIA DLFw Inspect at clean finish
+    # Close NVIDIA DLFw Inspect at the end of the training loop.
     tensor_inspect_end_if_enabled(config.tensor_inspect)
 
     if should_fire(callback_manager, "on_train_end"):
@@ -671,7 +817,19 @@ def train(
             ),
         )
 
+    # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
+    if should_exit:
+        checkpoint_manager.finalize_async_saves(state=global_state, blocking=True, terminate=True)
+        wandb_writer = global_state.wandb_logger
+        if wandb_writer:
+            wandb_writer.finish()
+        if global_state._comet_logger:
+            global_state._comet_logger.end()
+        fault_tolerance.shutdown(global_state)
+        sys.exit(exit_code)
 
+
+@nvtx_decorator()
 def train_step(
     forward_step_func: ForwardStepCallable,
     data_iterator: Optional[Union[RerunDataIterator, list[RerunDataIterator]]],
@@ -732,7 +890,7 @@ def train_step(
 
         if cfg.dataset.dataloader_type == "batch":
             # Finetuning path to support variable-length sequences
-            from megatron.bridge.data.finetuning import prepare_finetuning_batch
+            from megatron.bridge.data.batch_utils import prepare_finetuning_batch
 
             forward_backward_data_iterator, seq_length = prepare_finetuning_batch(
                 data_iterator=data_iterator,
@@ -785,16 +943,19 @@ def train_step(
         torch.cuda.empty_cache()
 
     # Update parameters.
+    nvtx_range_push(suffix="optimizer_step")
     timers("optimizer", log_level=1).start(barrier=optim_config.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
     log_max_attention_logit = None
-    if hasattr(cfg.model, "qk_clip") and cfg.model.qk_clip:
-        log_max_attention_logit = clip_qk(model)
+    qk_clip_enabled = getattr(cfg.model, "qk_clip", False)
+    if qk_clip_enabled or getattr(cfg.model, "log_max_attention_logit", False):
+        log_max_attention_logit = clip_qk(model, log_max_only=not qk_clip_enabled)
 
     timers("optimizer").stop()
+    nvtx_range_pop(suffix="optimizer_step")
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
@@ -821,7 +982,12 @@ def train_step(
     if train_config.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if is_pp_last_stage(pg_collection.pp):
+    pp_last_stage = None
+    if p2p_communicator is not None:
+        pp_last_stage = p2p_communicator.is_pp_last_stage
+    else:
+        pp_last_stage = is_pp_last_stage(pg_collection.pp)
+    if pp_last_stage:
         # Average loss across microbatches.
         loss_reduced = {}
 
@@ -908,6 +1074,7 @@ def maybe_report_stragglers(
 
 def maybe_check_weight_hash_across_dp_replicas(
     model: list[MegatronModule],
+    optimizer: Optional[MegatronOptimizer],
     check_weight_hash_across_dp_replicas_interval: Optional[int],
     iteration: int,
     should_toggle_forward_pre_hook: bool,
@@ -916,6 +1083,7 @@ def maybe_check_weight_hash_across_dp_replicas(
 
     Args:
         model: List of model chunks to validate.
+        optimizer: Optimizer used to stage params before disabling the pre-hook.
         check_weight_hash_across_dp_replicas_interval: Interval at which to verify; ``None`` to skip.
         iteration: Zero-based training iteration counter.
         should_toggle_forward_pre_hook: Whether the pre-hook must be disabled during the check.
@@ -926,7 +1094,7 @@ def maybe_check_weight_hash_across_dp_replicas(
         return
 
     if should_toggle_forward_pre_hook:
-        disable_forward_pre_hook(model)
+        disable_forward_pre_hook(model, optimizer=optimizer)
     assert check_param_hashes_across_dp_replicas(model, cross_check=True), (
         "Parameter hashes not matching across DP replicas"
     )
@@ -984,24 +1152,32 @@ def enable_forward_pre_hook(model: list[DDP]) -> None:
         model_chunk.enable_forward_pre_hook()
 
 
-def disable_forward_pre_hook(model: list[DDP], param_sync: bool = True) -> None:
+def disable_forward_pre_hook(
+    model: list[DDP], optimizer: Optional[MegatronOptimizer] = None, param_sync: bool = True
+) -> None:
     """Disable forward pre-hook for all model chunks.
 
     Args:
         model: list of model chunks wrapped in DDP
+        optimizer: Optional optimizer used to stage params before forced sync.
         param_sync: Whether to synchronize parameters across model chunks
     """
+    if param_sync and optimizer is not None:
+        optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model:
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
-def force_param_sync(model: list[DDP]) -> None:
+def force_param_sync(model: list[DDP], optimizer: Optional[MegatronOptimizer] = None) -> None:
     """Force parameter synchronization for all model chunks.
 
     Args:
         model: list of model chunks wrapped in DDP.
+        optimizer: Optional optimizer used to stage params before forced sync.
     """
+    if optimizer is not None:
+        optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
@@ -1109,7 +1285,9 @@ def save_checkpoint_and_time(
     checkpoint_manager: CheckpointManager,
     non_persistent_ckpt: bool = False,
     train_data_iterator: Optional[Union[RerunDataIterator, list[RerunDataIterator]]] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
     callback_manager: Optional[CallbackManager] = None,
+    module_name: str | None = None,
 ) -> None:
     """Saves a checkpoint and logs the timing.
 
@@ -1127,6 +1305,8 @@ def save_checkpoint_and_time(
         non_persistent_ckpt: Flag indicating if this is a non-persistent
                              (local) checkpoint. Defaults to False.
         train_data_iterator: Optional training data iterator to save its state.
+        pg_collection: Optional process group collection for MegatronMIMO topologies.
+                       When None, save_checkpoint falls back to model-attached PGs.
     """
     timers = state.timers
     energy_monitor = state.energy_monitor
@@ -1148,7 +1328,7 @@ def save_checkpoint_and_time(
         state.cfg.ddp.overlap_param_gather,
     )
     if should_force_param_sync:
-        force_param_sync(model)
+        force_param_sync(model, optimizer=optimizer)
 
     # Free overlap param-gather buffers and release cached GPU memory so
     # that the async checkpoint worker process has enough GPU headroom for
@@ -1167,11 +1347,12 @@ def save_checkpoint_and_time(
             num_floating_point_operations_so_far=int(num_floating_point_operations_so_far),
             train_data_iterator=train_data_iterator,
             non_persistent_ckpt=non_persistent_ckpt,
+            pg_collection=pg_collection,
+            module_name=module_name,
         ),
         callback_manager,
     )
-
-    if state.cfg.model.fp8 is not None:
+    if getattr(state.cfg.model, "fp8", None) is not None:
         # Run garbage collection after checkpoint saving to free memory from
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
@@ -1196,7 +1377,9 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far: float,
     checkpoint_manager: CheckpointManager,
     train_data_iterator: Optional[Union[RerunDataIterator, list[RerunDataIterator]]],
-    callback_manager: Optional[CallbackManager],
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    callback_manager: Optional[CallbackManager] = None,
+    module_name: str | None = None,
 ) -> bool:
     """Handles checkpointing decisions and determines if training should exit.
 
@@ -1212,6 +1395,8 @@ def checkpoint_and_decide_exit(
         num_floating_point_operations_so_far: Cumulative TFLOPs up to this point.
         checkpoint_manager: The checkpoint manager for save operations.
         train_data_iterator: Optional training data iterator to save its state.
+        pg_collection: Optional process group collection for MegatronMIMO topologies.
+                       When None, save_checkpoint falls back to model-attached PGs.
 
     Returns:
         True if the training loop should exit, False otherwise.
@@ -1231,8 +1416,11 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpoint_manager,
                     train_data_iterator=train_data_iterator,
+                    pg_collection=pg_collection,
                     callback_manager=callback_manager,
+                    module_name=module_name,
                 )
+            end_active_mlflow_run("KILLED")
             barrier_and_log("exiting program after receiving SIGTERM.")
 
             return True
@@ -1251,7 +1439,9 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpoint_manager,
             train_data_iterator=train_data_iterator,
+            pg_collection=pg_collection,
             callback_manager=callback_manager,
+            module_name=module_name,
         )
         saved_checkpoint = True
 
@@ -1269,7 +1459,9 @@ def checkpoint_and_decide_exit(
             checkpoint_manager,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
+            pg_collection=pg_collection,
             callback_manager=callback_manager,
+            module_name=module_name,
         )
         saved_checkpoint = True
 
@@ -1289,7 +1481,9 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpoint_manager,
                     train_data_iterator=train_data_iterator,
+                    pg_collection=pg_collection,
                     callback_manager=callback_manager,
+                    module_name=module_name,
                 )
             barrier_and_log(f"exiting program after {train_time} minutes")
 
@@ -1306,7 +1500,9 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpoint_manager,
                 train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
                 callback_manager=callback_manager,
+                module_name=module_name,
             )
         barrier_and_log(f"exiting program at iteration {state.train_state.step}")
 
@@ -1323,6 +1519,9 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpoint_manager,
                 train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
+                callback_manager=callback_manager,
+                module_name=module_name,
             )
         barrier_and_log("Exiting program due to straggler detection.")
         return True
@@ -1351,6 +1550,7 @@ def _finish_train(global_state: GlobalState, checkpoint_manager: CheckpointManag
     if global_state._comet_logger:
         global_state._comet_logger.end()
 
+    _delete_cuda_graphs(None)
     destroy_global_state()
 
 
@@ -1435,7 +1635,7 @@ def _handle_mxfp8_param_buffer_copy(
 
     However, we should skip this on the first iteration when forward_pre_hook is disabled,
     because:
-    1. The first iteration's params are already in param.data (from init or checkpoint).
+    1. A fresh run's first-iteration params are already in param.data from initialization.
     2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
        so the main grads will be polluted by the main params.
 
@@ -1460,7 +1660,7 @@ def _handle_mxfp8_param_buffer_copy(
                     optim_instance._copy_main_params_to_param_buffer()
 
 
-def _delete_cuda_graphs(cuda_graph_helper: TECudaGraphHelper):
+def _delete_cuda_graphs(cuda_graph_helper: TECudaGraphHelper | None):
     """
     Delete the CUDA graph object as they hold a reference to the some of the nccl buffers, thus blocking the
     process-destory (torch.dist.destroy_process_group()) at the end of the training loop.
@@ -1474,18 +1674,29 @@ def _delete_cuda_graphs(cuda_graph_helper: TECudaGraphHelper):
 
     print_rank_0("Deleting CUDA graphs")
 
-    # Explicitly delete the training CUDA graph because of
+    # Explicitly delete full CUDA graphs because of
     # https://github.com/pytorch/pytorch/issues/115388#issuecomment-3009880966
-    if "training" in FullCudaGraphWrapper.cuda_graph:
-        del FullCudaGraphWrapper.cuda_graph["training"]
+    for stage in ("training", "validation"):
+        if stage in FullCudaGraphWrapper.cuda_graph:
+            del FullCudaGraphWrapper.cuda_graph[stage]
+        FullCudaGraphWrapper.cuda_graph[stage] = None
+        FullCudaGraphWrapper.result[stage] = None
+        FullCudaGraphWrapper.curr_iteration[stage] = 0
 
-    # Cleanup CUDA graphs object for partial Cuda-graphs (implemented in TransformerEngine)
-    if cuda_graph_helper is not None:
-        for layers in cuda_graph_helper.callables_per_chunk:
-            for layer in layers:
-                for cuda_graph in layer.cuda_graphs:
-                    del cuda_graph
-                del layer.cuda_graphs
+    # Explicitly delete optimizer CUDA graph
+    if HAS_OPTIMIZER_CUDA_GRAPH:
+        if OptimizerCudaGraphWrapper.cuda_graph is not None:
+            del OptimizerCudaGraphWrapper.cuda_graph
+        OptimizerCudaGraphWrapper.cuda_graph = None
+        OptimizerCudaGraphWrapper.result = None
+        OptimizerCudaGraphWrapper.curr_iteration = 0
+
+    # Cleanup CUDA graphs object for partial Cuda-graphs (implemented in TransformerEngine).
+    # Guard on graphs_created(): with TE-scoped graphs (e.g. cuda_graph_scope="attn") the helper
+    # may finish its capture phase without actually producing any graphs, in which case
+    # delete_cuda_graphs() asserts. Mirrors the guard in upstream mcore training.py.
+    if cuda_graph_helper is not None and cuda_graph_helper.graphs_created():
+        cuda_graph_helper.delete_cuda_graphs()
 
     # Run GC to collect the freshed object
     gc.collect()
@@ -1504,7 +1715,7 @@ def _maybe_register_fsdp_buffers(
     ):
         print_rank_0("[Megatron-FSDP] Registering FSDP communication buffers manually")
         for model_chunk in model:
-            if isinstance(model_chunk, megatron_FSDP) and getattr(
+            if isinstance(model_chunk, MEGATRON_FSDP_TYPES) and getattr(
                 model_chunk.ddp_config, "fsdp_manual_registration", False
             ):
                 fsdp_param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
