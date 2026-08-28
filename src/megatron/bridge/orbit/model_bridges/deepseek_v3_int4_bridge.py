@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,10 +19,12 @@ native INT4 format (``weight_packed`` + ``weight_scale`` + ``weight_shape``)
 while attention / norm weights are BF16.
 
 Conversion flow:
-    1. ``maybe_modify_loaded_hf_weight`` intercepts INT4 weights and dequants
-       to BF16 so the standard bridge can do QKV merge + TP split.
+    1. The architecture-independent
+       :class:`~megatron.bridge.orbit.conversion.compressed_tensors_int4.CompressedTensorsINT4Mixin`
+       synthesizes virtual ``.weight`` keys and dequants INT4 -> BF16 on read
+       so the standard bridge can do QKV merge + TP split.
     2. After all weights are loaded, ``_requantize_experts_int4`` walks the
-       model and re-quantises expert weights BF16 → INT4.  The BF16 Parameter
+       model and re-quantises expert weights BF16 -> INT4.  The BF16 Parameter
        data is emptied and ``weight_packed`` / ``weight_scale`` / ``weight_shape``
        are registered as persistent buffers.
     3. ``save_megatron_model`` saves everything — dist_checkpointing preserves
@@ -32,97 +34,33 @@ At training time, OFTLinear detects the INT4 buffers and dequants on the fly.
 """
 
 import logging
-from typing import List, Mapping, Optional, Union
 
 import torch
 import torch.nn as nn
 
-from megatron.bridge.orbit.low_precision.int4 import (
-    dequantize_int4,
-    quantize_to_int4,
-)
+from megatron.bridge.models.conversion.quantization_utils import quantize_to_int4
 from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
+from megatron.bridge.orbit.conversion.compressed_tensors_int4 import CompressedTensorsINT4Mixin
+
 
 logger = logging.getLogger(__name__)
 
 
-class DeepSeekV3INT4Bridge(DeepSeekV3Bridge):
+class DeepSeekV3INT4Bridge(CompressedTensorsINT4Mixin, DeepSeekV3Bridge):
     """DeepSeek-V3 / Kimi-K2 bridge that preserves INT4 through conversion."""
 
     # --------------------------------------------------------------------- #
-    # Virtual key synthesis: make INT4 triplets visible as .weight keys
-    # --------------------------------------------------------------------- #
-
-    def build_conversion_tasks(self, hf_pretrained, megatron_model) -> List:
-        """Synthesize virtual 'weight' keys from INT4 quantized triplets.
-
-        The HF checkpoint stores quantized expert weights as triplets
-        (weight_packed, weight_scale, weight_shape) without a plain 'weight'
-        key.  We synthesize virtual 'weight' keys so the mapping registry
-        can find them, then maybe_modify_loaded_hf_weight handles dequant.
-        """
-        original_get_all_keys = hf_pretrained.state.source.get_all_keys
-
-        def _get_all_keys_with_virtual():
-            keys = original_get_all_keys()
-            all_keys_set = set(keys)
-            virtual_keys = []
-            for key in keys:
-                if key.endswith("_packed"):
-                    base = key[:-7]  # "...weight_packed" → "...weight"
-                    if f"{base}_scale" in all_keys_set and f"{base}_shape" in all_keys_set:
-                        virtual_keys.append(base)
-            return keys + virtual_keys
-
-        hf_pretrained.state.source.get_all_keys = _get_all_keys_with_virtual
-        try:
-            return super().build_conversion_tasks(hf_pretrained, megatron_model)
-        finally:
-            hf_pretrained.state.source.get_all_keys = original_get_all_keys
-
-    # --------------------------------------------------------------------- #
-    # Step 1: Dequant INT4 → BF16 during HF weight loading
-    # --------------------------------------------------------------------- #
-
-    def maybe_modify_loaded_hf_weight(
-        self, hf_param: Union[str, dict], hf_state_dict: Mapping[str, torch.Tensor]
-    ) -> torch.Tensor:
-        if isinstance(hf_param, dict):
-            return {role: self._maybe_dequant_int4(key, hf_state_dict)
-                    for role, key in hf_param.items()}
-        return self._maybe_dequant_int4(hf_param, hf_state_dict)
-
-    def _maybe_dequant_int4(
-        self, hf_key: str, hf_state_dict: Mapping[str, torch.Tensor]
-    ) -> torch.Tensor:
-        if hf_key.endswith(".weight"):
-            base = hf_key[: -len(".weight")]
-            packed_key = base + ".weight_packed"
-            if packed_key in hf_state_dict:
-                w = dequantize_int4(
-                    hf_state_dict[packed_key],
-                    hf_state_dict[base + ".weight_scale"],
-                    hf_state_dict[base + ".weight_shape"],
-                    device=hf_state_dict[packed_key].device,
-                )
-                logger.info("Dequantised INT4 → BF16: %s  shape=%s", hf_key, list(w.shape))
-                return w
-        return hf_state_dict[hf_key]
-
-    # --------------------------------------------------------------------- #
-    # Step 2: Re-quantise expert weights after loading, before save
+    # Re-quantise expert weights after loading, before save
     # --------------------------------------------------------------------- #
 
     def load_weights_hf_to_megatron(
         self,
         hf_pretrained,
         megatron_model,
-        allowed_mismatched_params: Optional[List[str]] = None,
+        allowed_mismatched_params: list[str] | None = None,
     ):
         """Load weights normally (with INT4 dequant), then re-quantise experts."""
-        result = super().load_weights_hf_to_megatron(
-            hf_pretrained, megatron_model, allowed_mismatched_params
-        )
+        result = super().load_weights_hf_to_megatron(hf_pretrained, megatron_model, allowed_mismatched_params)
         # Re-quantise expert linear weights to INT4.
         models = megatron_model if isinstance(megatron_model, list) else [megatron_model]
         for model in models:
@@ -131,7 +69,7 @@ class DeepSeekV3INT4Bridge(DeepSeekV3Bridge):
 
     @torch.no_grad()
     def _requantize_experts_int4(self, model: nn.Module, group_size: int = 32):
-        """Walk the model and re-quantise expert weights BF16 → INT4.
+        """Walk the model and re-quantise expert weights BF16 -> INT4.
 
         For each expert linear (grouped or regular), replace the BF16 weight
         data with INT4 packed buffers.
@@ -167,9 +105,7 @@ class DeepSeekV3INT4Bridge(DeepSeekV3Bridge):
 
         logger.info("Re-quantised experts to INT4, saved %.1f GB", total_saved / 1e9)
 
-    def _quantize_one_weight(
-        self, module: nn.Module, weight_name: str, w_data: torch.Tensor, group_size: int
-    ) -> int:
+    def _quantize_one_weight(self, module: nn.Module, weight_name: str, w_data: torch.Tensor, group_size: int) -> int:
         """Quantise one weight to INT4 and register buffers on the module."""
         bf16_bytes = w_data.numel() * w_data.element_size()
 

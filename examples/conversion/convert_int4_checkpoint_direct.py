@@ -52,6 +52,7 @@ from megatron.bridge.orbit.low_precision.common import (
     patch_meta_init_for_te_modules,
 )
 from megatron.bridge.orbit.low_precision.int4 import build_int4_direct_model_state_dict
+from megatron.bridge.orbit.conversion.compressed_tensors_int4 import int4_bridge_for
 from megatron.bridge.orbit.model_bridges.deepseek_v3_int4_bridge import DeepSeekV3INT4Bridge
 from megatron.bridge.models.kimi_vl.kimi_k25_vl_bridge import KimiK25VLBridge
 from megatron.bridge.orbit.model_bridges.llama_int4_bridge import LlamaINT4Bridge
@@ -161,7 +162,10 @@ def _select_int4_bridge(auto_bridge: AutoBridge) -> Any:
         return Qwen3INT4Bridge()
     if architecture_name == "Qwen3MoeForCausalLM":
         return Qwen3MoEINT4Bridge()
-    raise ValueError(f"Unsupported INT4 direct-write architecture: {architecture_name}")
+    # Any other registered architecture: compose the generic INT4 mixin with
+    # its registered bridge (same conversion path the named classes above use).
+    print(f"No named INT4 bridge for {architecture_name}; composing the generic INT4 adapter")
+    return int4_bridge_for(auto_bridge)
 
 
 def _save_direct_checkpoint(
