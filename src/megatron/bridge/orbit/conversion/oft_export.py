@@ -2,12 +2,13 @@
 
 """OFT adapter export/streaming for HF conversion (orbit fork).
 
-Extracted from ``megatron.bridge.models.conversion.peft_bridge``:
-module-level task/constant/regex helpers plus :class:`OrbitOFTExportMixin`,
-which ``MegatronPeftBridge`` inherits (its only structural seam). The public
-entry points remain ``MegatronPeftBridge.stream_oft_adapter_weights_megatron_to_hf``
-(dispatch-registered per bridge in ``model_bridge.register_bridge_implementation``)
-and ``AutoBridge.export_oft_adapter_weights``.
+OFT is a peer of LoRA: where upstream exports LoRA adapters via
+``AutoBridge.export_adapter_weights`` / ``save_hf_adapter``, orbit exports OFT
+adapters via the free functions :func:`export_oft_adapter_weights` /
+:func:`save_hf_oft_adapter` defined at the bottom of this module. They compose
+the architecture's registered model-bridge class with
+:class:`OrbitOFTExportMixin` (mixin-first MRO, see
+:func:`oft_export_bridge_for`) — no upstream file is edited.
 """
 
 from __future__ import annotations
@@ -174,7 +175,30 @@ class OrbitOFTExportMixin:
     Methods are verbatim from the pre-restructure ``MegatronPeftBridge``; the
     adapter-info cache stays on the bridge instance
     (``self._cached_oft_adapter_info``).
+
+    The two predicate overrides below widen upstream's LoRA-shaped name
+    handling for OFT; because this mixin precedes the bridge class in the MRO
+    (see :func:`oft_export_bridge_for`), they take effect without editing
+    upstream's ``MegatronPeftBridge``.
     """
+
+    def _get_lora_unwrapped_name(self, megatron_param: str) -> str:
+        """Remove `.to_wrap` (LoRA) or `._orig_module` (OFT) from PEFT parameter names."""
+        return megatron_param.replace(".to_wrap.", ".").replace("._orig_module.", ".")
+
+    def _is_adapter_param_name(self, param_name: str) -> bool:
+        """Return True if the parameter only belongs to a PEFT adapter.
+
+        Matches both the upstream ``.adapter.`` form and the CanonicalOFT split
+        forms ``.adapter_q.`` / ``.adapter_k.`` / ``.adapter_v.`` /
+        ``.adapter_gate.`` / ``.adapter_up.``.
+        """
+        if ".adapter." in param_name:
+            return True
+        for slice_name in _CANONICAL_OFT_SLICE_TO_HF_LEAF:
+            if f".adapter_{slice_name}." in param_name:
+                return True
+        return False
 
     @staticmethod
     def _parse_canonical_oft_slice(param_name: str) -> Optional[str]:
@@ -778,3 +802,175 @@ class OrbitOFTExportMixin:
             converted_weights_dict[hf_name] = base_weight @ R_dev
 
         return converted_weights_dict
+
+
+# ---------------------------------------------------------------------------
+# Orbit-side OFT export API (peer of AutoBridge.save_hf_adapter for LoRA).
+#
+# Upstream's export path is LoRA-only; instead of editing it, orbit composes
+# the registered model-bridge class with OrbitOFTExportMixin (mixin-first MRO)
+# and exposes free-function entrypoints below.
+# ---------------------------------------------------------------------------
+
+_HF_OFT_SUFFIXES = (".oft_R",)
+
+_OFT_BRIDGE_CLASS_CACHE: Dict[type, type] = {}
+
+
+def oft_export_bridge_for(auto_bridge) -> "MegatronModule":
+    """Return the model bridge for ``auto_bridge``'s architecture, composed with the OFT mixin.
+
+    Mirrors upstream's ``_get_model_bridge_impl`` construction (fresh instance,
+    ``hf_pretrained``/``hf_config`` attached) with ``OrbitOFTExportMixin``
+    placed first in the MRO.
+    """
+    from megatron.bridge.models.conversion import model_bridge as model_bridge_mod
+
+    base = model_bridge_mod.get_model_bridge(auto_bridge._causal_lm_architecture)
+    base_cls = type(base)
+    oft_cls = _OFT_BRIDGE_CLASS_CACHE.get(base_cls)
+    if oft_cls is None:
+        oft_cls = type(f"OrbitOFT{base_cls.__name__}", (OrbitOFTExportMixin, base_cls), {})
+        _OFT_BRIDGE_CLASS_CACHE[base_cls] = oft_cls
+
+    bridge = oft_cls()
+    hf_pretrained = getattr(auto_bridge, "hf_pretrained", None)
+    if hf_pretrained is not None:
+        bridge.hf_pretrained = hf_pretrained
+        bridge.hf_config = hf_pretrained.config if hasattr(hf_pretrained, "config") else hf_pretrained
+    return bridge
+
+
+def export_oft_adapter_weights(auto_bridge, model, cpu: bool = False, show_progress: bool = True):
+    """Export only OFT adapter weights from a Megatron model in HuggingFace format.
+
+    Unlike LoRA's ``lora_A``/``lora_B`` matrices, OFT adapters consist of a
+    single rotation parameter per adapted layer; fused Megatron layers (QKV,
+    gate/up) emit it once per sub-projection. All ranks must consume the
+    returned generator — the gather uses TP/PP/EP collectives.
+
+    Yields:
+        HFWeightTuple: ``(param_name, weight_tensor)`` for OFT adapter parameters.
+    """
+    bridge = oft_export_bridge_for(auto_bridge)
+    return bridge.stream_oft_adapter_weights_megatron_to_hf(model, cpu=cpu, show_progress=show_progress)
+
+
+def infer_oft_target_modules(adapter_weight_names: Iterable[str]) -> List[str]:
+    """Derive HF ``target_modules`` from HF-format OFT adapter weight names."""
+    modules: set[str] = set()
+    for name in adapter_weight_names:
+        for suffix in _HF_OFT_SUFFIXES:
+            if name.endswith(suffix):
+                modules.add(name[: -len(suffix)].rsplit(".", 1)[-1])
+    return sorted(modules)
+
+
+def build_oft_adapter_config_dict(
+    peft_config,
+    target_modules: List[str],
+    base_model_name_or_path: Optional[str] = None,
+) -> Dict[str, object]:
+    """Build a HF-PEFT-compatible ``adapter_config.json`` dict for an OFT adapter.
+
+    Inherits every field from the megatron-bridge ``peft_config`` dataclass,
+    remaps Megatron names to HF names (``block_size`` → ``oft_block_size``) and
+    adds the HF boilerplate fields (``peft_type`` …) the dataclass lacks. The
+    result loads with ``peft.PeftModel.from_pretrained`` without depending on
+    the ``peft`` pip package here.
+    """
+    import dataclasses as _dataclasses
+
+    config: Dict[str, object] = {}
+    if _dataclasses.is_dataclass(peft_config):
+        config.update(_dataclasses.asdict(peft_config))
+        for k, v in list(config.items()):
+            if isinstance(v, (set, frozenset)):
+                config[k] = sorted(v)
+
+    config["base_model_name_or_path"] = base_model_name_or_path or ""
+    # ``target_modules`` must be the HF-format names (q_proj, gate_proj, ...).
+    config["target_modules"] = target_modules
+    config.setdefault("task_type", "CAUSAL_LM")
+    config.setdefault("inference_mode", True)
+    config.setdefault("auto_mapping", None)
+    config.setdefault("revision", None)
+    config.setdefault("modules_to_save", None)
+
+    config["peft_type"] = "OFT"
+    if "block_size" in config:
+        config["oft_block_size"] = config.pop("block_size")
+    config.setdefault("num_cayley_neumann_terms", 5)
+    config.setdefault("use_cayley_neumann", True)
+    config.setdefault("init_weights", True)
+    config.setdefault("bias", "none")
+    config.setdefault("fan_in_fan_out", False)
+    config.setdefault("layers_pattern", None)
+    config.setdefault("layers_to_transform", None)
+    return config
+
+
+def save_hf_oft_adapter(
+    auto_bridge,
+    model,
+    path,
+    peft_config,
+    base_model_name_or_path: Optional[str] = None,
+    show_progress: bool = True,
+) -> None:
+    """Save OFT adapter weights as a HuggingFace PEFT-compatible directory.
+
+    The output directory contains ``adapter_config.json`` and
+    ``adapter_model.safetensors`` and loads directly with
+    ``peft.PeftModel.from_pretrained(base_model, path)``. Peer of upstream's
+    ``AutoBridge.save_hf_adapter`` (which handles LoRA / DoRA).
+    """
+    import json
+    from pathlib import Path
+
+    import torch.distributed as dist
+    from safetensors.torch import save_file
+
+    is_distributed = dist.is_available() and dist.is_initialized()
+    is_rank0 = (not is_distributed) or dist.get_rank() == 0
+
+    if is_distributed:
+        dist.barrier()
+
+    # The OFT exporter keeps tensors on GPU during the per-rank gather because
+    # it relies on collective broadcasts; non-rank0 ranks must still consume
+    # the generator to participate in the TP/PP/EP collectives.
+    adapter_state: Dict[str, torch.Tensor] = {}
+    for name, tensor in export_oft_adapter_weights(auto_bridge, model, cpu=False, show_progress=show_progress):
+        if is_rank0:
+            adapter_state[f"base_model.model.{name}"] = tensor.detach().cpu()
+
+    if is_rank0:
+        if not adapter_state:
+            raise RuntimeError(
+                "No adapter weights were found on the model. "
+                "Ensure the model has OFT adapters applied before calling save_hf_oft_adapter()."
+            )
+
+        save_dir = Path(path)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        if base_model_name_or_path is None:
+            hf_pretrained = getattr(auto_bridge, "hf_pretrained", None)
+            base_model_name_or_path = str(
+                getattr(hf_pretrained, "model_name_or_path", None) or getattr(hf_pretrained, "name_or_path", "")
+            )
+
+        target_modules = infer_oft_target_modules(adapter_state.keys())
+        adapter_config = build_oft_adapter_config_dict(
+            peft_config,
+            target_modules=target_modules,
+            base_model_name_or_path=base_model_name_or_path,
+        )
+        with open(save_dir / "adapter_config.json", "w") as f:
+            json.dump(adapter_config, f, indent=2, sort_keys=True)
+
+        save_file(adapter_state, str(save_dir / "adapter_model.safetensors"))
+
+    if is_distributed:
+        dist.barrier()

@@ -23,6 +23,8 @@ from megatron.bridge.orbit.low_precision.int4 import dequantize_int4
 from megatron.bridge.models.qwen.qwen3_bridge import Qwen3Bridge
 from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
 
+from megatron.bridge.orbit.model_bridges.qwen3_moe_provider_ext import Qwen3MoEOrbitProviderMixin
+
 logger = logging.getLogger(__name__)
 
 
@@ -85,5 +87,5 @@ class Qwen3INT4Bridge(_Qwen3CompressedTensorsINT4Mixin, Qwen3Bridge):
     """Dense Qwen3 bridge that preserves compressed-tensors INT4 direct writes."""
 
 
-class Qwen3MoEINT4Bridge(_Qwen3CompressedTensorsINT4Mixin, Qwen3MoEBridge):
+class Qwen3MoEINT4Bridge(_Qwen3CompressedTensorsINT4Mixin, Qwen3MoEOrbitProviderMixin, Qwen3MoEBridge):
     """Qwen3 MoE bridge that preserves compressed-tensors INT4 direct writes."""

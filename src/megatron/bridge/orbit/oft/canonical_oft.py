@@ -33,7 +33,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
 )
 
-from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
+from megatron.bridge.orbit.peft_ext.meta_init import to_empty_if_meta_device
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.orbit.oft.oft import _SplitLNOFTLinear
@@ -45,7 +45,9 @@ from megatron.bridge.orbit.oft.oft_layers import (
     _is_direct_fp8_runtime_weight,
     _module_bias_enabled,
 )
-from megatron.bridge.peft.utils import get_adapter_attributes_from_linear, is_expert_linear
+from megatron.bridge.orbit.peft_ext.adapter_attrs import get_oft_adapter_attributes_from_linear
+from megatron.bridge.orbit.peft_ext.peft_mixin import OrbitPEFTMixin
+from megatron.bridge.peft.utils import is_expert_linear
 from megatron.bridge.utils.import_utils import safe_import_from
 
 
@@ -1400,7 +1402,7 @@ class _SplitLNCanonicalOFTFC1(nn.Module):
 
 
 @dataclass
-class CanonicalOFT(PEFT, ModuleMatcher):
+class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
     """OFT with split Q/K/V and split gate/up rotations on fused Megatron linears.
 
     Parallel to ``CanonicalLoRA``: independent rotations are attached to each of
@@ -1522,7 +1524,7 @@ class CanonicalOFT(PEFT, ModuleMatcher):
         model_parallel_config = getattr(module, "config", None)
         if model_parallel_config is not None:
             is_expert = is_expert_linear(full_name)
-            attrs = get_adapter_attributes_from_linear(module, is_expert=is_expert, adapter_type="oft")
+            attrs = get_oft_adapter_attributes_from_linear(module, is_expert=is_expert)
             if attrs.input_is_parallel:
                 if is_expert:
                     tp_size = parallel_state.get_expert_tensor_parallel_world_size()
@@ -1585,7 +1587,7 @@ class CanonicalOFT(PEFT, ModuleMatcher):
 
 
 @dataclass
-class CanonicalOFTMerge(PEFT):
+class CanonicalOFTMerge(OrbitPEFTMixin, PEFT):
     """Folds per-projection R's into the fused W_qkv / W_fc1.
 
     ``split_qkv_weights`` returns a row-gather (built via

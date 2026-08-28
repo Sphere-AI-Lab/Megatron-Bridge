@@ -45,13 +45,15 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.models.conversion.utils import get_module_and_param_from_name
 from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
+
+from megatron.bridge.orbit.model_bridges.qwen3_moe_provider_ext import Qwen3MoEOrbitProviderMixin
 from megatron.bridge.orbit.quant.fp8_utils import merge_gated_mlp_scale_inv, merge_qkv_scale_inv
 from megatron.bridge.utils.common_utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 
 
-class Qwen3MoEFP8Bridge(Qwen3MoEBridge):
+class Qwen3MoEFP8Bridge(Qwen3MoEOrbitProviderMixin, Qwen3MoEBridge):
     """Qwen3 MoE bridge that keeps FP8 weights in FP8 throughout conversion.
 
     The standard bridge dequantises FP8→BF16 because

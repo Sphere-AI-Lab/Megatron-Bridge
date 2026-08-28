@@ -51,7 +51,9 @@ from megatron.bridge.orbit.quant.qwen3_fp8_gemm import (
     maybe_qwen3_native_block_fp8_linear,
     should_attempt_qwen3_native_fp8_gemm,
 )
-from megatron.bridge.peft.utils import get_adapter_attributes_from_linear, is_expert_linear
+from megatron.bridge.orbit.peft_ext.adapter_attrs import get_oft_adapter_attributes_from_linear
+from megatron.bridge.orbit.peft_ext.peft_mixin import OrbitPEFTMixin
+from megatron.bridge.peft.utils import is_expert_linear
 from megatron.bridge.utils.import_utils import safe_import_from
 
 
@@ -468,7 +470,7 @@ class _SplitLNOFTLinear(nn.Module):
 
 
 @dataclass
-class OFT(PEFT, ModuleMatcher):
+class OFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
     """
     Implements OFT (Orthogonal Fine-Tuning) for parameter-efficient fine-tuning.
 
@@ -550,7 +552,7 @@ class OFT(PEFT, ModuleMatcher):
                 )
                 model_parallel_config = getattr(module, "config", None)
                 is_expert = is_expert_linear(full_name)
-                attrs = get_adapter_attributes_from_linear(module, is_expert=is_expert, adapter_type="oft")
+                attrs = get_oft_adapter_attributes_from_linear(module, is_expert=is_expert)
                 assert not attrs.input_is_parallel
 
                 adapter = OFTRotationModule(
@@ -573,7 +575,7 @@ class OFT(PEFT, ModuleMatcher):
             if model_parallel_config is not None:
                 # Megatron parallel linear — use get_adapter_attributes_from_linear
                 is_expert = is_expert_linear(full_name)
-                attrs = get_adapter_attributes_from_linear(module, is_expert=is_expert, adapter_type="oft")
+                attrs = get_oft_adapter_attributes_from_linear(module, is_expert=is_expert)
 
                 # attrs.in_features is the FULL (un-sharded) dimension.
                 # For RowParallel (input_is_parallel), the rotation operates on
@@ -660,7 +662,7 @@ class VLMOFT(OFT):
 
 
 @dataclass
-class OFTMerge(PEFT):
+class OFTMerge(OrbitPEFTMixin, PEFT):
     """
     Merges the learned OFT rotation into the base weight: W_merged = W @ R.
 

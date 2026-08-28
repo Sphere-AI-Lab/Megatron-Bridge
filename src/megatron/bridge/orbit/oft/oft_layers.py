@@ -32,7 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from megatron.core import parallel_state
 
-from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
+from megatron.bridge.orbit.peft_ext.meta_init import to_empty_if_meta_device
 
 
 logger = logging.getLogger(__name__)
