@@ -239,23 +239,54 @@ def apply_modelopt_nvfp4_to_meta_model(
 
     quant_cfg = deepcopy(mtq.NVFP4_DEFAULT_CFG)
     if module_names is not None:
-        quant_cfg["quant_cfg"] = quant_cfg.get("quant_cfg", {}).copy()
-        enabled_weight_cfg = deepcopy(
-            quant_cfg["quant_cfg"].get("*weight_quantizer", {"enable": True})
-        )
-        enabled_input_cfg = deepcopy(
-            quant_cfg["quant_cfg"].get("*input_quantizer", {"enable": True})
-        )
-        quant_cfg["quant_cfg"]["*weight_quantizer"] = {"enable": False}
-        quant_cfg["quant_cfg"]["*input_quantizer"] = {"enable": False}
+        rules = quant_cfg.get("quant_cfg", {})
+        if isinstance(rules, list):
+            # modelopt >= 0.44 ships quant_cfg as an ordered rule list where a
+            # later match overrides an earlier one. Capture the default
+            # weight/input quantizer payloads, replace the wildcard rules with
+            # disables, and append per-module enables at the tail so only the
+            # requested modules are quantized (same effective config as the
+            # dict path below produced on older modelopt).
+            enabled_weight_cfg = {"enable": True}
+            enabled_input_cfg = {"enable": True}
+            kept_rules = []
+            for rule in rules:
+                name = rule.get("quantizer_name")
+                if name == "*weight_quantizer":
+                    enabled_weight_cfg = deepcopy(rule.get("cfg", enabled_weight_cfg))
+                    continue
+                if name == "*input_quantizer":
+                    enabled_input_cfg = deepcopy(rule.get("cfg", enabled_input_cfg))
+                    continue
+                kept_rules.append(deepcopy(rule))
+            kept_rules.append({"quantizer_name": "*weight_quantizer", "enable": False})
+            kept_rules.append({"quantizer_name": "*input_quantizer", "enable": False})
+            for module_name in sorted(set(module_names)):
+                kept_rules.append(
+                    {"quantizer_name": f"{module_name}.weight_quantizer", "cfg": deepcopy(enabled_weight_cfg)}
+                )
+                kept_rules.append(
+                    {"quantizer_name": f"{module_name}.input_quantizer", "cfg": deepcopy(enabled_input_cfg)}
+                )
+            quant_cfg["quant_cfg"] = kept_rules
+        else:
+            quant_cfg["quant_cfg"] = rules.copy()
+            enabled_weight_cfg = deepcopy(
+                quant_cfg["quant_cfg"].get("*weight_quantizer", {"enable": True})
+            )
+            enabled_input_cfg = deepcopy(
+                quant_cfg["quant_cfg"].get("*input_quantizer", {"enable": True})
+            )
+            quant_cfg["quant_cfg"]["*weight_quantizer"] = {"enable": False}
+            quant_cfg["quant_cfg"]["*input_quantizer"] = {"enable": False}
 
-        for module_name in sorted(set(module_names)):
-            quant_cfg["quant_cfg"][f"{module_name}.weight_quantizer"] = deepcopy(
-                enabled_weight_cfg
-            )
-            quant_cfg["quant_cfg"][f"{module_name}.input_quantizer"] = deepcopy(
-                enabled_input_cfg
-            )
+            for module_name in sorted(set(module_names)):
+                quant_cfg["quant_cfg"][f"{module_name}.weight_quantizer"] = deepcopy(
+                    enabled_weight_cfg
+                )
+                quant_cfg["quant_cfg"][f"{module_name}.input_quantizer"] = deepcopy(
+                    enabled_input_cfg
+                )
 
     def _noop_forward_loop(_m):
         return None
