@@ -77,12 +77,8 @@ custom pipeline layout / callbacks. Each pairs with an entrypoint under `scripts
 | `run_qoft_finetune_kimi_k25_int4.sh` | Kimi-K2.5 | INT4 | 8 · TP=2 EP=4 PP=1 |
 | `run_qoft_finetune_kimi_k25_nvfp4.sh` | Kimi-K2.5 | NVFP4 | 8 · TP=1 EP=8 |
 | `run_qoft_finetune_moonlight_16b_int4.sh` | Moonlight-16B-A3B | INT4 | 1 · TP=1 EP=1 PP=1 |
-| `run_qoft_finetune_qwen3_14b_nvfp4.sh` | Qwen3-14B (dense) | NVFP4 | 8 · TP=4 PP=2 |
-| `run_qoft_finetune_qwen3_30b_a3b_nvfp4.sh` | Qwen3-30B-A3B | NVFP4 | 8 · TP=1 EP=8 PP=1 |
 | `run_qoft_finetune_qwen3_moe_fp8.sh` | Qwen3-30B-A3B | FP8 | 4 · TP=2 EP=2 |
 | `run_qoft_finetune_qwen3_moe_int4.sh` | Qwen3-30B-A3B | INT4 W4A16 | 4 · TP=2 EP=2 PP=1 |
-| `run_oft_finetune_moe.sh` | Qwen3-30B-A3B | **BF16** | 4×B200 · TP=2 EP=2 |
-| `run_oft_finetune_qwen3_moe.sh` | Qwen3-30B-A3B | **FP8** | 4×B200 · TP=2 EP=2 |
 
 The last two differ only in precision (BF16 vs FP8) despite their names suggesting different
 models — `run_peft_finetune.sh` with `QUANT=none` / `QUANT=fp8` now covers the same ground.
@@ -118,10 +114,6 @@ bash scripts/orbit/compare_converted_model_metadata.sh <hf_model> <megatron_path
 ```
 
 NVFP4 and FP8 use the corresponding `scripts/orbit/conversion/convert_{nvfp4,fp8}_checkpoint*.py`.
-
-> Several script headers still tell you to run `convert_int4_checkpoint_direct.sh` or
-> `convert_nvfp4_checkpoint_direct.sh`. **Those shell wrappers do not exist** — use the `.py`
-> files in `scripts/orbit/conversion/` directly, as shown above.
 
 ### Verified conversion examples
 

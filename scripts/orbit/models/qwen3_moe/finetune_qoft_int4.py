@@ -96,7 +96,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--pretrained-checkpoint",
         type=str,
         required=True,
-        help="Path to INT4 Megatron checkpoint from convert_int4_checkpoint_direct.sh",
+        help="Path to INT4 Megatron checkpoint from convert_int4_checkpoint_direct.py",
     )
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--ep", type=int, default=2)

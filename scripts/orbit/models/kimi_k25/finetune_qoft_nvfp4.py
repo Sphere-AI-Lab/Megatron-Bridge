@@ -33,9 +33,9 @@ the quantized layers — no INT4-style sharded-state-dict monkey-patching.
 Prerequisites:
     Convert the HF NVFP4 checkpoint to Megatron format:
 
-        bash convert_nvfp4_checkpoint_direct.sh \\
-            ${HF_MODEL_ROOT:-${HOME}/hf_models}/Kimi-K2.5-NVFP4 \\
-            ./checkpoints/Kimi-K2.5-NVFP4
+        python scripts/orbit/conversion/convert_nvfp4_checkpoint_direct.py \\
+            --hf-model-path ${HF_MODEL_ROOT:-${HOME}/hf_models}/Kimi-K2.5-NVFP4 \\
+            --megatron-path ./checkpoints/Kimi-K2.5-NVFP4
 
 Usage:
     torchrun --nproc_per_node=8 scripts/orbit/models/kimi_k25/finetune_qoft_nvfp4.py \\
@@ -404,7 +404,7 @@ def parse_args() -> argparse.Namespace:
         "--pretrained-checkpoint",
         type=str,
         required=True,
-        help="Path to NVFP4 Megatron checkpoint (converted via convert_nvfp4_checkpoint_direct.sh)",
+        help="Path to NVFP4 Megatron checkpoint (converted via convert_nvfp4_checkpoint_direct.py)",
     )
     parser.add_argument("--hf-model-path", type=str, default="moonshotai/Kimi-K2.5",
                         help="HF model path for config/tokenizer")

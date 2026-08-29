@@ -20,7 +20,8 @@ Expected flow:
     1. Quantize BF16 HF experts to Kimi-style INT4 triplets:
          python scripts/orbit/conversion/quantize_to_int4.py --input ... --output ...
     2. Convert HF INT4 checkpoint to Megatron INT4:
-         bash convert_int4_checkpoint_direct.sh /path/to/Moonlight-16B-A3B-INT4 ...
+         python scripts/orbit/conversion/convert_int4_checkpoint_direct.py \
+             --hf-model-path /path/to/Moonlight-16B-A3B-INT4 --megatron-path ...
     3. Finetune with this script:
          torchrun --nproc_per_node=2 scripts/orbit/models/moonlight_16b/finetune_qoft_int4.py \
              --pretrained-checkpoint ./checkpoints/Moonlight-16B-A3B-INT4 \

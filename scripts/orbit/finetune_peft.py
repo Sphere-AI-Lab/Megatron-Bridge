@@ -47,10 +47,9 @@ from megatron.bridge.training.mixed_precision import get_mixed_precision_config
 
 
 # Quantization presets. Each entry is applied on top of the _peft_common base.
-# Settings are taken from the per-model entrypoints they replace, not invented:
-#   fp8    <- scripts/orbit/models/qwen3_moe/finetune_oft_fp8.py
-#   nvfp4  <- scripts/orbit/models/qwen3_14b/finetune_qoft_nvfp4.py
-#             scripts/orbit/models/qwen3_moe/finetune_qoft_nvfp4.py
+# Settings were taken verbatim from the per-model entrypoints these presets
+# retired (qwen3_moe finetune_oft_fp8, qwen3_14b/qwen3_moe finetune_qoft_nvfp4),
+# not invented.
 QUANT_PRESETS: dict[str, dict] = {
     "none": {
         "mixed_precision": None,

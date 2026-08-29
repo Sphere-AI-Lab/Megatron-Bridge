@@ -3,9 +3,9 @@
 #
 # NVFP4 sibling of run_qoft_finetune_kimi_k25_int4.sh. Two steps:
 #   1. Convert HF NVFP4 checkpoint to Megatron format:
-#        bash convert_nvfp4_checkpoint_direct.sh \
-#            ${HF_MODEL_ROOT:-${HOME}/hf_models}/Kimi-K2.5-NVFP4 \
-#            ./checkpoints/Kimi-K2.5-NVFP4
+#        python scripts/orbit/conversion/convert_nvfp4_checkpoint_direct.py \
+#            --hf-model-path ${HF_MODEL_ROOT:-${HOME}/hf_models}/Kimi-K2.5-NVFP4 \
+#            --megatron-path ./checkpoints/Kimi-K2.5-NVFP4
 #
 #   2. Finetune (this script):
 #        bash run_qoft_finetune_kimi_k25_nvfp4.sh

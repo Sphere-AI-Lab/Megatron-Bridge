@@ -3,9 +3,9 @@
 #
 # Two steps:
 #   1. Convert HF INT4 checkpoint to Megatron format:
-#        bash convert_int4_checkpoint_direct.sh \
-#            /path/to/Kimi-K2.5 \
-#            ./checkpoints/Kimi-K2.5-INT4
+#        python scripts/orbit/conversion/convert_int4_checkpoint_direct.py \
+#            --hf-model-path /path/to/Kimi-K2.5 \
+#            --megatron-path ./checkpoints/Kimi-K2.5-INT4
 #
 #   2. Finetune (this script):
 #        bash run_qoft_finetune_kimi_k25_int4.sh
