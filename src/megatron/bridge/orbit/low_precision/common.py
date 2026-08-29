@@ -168,6 +168,13 @@ def build_single_rank_meta_provider(
         if hasattr(provider, attr):
             setattr(provider, attr, value)
 
+    # Conversion meta models never route tokens, but the Kimi / DeepSeek-v4
+    # bridges default to the flex dispatcher, whose _HybridEPManager imports
+    # the optional HybridEP package at layer-build time. Downgrade to the
+    # plain alltoall dispatcher so direct conversion does not depend on it.
+    if getattr(provider, "moe_token_dispatcher_type", None) == "flex":
+        provider.moe_token_dispatcher_type = "alltoall"
+
     return auto_bridge, provider
 
 
