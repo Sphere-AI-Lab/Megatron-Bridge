@@ -9,7 +9,7 @@ Non-expert weights (attention, norms, embeddings, shared experts, dense layers)
 stay in BF16.
 
 Usage:
-    python examples/conversion/quantize_to_int4.py \
+    python scripts/orbit/conversion/quantize_to_int4.py \
         --input /path/to/Moonlight-16B-A3B \
         --output /path/to/Moonlight-16B-A3B-INT4
 """
@@ -25,7 +25,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from megatron.bridge.orbit.low_precision.int4 import quantize_to_int4
 
 

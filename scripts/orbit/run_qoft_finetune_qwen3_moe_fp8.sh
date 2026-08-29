@@ -3,7 +3,7 @@
 #
 # Two steps:
 #   1. Convert HF FP8 checkpoint to Megatron format (preserving FP8):
-#        python examples/conversion/convert_fp8_checkpoint.py \
+#        python scripts/orbit/conversion/convert_fp8_checkpoint.py \
 #            --hf-model-path $HF_MODEL_PATH \
 #            --megatron-path $MEGATRON_CKPT
 #

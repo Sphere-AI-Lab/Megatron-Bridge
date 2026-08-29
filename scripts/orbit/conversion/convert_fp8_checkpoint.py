@@ -23,7 +23,7 @@ through QKV merge and TP split unchanged.  Block-wise ``weight_scale_inv``
 tensors are transformed in parallel and stored as module buffers.
 
 Usage:
-    python examples/conversion/convert_fp8_checkpoint.py \\
+    python scripts/orbit/conversion/convert_fp8_checkpoint.py \\
         --hf-model-path /path/to/Qwen3-30B-A3B-FP8 \\
         --megatron-path ./checkpoints/Qwen3-30B-A3B-FP8
 

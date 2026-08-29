@@ -49,7 +49,7 @@ echo "Input:  ${INPUT}"
 echo "Output: ${OUTPUT}"
 echo "======================================"
 
-python examples/conversion/quantize_to_int4.py \
+python scripts/orbit/conversion/quantize_to_int4.py \
     --input "${INPUT}" \
     --output "${OUTPUT}"
 

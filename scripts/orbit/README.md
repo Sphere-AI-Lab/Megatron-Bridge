@@ -109,18 +109,18 @@ Finetuning expects a **Megatron** checkpoint. Typical flow from a BF16 HF model:
 bash scripts/orbit/quantize_to_int4.sh <input_model> [output_model]
 
 # 2. Convert the HF checkpoint to Megatron.
-python examples/conversion/convert_int4_checkpoint_direct.py \
+python scripts/orbit/conversion/convert_int4_checkpoint_direct.py \
     --hf-model-path <hf_int4_model> --megatron-path ./checkpoints/<name>
 
 # 3. Verify the conversion round-tripped.
 bash scripts/orbit/compare_converted_model_metadata.sh <hf_model> <megatron_path>
 ```
 
-NVFP4 and FP8 use the corresponding `examples/conversion/convert_{nvfp4,fp8}_checkpoint*.py`.
+NVFP4 and FP8 use the corresponding `scripts/orbit/conversion/convert_{nvfp4,fp8}_checkpoint*.py`.
 
 > Several script headers still tell you to run `convert_int4_checkpoint_direct.sh` or
 > `convert_nvfp4_checkpoint_direct.sh`. **Those shell wrappers do not exist** — use the `.py`
-> files in `examples/conversion/` directly, as shown above.
+> files in `scripts/orbit/conversion/` directly, as shown above.
 
 | Utility | Arguments | Purpose |
 |---|---|---|

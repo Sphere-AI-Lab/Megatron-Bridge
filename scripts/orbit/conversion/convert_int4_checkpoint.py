@@ -24,11 +24,11 @@ Expert weights are dequantised to BF16 for QKV merge / TP split, then
 re-quantised to INT4 before saving.  Non-expert weights stay in BF16.
 
 Usage:
-    python examples/conversion/convert_int4_checkpoint.py \\
+    python scripts/orbit/conversion/convert_int4_checkpoint.py \\
         --hf-model-path /path/to/Moonlight-16B-A3B-INT4 \\
         --megatron-path ./checkpoints/Moonlight-16B-A3B-INT4
 
-    python examples/conversion/convert_int4_checkpoint.py \\
+    python scripts/orbit/conversion/convert_int4_checkpoint.py \\
         --hf-model-path /path/to/Kimi-K2.5 \\
         --megatron-path ./checkpoints/Kimi-K2.5-INT4
 """

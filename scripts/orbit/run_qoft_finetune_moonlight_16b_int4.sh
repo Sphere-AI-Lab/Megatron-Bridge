@@ -7,7 +7,7 @@
 #            "${HF_MODEL_ROOT:-${HOME}/hf_models}/Moonlight-16B-A3B" \
 #            "${HF_MODEL_ROOT:-${HOME}/hf_models}/Moonlight-16B-A3B-INT4"
 #   2. Convert HF INT4 checkpoint to Megatron INT4:
-#        uv run python examples/conversion/convert_int4_checkpoint_direct.py \
+#        uv run python scripts/orbit/conversion/convert_int4_checkpoint_direct.py \
 #            --hf-model-path \
 #            "${HF_MODEL_ROOT:-${HOME}/hf_models}/Moonlight-16B-A3B-INT4" \
 #            --megatron-path \

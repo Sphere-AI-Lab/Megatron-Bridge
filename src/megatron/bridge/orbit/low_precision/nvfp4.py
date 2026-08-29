@@ -348,7 +348,7 @@ def scale_to_amax(scale: torch.Tensor) -> torch.Tensor:
     """Convert ModelOpt NVFP4 scaling factor back to the stored amax value.
 
     The post-``mtq.compress`` buffer dtype is ``float32`` (verified by
-    ``examples/conversion/dump_nvfp4_meta_keys.py --probe-compress``). Casting
+    ``scripts/orbit/conversion/dump_nvfp4_meta_keys.py --probe-compress``). Casting
     to bfloat16 here would drop ~8 mantissa bits from a scalar that the quant
     kernel multiplies through every 16-element block on dequant.
     """

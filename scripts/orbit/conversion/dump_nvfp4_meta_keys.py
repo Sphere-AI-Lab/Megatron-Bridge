@@ -177,7 +177,7 @@ def main() -> int:
         if output_path is None:
             model_tag = Path(args.hf_model_path).name or "model"
             filter_tag = re.sub(r"[^a-zA-Z0-9]+", "_", args.layer_match).strip("_") or "all"
-            repo_root = Path(__file__).resolve().parents[2]
+            repo_root = Path(__file__).resolve().parents[3]
             output_path = str(repo_root / f"nvfp4_meta_keys_{model_tag}_{filter_tag}.log")
         output_path = str(Path(output_path).resolve())
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -346,7 +346,7 @@ def _probe_compress_standalone() -> int:
     """
     import modelopt.torch.quantization as mtq
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     output_path = str(repo_root / "nvfp4_probe_compress.log")
     log = open(output_path, "w")
 
@@ -416,7 +416,7 @@ def _probe_roundtrip_standalone() -> int:
     """
     import modelopt.torch.quantization as mtq
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     output_path = str(repo_root / "nvfp4_probe_roundtrip.log")
     log = open(output_path, "w")
 

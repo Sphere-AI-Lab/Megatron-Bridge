@@ -33,7 +33,7 @@ if [ $# -lt 2 ]; then
     echo "  hf_model       Path to the source HuggingFace checkpoint"
     echo "  megatron_path  Path to the converted Megatron checkpoint directory"
     echo ""
-    echo "Extra args are forwarded to examples/conversion/compare_model_metadata.py"
+    echo "Extra args are forwarded to scripts/orbit/conversion/compare_model_metadata.py"
     exit 1
 fi
 
@@ -48,7 +48,7 @@ echo "Source HF model:      ${HF_MODEL}"
 echo "Megatron checkpoint:  ${MEGATRON_PATH}"
 echo "=============================================="
 
-uv run --project "${UV_PROJECT}" python examples/conversion/compare_model_metadata.py \
+uv run --project "${UV_PROJECT}" python scripts/orbit/conversion/compare_model_metadata.py \
     --hf-model-path "${HF_MODEL}" \
     --megatron-path "${MEGATRON_PATH}" \
     "$@"

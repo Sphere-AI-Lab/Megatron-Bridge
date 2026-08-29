@@ -28,21 +28,21 @@ and rollout layout (DP attention with experts EP-partitioned across 8 ranks).
 Usage:
 
     uv run python -m torch.distributed.run --nproc_per_node=8 \\
-        examples/conversion/convert_nvfp4_checkpoint_direct_multigpu.py \\
+        scripts/orbit/conversion/convert_nvfp4_checkpoint_direct_multigpu.py \\
         --hf-model-path /path/to/Kimi-K2.5-NVFP4 \\
         --megatron-path /path/to/output \\
         --tp 1 --ep 8
 
     # Mixed TP and EP (e.g. 4-way TP attention, 2-way EP experts on 8 GPUs)
     uv run python -m torch.distributed.run --nproc_per_node=8 \\
-        examples/conversion/convert_nvfp4_checkpoint_direct_multigpu.py \\
+        scripts/orbit/conversion/convert_nvfp4_checkpoint_direct_multigpu.py \\
         --hf-model-path /path/to/Kimi-K2.5-NVFP4 \\
         --megatron-path /path/to/output \\
         --tp 4 --ep 2
 
     # Multi-node via Slurm srun
     srun --ntasks-per-node=8 ... python \\
-        examples/conversion/convert_nvfp4_checkpoint_direct_multigpu.py \\
+        scripts/orbit/conversion/convert_nvfp4_checkpoint_direct_multigpu.py \\
         --hf-model-path /path/to/Kimi-K2.5-NVFP4 \\
         --megatron-path /path/to/output \\
         --tp 1 --ep 8
