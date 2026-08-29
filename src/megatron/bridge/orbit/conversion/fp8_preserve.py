@@ -29,6 +29,24 @@ buffers on the owning module.
 
 Nothing in this module is model-specific; it composes with any registered
 bridge (mixin-first MRO) via the shared factories.
+
+Why preserve instead of dequantize (format rationale):
+    Block-FP8 stores one ``float8_e4m3fn`` byte per weight element — the
+    tensor is element-addressable, so ``cat`` / ``chunk`` / interleave run
+    directly on the stored bytes, and the per-``[128, 128]``-block
+    ``scale_inv`` tensors follow their rows/columns through the same cuts.
+    Dequantizing here would only cost:
+
+    1. memory — a BF16 intermediate of the whole model is exactly what
+       this path exists to avoid;
+    2. fidelity — re-quantizing after the merge recomputes block scales,
+       producing a re-encoded model rather than the published bytes;
+    3. novelty — FP8 -> BF16 dequant is already the upstream default load
+       behavior, which this mixin exists to escape.
+
+    Contrast with the packed formats (compressed-tensors INT4, ModelOpt
+    NVFP4): those are not element-addressable and must pass through a BF16
+    transit form — see ``compressed_tensors_int4`` and ``modelopt_nvfp4``.
 """
 
 import contextlib

@@ -37,6 +37,23 @@ Dequantization uses upstream's pure-torch
 which runs on CPU and CUDA and derives the group count from the scale shape,
 so Kimi-native (group 32) and W4A16 (group 128) checkpoints both work
 without configuration.
+
+Why dequantize (format rationale):
+    Packed formats are not element-addressable: every int32 stores eight
+    4-bit weights along the input dimension, and Q/K/V each carry their own
+    per-group scales. Conversion must run tensor surgery — head-interleaved
+    QKV merge, gate/up concat, TP chunking — and none of those operations
+    are defined on packed storage without re-implementing them in "packed
+    space" while keeping the 8-per-int32 packing and the scale-group
+    boundaries aligned through every cut. BF16 is therefore used as a
+    *transit* representation: dequantize one weight at a time, run the
+    standard dtype-agnostic mapping machinery unchanged, and re-quantize
+    afterwards wherever INT4 is to be kept (see DeepSeekV3INT4Bridge's
+    expert requantize and the direct-save builders). Symmetric INT4 values
+    sit exactly on their scale grid, so the dequant -> requant round trip
+    is stable. Contrast with block-FP8 (one byte per element), where the
+    surgery runs natively on the stored bytes and orbit preserves instead —
+    see ``fp8_preserve``.
 """
 
 import logging

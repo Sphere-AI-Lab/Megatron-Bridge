@@ -25,6 +25,16 @@ through upstream's public ``maybe_modify_loaded_hf_weight`` hook and defers
 every other key to the next hook in the MRO — so it composes with any
 registered bridge and stacks over bridges that do their own load handling
 (e.g. Kimi-K2.5's built-in INT4 path).
+
+Why dequantize (format rationale):
+    Same reason as compressed-tensors INT4: the storage is packed — two
+    e2m1 values per uint8, plus per-16-element block scales and a global
+    scale — so one stored element is not one weight, and the conversion
+    surgery (QKV merge, gate/up concat, TP chunking) is undefined on it.
+    BF16 is the transit representation; the quantized form is restored on
+    emit (see KimiK25VLNVFP4Bridge) or by the direct NVFP4 save machinery.
+    See ``fp8_preserve`` for the contrasting byte-per-element case where
+    preserving through conversion is possible.
 """
 
 import logging
