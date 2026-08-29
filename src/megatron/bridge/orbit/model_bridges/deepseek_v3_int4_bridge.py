@@ -41,6 +41,12 @@ import torch.nn as nn
 from megatron.bridge.models.conversion.quantization_utils import quantize_to_int4
 from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
 from megatron.bridge.orbit.conversion.compressed_tensors_int4 import CompressedTensorsINT4DequantMixin
+from megatron.bridge.orbit.low_precision.int4 import (
+    _convert_hf_int4_triplet_for_direct_save,
+    _load_hf_int4_triplets,
+    hf_param_uses_int4,
+    requantize_int4_with_scales,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -61,14 +67,43 @@ class DeepSeekV3INT4Bridge(CompressedTensorsINT4DequantMixin, DeepSeekV3Bridge):
     ):
         """Load weights normally (with INT4 dequant), then re-quantise experts."""
         result = super().load_weights_hf_to_megatron(hf_pretrained, megatron_model, allowed_mismatched_params)
-        # Re-quantise expert linear weights to INT4.
+        # Re-quantise expert linear weights to INT4, reusing the checkpoint's
+        # own per-group scales so the integers round back bitwise.
         models = megatron_model if isinstance(megatron_model, list) else [megatron_model]
+        source_scales = self._collect_source_scales(hf_pretrained, models)
         for model in models:
-            self._requantize_experts_int4(model)
+            self._requantize_experts_int4(model, source_scales=source_scales)
         return result
 
+    def _collect_source_scales(self, hf_pretrained, megatron_model: list) -> dict[str, torch.Tensor]:
+        """Map Megatron param names to their merged SOURCE scale tensors.
+
+        Recomputing scales as ``amax / 7`` re-grids every group whose source
+        used the valid INT4 value ``-8`` (``quantize_to_int4`` can never emit
+        it). Reusing the checkpoint's scales keeps re-quantization bitwise.
+        Rows are merged in the same order as the weights via the
+        triplet-preserving direct-save converter.
+        """
+        hf_state_dict = hf_pretrained.state
+        scales: dict[str, torch.Tensor] = {}
+        for task in self.build_conversion_tasks(hf_pretrained, megatron_model):
+            if task is None or task.megatron_module is None:
+                continue
+            if not hf_param_uses_int4(task.mapping.hf_param, hf_state_dict):
+                continue
+            triplets = _load_hf_int4_triplets(task.mapping.hf_param, hf_state_dict)
+            merged = _convert_hf_int4_triplet_for_direct_save(task, triplets)
+            if merged is not None:
+                scales[task.param_name] = merged.scale
+        return scales
+
     @torch.no_grad()
-    def _requantize_experts_int4(self, model: nn.Module, group_size: int = 32):
+    def _requantize_experts_int4(
+        self,
+        model: nn.Module,
+        group_size: int = 32,
+        source_scales: dict[str, torch.Tensor] | None = None,
+    ):
         """Walk the model and re-quantise expert weights BF16 -> INT4.
 
         For each expert linear (grouped or regular), replace the BF16 weight
@@ -88,7 +123,13 @@ class DeepSeekV3INT4Bridge(CompressedTensorsINT4DequantMixin, DeepSeekV3Bridge):
                     w_data = w.data if isinstance(w, nn.Parameter) else w
                     if w_data.ndim != 2:
                         continue
-                    saved = self._quantize_one_weight(module, w_name, w_data, group_size)
+                    saved = self._quantize_one_weight(
+                        module,
+                        w_name,
+                        w_data,
+                        group_size,
+                        source_scale=(source_scales or {}).get(f"{name}.{w_name}"),
+                    )
                     total_saved += saved
                 continue
 
@@ -100,16 +141,37 @@ class DeepSeekV3INT4Bridge(CompressedTensorsINT4DequantMixin, DeepSeekV3Bridge):
                 continue
             if w.dtype != torch.bfloat16 or w.ndim != 2:
                 continue
-            saved = self._quantize_one_weight(module, "weight", w.data, group_size)
+            saved = self._quantize_one_weight(
+                module,
+                "weight",
+                w.data,
+                group_size,
+                source_scale=(source_scales or {}).get(f"{name}.weight"),
+            )
             total_saved += saved
 
         logger.info("Re-quantised experts to INT4, saved %.1f GB", total_saved / 1e9)
 
-    def _quantize_one_weight(self, module: nn.Module, weight_name: str, w_data: torch.Tensor, group_size: int) -> int:
+    def _quantize_one_weight(
+        self,
+        module: nn.Module,
+        weight_name: str,
+        w_data: torch.Tensor,
+        group_size: int,
+        source_scale: torch.Tensor | None = None,
+    ) -> int:
         """Quantise one weight to INT4 and register buffers on the module."""
         bf16_bytes = w_data.numel() * w_data.element_size()
 
-        packed, scale, shape = quantize_to_int4(w_data, group_size=group_size)
+        if source_scale is not None:
+            packed, scale, shape = requantize_int4_with_scales(w_data, source_scale.to(w_data.device))
+        else:
+            logger.warning(
+                "No source scales for %s; re-quantizing with recomputed amax/7 scales "
+                "(groups whose source used -8 will be re-gridded)",
+                weight_name,
+            )
+            packed, scale, shape = quantize_to_int4(w_data, group_size=group_size)
 
         # Register INT4 tensors as persistent buffers (saved by dist_checkpointing).
         module.register_buffer(f"{weight_name}_packed", packed, persistent=True)

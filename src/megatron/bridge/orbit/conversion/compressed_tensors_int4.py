@@ -48,10 +48,14 @@ Why dequantize (format rationale):
     boundaries aligned through every cut. BF16 is therefore used as a
     *transit* representation: dequantize one weight at a time, run the
     standard dtype-agnostic mapping machinery unchanged, and re-quantize
-    afterwards wherever INT4 is to be kept (see DeepSeekV3INT4Bridge's
-    expert requantize and the direct-save builders). Symmetric INT4 values
-    sit exactly on their scale grid, so the dequant -> requant round trip
-    is stable. Contrast with block-FP8 (one byte per element), where the
+    afterwards wherever INT4 is to be kept. The BF16 transit itself is
+    exact, but re-quantization is only bitwise when the SOURCE scales are
+    reused: real checkpoints use the full signed range including -8, which
+    an amax/7 scale recomputation can never reproduce (it re-grids those
+    groups). The direct-save builder therefore preserves triplets outright,
+    and DeepSeekV3INT4Bridge's expert requantize reuses the source scales
+    (``requantize_int4_with_scales``). Contrast with block-FP8 (one byte
+    per element), where the
     surgery runs natively on the stored bytes and orbit preserves instead —
     see ``fp8_preserve``.
 """

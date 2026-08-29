@@ -49,6 +49,7 @@ __all__ = [
     "dequantize_int4",
     "hf_param_uses_int4",
     "quantize_to_int4",
+    "requantize_int4_with_scales",
     "register_int4_buffers_after_load_dense",
     "transform_sharded_state_dict_for_int4_dense",
 ]
@@ -144,6 +145,54 @@ def quantize_to_int4(
         packed |= (w_q_grouped[:, :, i] & 0xF) << (i * 4)
 
     return packed, scale.to(scale_dtype), weight_shape
+
+
+def requantize_int4_with_scales(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Re-quantize a dequantized weight onto its ORIGINAL per-group grid.
+
+    ``quantize_to_int4`` derives fresh scales as ``amax / 7`` and therefore can
+    never emit ``-8`` — a valid INT4 value that real compressed-tensors
+    checkpoints use (30% of groups in the nm-testing Llama W4A16 model carry a
+    ``-8`` group minimum). Re-quantizing such data with recomputed scales
+    re-grids those groups. This variant reuses the source ``scale`` tensor, so
+    values that came from ``dequantize_int4(packed, scale, ...)`` round back to
+    their original integers bitwise (the BF16 transit error is far below half
+    a grid step).
+
+    Args:
+        weight: Dequantized values, ``[out_features, in_features]``.
+        scale: The ORIGINAL per-group scales, ``[out_features, num_groups]``
+            (rows aligned with ``weight`` rows).
+
+    Returns:
+        ``(weight_packed, weight_scale, weight_shape)`` in the same packed
+        layout ``quantize_to_int4`` produces; ``weight_scale`` is the input
+        ``scale`` unchanged.
+    """
+    out_features, in_features = weight.shape
+    if scale.dim() != 2 or scale.shape[0] != out_features or in_features % scale.shape[1] != 0:
+        raise ValueError(
+            f"scale shape {tuple(scale.shape)} does not tile weight shape {tuple(weight.shape)}"
+        )
+    num_groups = scale.shape[1]
+    group_size = in_features // num_groups
+    weight_shape = torch.tensor([out_features, in_features], dtype=torch.int32)
+
+    w_grouped = weight.float().view(out_features, num_groups, group_size)
+    s = scale.float().clamp(min=1e-10).unsqueeze(-1)
+    w_q = torch.round(w_grouped / s).clamp(-8, 7).view(out_features, -1)
+    w_q = (w_q + 8).to(torch.uint8)
+
+    assert in_features % 8 == 0, f"in_features must be divisible by 8, got {in_features}"
+    w_q_grouped = w_q.view(out_features, in_features // 8, 8).to(torch.int32)
+    packed = torch.zeros(out_features, in_features // 8, dtype=torch.int32, device=weight.device)
+    for i in range(8):
+        packed |= (w_q_grouped[:, :, i] & 0xF) << (i * 4)
+
+    return packed, scale, weight_shape
 
 
 def hf_weight_has_int4_triplet(
