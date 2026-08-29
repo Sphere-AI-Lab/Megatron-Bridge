@@ -123,6 +123,54 @@ NVFP4 and FP8 use the corresponding `scripts/orbit/conversion/convert_{nvfp4,fp8
 > `convert_nvfp4_checkpoint_direct.sh`. **Those shell wrappers do not exist** — use the `.py`
 > files in `scripts/orbit/conversion/` directly, as shown above.
 
+### Verified conversion examples
+
+All commands run from the repository root; each was exercised end-to-end on a real
+checkpoint (single GPU). `MODELS` stands for your HF model root, e.g.
+`${HF_MODEL_ROOT:-$HOME/hf_models}`.
+
+```bash
+# FP8 (e.g. Qwen/Qwen3-30B-A3B-FP8). Streaming direct writer:
+python scripts/orbit/conversion/convert_fp8_checkpoint_direct.py     --hf-model-path $MODELS/Qwen3-30B-A3B-FP8     --megatron-path ./checkpoints/Qwen3-30B-A3B-FP8-mcore
+# Full variant (instantiates the BF16 model; needs model-sized RAM):
+python scripts/orbit/conversion/convert_fp8_checkpoint.py     --hf-model-path $MODELS/Qwen3-30B-A3B-FP8     --megatron-path ./checkpoints/Qwen3-30B-A3B-FP8-mcore-full
+
+# NVFP4 (a ModelOpt NVFP4 export, e.g. nvidia/Qwen3-30B-A3B-NVFP4):
+python scripts/orbit/conversion/convert_nvfp4_checkpoint_direct.py     --hf-model-path $MODELS/Qwen3-30B-A3B-NVFP4     --megatron-path ./checkpoints/Qwen3-30B-A3B-NVFP4-mcore
+# Inspect the ModelOpt quantizer/meta keys of such a bundle:
+python scripts/orbit/conversion/dump_nvfp4_meta_keys.py     --hf-model-path $MODELS/Qwen3-30B-A3B-NVFP4
+
+# INT4 from a BF16 model (e.g. Moonlight-16B-A3B): quantize, then convert.
+bash scripts/orbit/quantize_to_int4.sh $MODELS/Moonlight-16B-A3B $MODELS/Moonlight-16B-A3B-INT4
+python scripts/orbit/conversion/convert_int4_checkpoint_direct.py     --hf-model-path $MODELS/Moonlight-16B-A3B-INT4     --megatron-path ./checkpoints/Moonlight-16B-A3B-INT4-mcore
+
+# Native-INT4 releases (Kimi-K2.5 / Kimi-K2.7 ship INT4 triplets already):
+python scripts/orbit/conversion/convert_int4_checkpoint_direct.py     --hf-model-path $MODELS/Kimi-K2.7-Code     --megatron-path ./checkpoints/Kimi-K2.7-Code-INT4-mcore
+
+# Verify any of the above (strict tensor-metadata diff, HF vs Megatron):
+python scripts/orbit/conversion/compare_model_metadata.py     --hf-model-path $MODELS/<hf_model> --megatron-path ./checkpoints/<name>
+```
+
+**Tiny-model validation** — before committing to a multi-hundred-GB conversion, cut a
+byte-identical few-layer slice with upstream's toy tool and run the same chain on it
+(minutes instead of hours; this exact recipe validated Kimi-K2.7 INT4 end-to-end):
+
+```bash
+python examples/conversion/create_hf_toy_model.py     $MODELS/Kimi-K2.7-Code $MODELS/Kimi-K2.7-Code-4layers --num-hidden-layers 4
+python scripts/orbit/conversion/convert_int4_checkpoint_direct.py     --hf-model-path $MODELS/Kimi-K2.7-Code-4layers     --megatron-path ./checkpoints/Kimi-K2.7-Code-4layers-INT4-mcore
+python scripts/orbit/conversion/compare_model_metadata.py     --hf-model-path $MODELS/Kimi-K2.7-Code-4layers     --megatron-path ./checkpoints/Kimi-K2.7-Code-4layers-INT4-mcore
+```
+
+**Memory-constrained hosts** — a full 555 GB Kimi conversion peaks around 1.1 TB by
+default (whole output state in RAM plus source mmaps). The INT4 direct converter has
+opt-in relief valves; stage the source model on node-local disk and set:
+
+```bash
+export MEGATRON_BRIDGE_DIRECT_USE_SPILL=1        # spill converted tensors to disk
+export MEGATRON_BRIDGE_DIRECT_SPILL_DIR=/path/to/node-local  # spill location
+export MEGATRON_BRIDGE_PYMMAP_READER=1           # lazy no-populate source reads
+```
+
 | Utility | Arguments | Purpose |
 |---|---|---|
 | `quantize_to_int4.sh` | `<input_model> [output_model]` | BF16 HF expert weights → INT4 triplets |
