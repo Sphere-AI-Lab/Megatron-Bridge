@@ -74,6 +74,37 @@ from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 
 
+def _patch_safetensors_mmap_retry(max_attempts: int = 6) -> None:
+    """Retry transient safe_open mmap ENOMEM (memcg reclaim racing a large populate)."""
+    import safetensors
+
+    import megatron.bridge.models.hf_pretrained.state as _hf_state
+
+    original_safe_open = safetensors.safe_open
+
+    def _retrying_safe_open(*args, **kwargs):
+        for attempt in range(max_attempts):
+            try:
+                return original_safe_open(*args, **kwargs)
+            except RuntimeError as exc:
+                if "unable to mmap" not in str(exc) or attempt == max_attempts - 1:
+                    raise
+                wait_s = 5 * (attempt + 1)
+                print(
+                    f"safe_open mmap failed under memory pressure; sync + retry "
+                    f"{attempt + 1}/{max_attempts - 1} in {wait_s}s",
+                    flush=True,
+                )
+                os.sync()
+                time.sleep(wait_s)
+
+    safetensors.safe_open = _retrying_safe_open
+    _hf_state.safe_open = _retrying_safe_open
+
+
+_patch_safetensors_mmap_retry()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Direct-write HF INT4 -> Megatron checkpoint conversion",
