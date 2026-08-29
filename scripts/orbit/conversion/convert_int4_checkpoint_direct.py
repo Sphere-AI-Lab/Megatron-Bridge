@@ -39,7 +39,10 @@ the INT4 triplets (``*_packed``, ``*_scale``, ``*_shape``) for expert linears.
 
 import argparse
 from contextlib import contextmanager
+import os
+from pathlib import Path
 import sys
+import tempfile
 import time
 from typing import Any, Mapping, Optional
 
@@ -48,6 +51,7 @@ from megatron.core.optimizer import OptimizerConfig
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.orbit.low_precision.common import (
+    TensorSpillManager,
     build_single_rank_meta_provider,
     patch_meta_init_for_te_modules,
 )
@@ -282,25 +286,50 @@ def main() -> int:
 
         pg_collection = get_pg_collection(meta_model)
         model_template = meta_model[0].sharded_state_dict(metadata={"dp_cp_group": pg_collection.dp_cp})
-        model_state = build_int4_direct_model_state_dict(
-            int4_bridge,
-            auto_bridge.hf_pretrained,
-            meta_model,
-            model_template,
-            group_size=group_size,
-        )
+        use_spill = os.environ.get("MEGATRON_BRIDGE_DIRECT_USE_SPILL", "0").lower() in ("1", "true", "yes")
 
-        del meta_model
-        del model_template
+        @contextmanager
+        def _maybe_spill_manager():
+            if not use_spill:
+                yield None
+                return
+            spill_parent = Path(
+                os.environ.get(
+                    "MEGATRON_BRIDGE_DIRECT_SPILL_DIR",
+                    str(Path(args.megatron_path).resolve().parent),
+                )
+            ).resolve()
+            spill_parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix=f".{Path(args.megatron_path).name}.int4_spill_",
+                dir=spill_parent,
+            ) as spill_dir:
+                print(f"Using spill directory for direct tensors: {spill_dir}", flush=True)
+                yield TensorSpillManager(spill_dir)
 
-        _save_direct_checkpoint(
-            provider,
-            args.megatron_path,
-            model_state,
-            pg_collection=pg_collection,
-            hf_tokenizer_path=args.hf_model_path,
-            hf_tokenizer_kwargs=tokenizer_kwargs,
-        )
+        # The spill files back the state dict's tensors, so the manager must
+        # stay alive through the save.
+        with _maybe_spill_manager() as spill_manager:
+            model_state = build_int4_direct_model_state_dict(
+                int4_bridge,
+                auto_bridge.hf_pretrained,
+                meta_model,
+                model_template,
+                group_size=group_size,
+                spill_manager=spill_manager,
+            )
+
+            del meta_model
+            del model_template
+
+            _save_direct_checkpoint(
+                provider,
+                args.megatron_path,
+                model_state,
+                pg_collection=pg_collection,
+                hf_tokenizer_path=args.hf_model_path,
+                hf_tokenizer_kwargs=tokenizer_kwargs,
+            )
 
     print(f"Done. Direct INT4 Megatron checkpoint saved to: {args.megatron_path}")
     return 0

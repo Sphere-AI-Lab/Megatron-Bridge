@@ -25,6 +25,7 @@ from typing import Any, Dict, Mapping
 import torch
 
 from megatron.bridge.orbit.low_precision.common import (
+    TensorSpillManager,
     add_tensor_entry,
     prepare_empty_model_state,
 )
@@ -350,6 +351,7 @@ def build_int4_direct_model_state_dict(
     model_template: dict[str, Any],
     *,
     group_size: int,
+    spill_manager: TensorSpillManager | None = None,
 ) -> dict[str, Any]:
     """Create the prebuilt ``state_dict['model']`` for direct INT4 checkpoint save."""
     if len(meta_model) != 1:
@@ -387,9 +389,9 @@ def build_int4_direct_model_state_dict(
             scale = converted_triplet.scale
             shape = converted_triplet.shape
 
-            add_tensor_entry(model_state, f"{task.param_name}_packed", packed)
-            add_tensor_entry(model_state, f"{task.param_name}_scale", scale)
-            add_tensor_entry(model_state, f"{task.param_name}_shape", shape)
+            add_tensor_entry(model_state, f"{task.param_name}_packed", packed, spill_manager=spill_manager)
+            add_tensor_entry(model_state, f"{task.param_name}_scale", scale, spill_manager=spill_manager)
+            add_tensor_entry(model_state, f"{task.param_name}_shape", shape, spill_manager=spill_manager)
             num_int4 += 1
         else:
             hf_weights = int4_bridge.maybe_modify_loaded_hf_weight(
@@ -397,7 +399,7 @@ def build_int4_direct_model_state_dict(
                 hf_state_dict,
             )
             converted = convert_hf_weight_for_direct_save(task, hf_weights)
-            add_tensor_entry(model_state, task.param_name, converted)
+            add_tensor_entry(model_state, task.param_name, converted, spill_manager=spill_manager)
             num_regular += 1
 
         if (i + 1) % log_interval == 0 or (i + 1) == total_tasks:
