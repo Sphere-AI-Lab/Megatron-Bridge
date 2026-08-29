@@ -74,21 +74,114 @@ from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 
 
-def _patch_safetensors_mmap_retry(max_attempts: int = 6) -> None:
-    """Retry transient safe_open mmap ENOMEM (memcg reclaim racing a large populate)."""
+_SAFETENSORS_TORCH_DTYPES = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+
+class _PyMmapSafeTensors:
+    """Drop-in ``safe_open`` replacement that maps shards without MAP_POPULATE.
+
+    safetensors' native reader populates the whole shard mapping in one
+    syscall; on a nearly full memory cgroup that single ~10 GB charge
+    admission can fail with ENOMEM even though the pressure is reclaimable
+    and small faults would succeed (observed on k8s-podded Slurm nodes with
+    co-tenant jobs). This reader mmaps lazily (plain python mmap,
+    copy-on-write) so pages fault in tensor-sized steps instead. Only the
+    interface the HF state accessors use is provided: context manager,
+    ``keys``, ``metadata`` and ``get_tensor``.
+    """
+
+    _cache: dict[str, tuple[Any, dict, Any, int]] = {}
+
+    def __init__(self, path: Any, framework: str = "pt", device: str = "cpu"):
+        if framework != "pt" or device != "cpu":
+            raise ValueError("_PyMmapSafeTensors supports framework='pt', device='cpu' only")
+        import json
+        import mmap as _mmap
+
+        path = str(path)
+        cached = self._cache.get(path)
+        if cached is None:
+            with open(path, "rb") as fh:
+                header_len = int.from_bytes(fh.read(8), "little")
+                header = json.loads(fh.read(header_len))
+                mm = _mmap.mmap(
+                    fh.fileno(),
+                    0,
+                    flags=_mmap.MAP_PRIVATE,
+                    prot=_mmap.PROT_READ | _mmap.PROT_WRITE,
+                )
+            metadata = header.pop("__metadata__", None)
+            cached = (mm, header, metadata, 8 + header_len)
+            self._cache[path] = cached
+        self._mm, self._header, self._metadata, self._base = cached
+
+    def __enter__(self) -> "_PyMmapSafeTensors":
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+    def keys(self) -> list[str]:
+        return list(self._header.keys())
+
+    def metadata(self) -> Any:
+        return self._metadata
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        info = self._header[name]
+        start, end = info["data_offsets"]
+        dtype = _SAFETENSORS_TORCH_DTYPES[info["dtype"]]
+        if start == end:
+            return torch.empty(info["shape"], dtype=dtype)
+        view = memoryview(self._mm)[self._base + start : self._base + end]
+        return torch.frombuffer(view, dtype=dtype).reshape(info["shape"])
+
+
+def _patch_safetensors_reader(max_attempts: int = 3) -> None:
+    """Route safe_open through a no-populate reader (forced or ENOMEM fallback).
+
+    MEGATRON_BRIDGE_PYMMAP_READER: "1" always use the lazy reader, "0" never
+    (retry-and-raise only), default "auto" retries the native reader and
+    falls back to the lazy one per file after repeated mmap ENOMEM.
+    """
     import safetensors
 
     import megatron.bridge.models.hf_pretrained.state as _hf_state
 
     original_safe_open = safetensors.safe_open
+    mode = os.environ.get("MEGATRON_BRIDGE_PYMMAP_READER", "auto").lower()
+    fallback_paths: set[str] = set()
 
-    def _retrying_safe_open(*args, **kwargs):
+    def _patched_safe_open(path: Any, *args: Any, **kwargs: Any):
+        if mode == "1" or str(path) in fallback_paths:
+            return _PyMmapSafeTensors(path, *args, **kwargs)
         for attempt in range(max_attempts):
             try:
-                return original_safe_open(*args, **kwargs)
+                return original_safe_open(path, *args, **kwargs)
             except RuntimeError as exc:
-                if "unable to mmap" not in str(exc) or attempt == max_attempts - 1:
+                if "unable to mmap" not in str(exc):
                     raise
+                if attempt == max_attempts - 1:
+                    if mode == "0":
+                        raise
+                    print(
+                        f"safe_open mmap keeps failing for {path}; "
+                        "switching to the lazy python-mmap reader",
+                        flush=True,
+                    )
+                    fallback_paths.add(str(path))
+                    return _PyMmapSafeTensors(path, *args, **kwargs)
                 wait_s = 5 * (attempt + 1)
                 print(
                     f"safe_open mmap failed under memory pressure; sync + retry "
@@ -97,12 +190,13 @@ def _patch_safetensors_mmap_retry(max_attempts: int = 6) -> None:
                 )
                 os.sync()
                 time.sleep(wait_s)
+        raise RuntimeError("unreachable")
 
-    safetensors.safe_open = _retrying_safe_open
-    _hf_state.safe_open = _retrying_safe_open
+    safetensors.safe_open = _patched_safe_open
+    _hf_state.safe_open = _patched_safe_open
 
 
-_patch_safetensors_mmap_retry()
+_patch_safetensors_reader()
 
 
 class _ResidencyCappedSpillManager(TensorSpillManager):
