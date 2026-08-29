@@ -112,6 +112,19 @@ class _PyMmapSafeTensors:
         path = str(path)
         cached = self._cache.get(path)
         if cached is None:
+            import mmap as _mmap_mod
+
+            # Sequential shard access: when a new shard is opened, drop the
+            # page residency of every previously mapped one. The mappings are
+            # clean copy-on-write views of immutable files, so evicted pages
+            # simply refault from disk if a straggler view touches them; this
+            # keeps one hot shard resident instead of accumulating all of
+            # them (which pinned ~28 shards and re-hit the node ceiling).
+            for other_mm, _h, _m, _b in self._cache.values():
+                try:
+                    other_mm.madvise(_mmap_mod.MADV_DONTNEED)
+                except (OSError, ValueError):
+                    pass
             with open(path, "rb") as fh:
                 header_len = int.from_bytes(fh.read(8), "little")
                 header = json.loads(fh.read(header_len))
