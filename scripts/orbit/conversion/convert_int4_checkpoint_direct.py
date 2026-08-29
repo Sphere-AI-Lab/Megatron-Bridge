@@ -105,6 +105,40 @@ def _patch_safetensors_mmap_retry(max_attempts: int = 6) -> None:
 _patch_safetensors_mmap_retry()
 
 
+class _ResidencyCappedSpillManager(TensorSpillManager):
+    """Spill manager that drops page residency right after each write.
+
+    MAP_SHARED spilled pages otherwise stay resident, and under a tight
+    memory-cgroup ceiling direct reclaim cannot evict them fast enough for
+    the next large source-shard mmap (observed on k8s-podded Slurm nodes
+    converting 555 GB Kimi-K2.7-Code). The data is already fsynced by the
+    base class, so dropping the mapping's pages is safe: they refault from
+    the spill file when the checkpoint save reads them.
+    """
+
+    _libc = None
+
+    def spill_tensor(self, key: str, tensor: torch.Tensor) -> torch.Tensor:
+        spilled = super().spill_tensor(key, tensor)
+        if spilled.numel() == 0:
+            return spilled
+        import ctypes
+
+        if _ResidencyCappedSpillManager._libc is None:
+            _ResidencyCappedSpillManager._libc = ctypes.CDLL(None, use_errno=True)
+        addr = spilled.data_ptr()
+        page = os.sysconf("SC_PAGESIZE")
+        start = addr - (addr % page)
+        length = spilled.numel() * spilled.element_size() + (addr - start)
+        _ResidencyCappedSpillManager._libc.madvise(
+            ctypes.c_void_p(start), ctypes.c_size_t(length), 4
+        )  # MADV_DONTNEED: zap PTEs; file-backed shared pages stay in page cache
+        fd = os.open(self._paths[-1], os.O_RDONLY)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        os.close(fd)
+        return spilled
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Direct-write HF INT4 -> Megatron checkpoint conversion",
@@ -336,7 +370,7 @@ def main() -> int:
                 dir=spill_parent,
             ) as spill_dir:
                 print(f"Using spill directory for direct tensors: {spill_dir}", flush=True)
-                yield TensorSpillManager(spill_dir)
+                yield _ResidencyCappedSpillManager(spill_dir)
 
         # The spill files back the state dict's tensors, so the manager must
         # stay alive through the save.
