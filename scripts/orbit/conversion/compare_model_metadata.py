@@ -108,6 +108,13 @@ def print_logical_summary(title: str, summary) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.trust_remote_code:
+        # Checkpoints of trust_remote_code models embed config targets under
+        # transformers_modules.*; allow instantiating them on the Megatron
+        # side too, mirroring AutoBridge's own registration.
+        from megatron.bridge.utils.instantiate_utils import register_allowed_target_prefix
+
+        register_allowed_target_prefix("transformers_modules.")
     checkpoint_path = resolve_megatron_checkpoint_path(args.megatron_path)
 
     print(f"HuggingFace source: {args.hf_model_path}", flush=True)
