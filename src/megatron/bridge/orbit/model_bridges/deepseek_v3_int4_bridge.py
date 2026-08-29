@@ -20,7 +20,7 @@ while attention / norm weights are BF16.
 
 Conversion flow:
     1. The architecture-independent
-       :class:`~megatron.bridge.orbit.conversion.compressed_tensors_int4.CompressedTensorsINT4Mixin`
+       :class:`~megatron.bridge.orbit.conversion.compressed_tensors_int4.CompressedTensorsINT4DequantMixin`
        synthesizes virtual ``.weight`` keys and dequants INT4 -> BF16 on read
        so the standard bridge can do QKV merge + TP split.
     2. After all weights are loaded, ``_requantize_experts_int4`` walks the
@@ -40,13 +40,13 @@ import torch.nn as nn
 
 from megatron.bridge.models.conversion.quantization_utils import quantize_to_int4
 from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
-from megatron.bridge.orbit.conversion.compressed_tensors_int4 import CompressedTensorsINT4Mixin
+from megatron.bridge.orbit.conversion.compressed_tensors_int4 import CompressedTensorsINT4DequantMixin
 
 
 logger = logging.getLogger(__name__)
 
 
-class DeepSeekV3INT4Bridge(CompressedTensorsINT4Mixin, DeepSeekV3Bridge):
+class DeepSeekV3INT4Bridge(CompressedTensorsINT4DequantMixin, DeepSeekV3Bridge):
     """DeepSeek-V3 / Kimi-K2 bridge that preserves INT4 through conversion."""
 
     # --------------------------------------------------------------------- #

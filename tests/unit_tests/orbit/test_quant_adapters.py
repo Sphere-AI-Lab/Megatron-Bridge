@@ -5,11 +5,11 @@ import torch
 
 from megatron.bridge.orbit.conversion.bridge_compose import quant_bridge_class_for
 from megatron.bridge.orbit.conversion.compressed_tensors_int4 import (
-    CompressedTensorsINT4Mixin,
+    CompressedTensorsINT4DequantMixin,
     int4_bridge_class_for,
 )
 from megatron.bridge.orbit.conversion.fp8_preserve import (
-    FP8PreserveMixin,
+    BlockFP8PreserveMixin,
     _is_fp8,
     _load_scale,
     _tp_chunk,
@@ -34,12 +34,14 @@ class _PlusOneBridge:
 
 class TestSharedComposition:
     def test_prefix_defaults_and_cache(self):
-        cls_a = quant_bridge_class_for(FP8PreserveMixin, _PlusOneBridge, name_prefix="FP8")
+        cls_a = quant_bridge_class_for(BlockFP8PreserveMixin, _PlusOneBridge, name_prefix="FP8")
         cls_b = fp8_bridge_class_for(_PlusOneBridge)
         assert cls_a is cls_b  # same cache key -> same class
         assert cls_a.__name__ == "FP8_PlusOneBridge"
         # Default prefix derives from the mixin name and is a distinct cache entry.
-        assert quant_bridge_class_for(FP8PreserveMixin, _PlusOneBridge).__name__ == "FP8Preserve_PlusOneBridge"
+        assert (
+            quant_bridge_class_for(BlockFP8PreserveMixin, _PlusOneBridge).__name__ == "BlockFP8Preserve_PlusOneBridge"
+        )
 
         nv = nvfp4_bridge_class_for(_PlusOneBridge)
         assert nv.__name__ == "NVFP4_PlusOneBridge"
@@ -47,7 +49,7 @@ class TestSharedComposition:
 
         i4 = int4_bridge_class_for(_PlusOneBridge)
         assert i4.__name__ == "INT4_PlusOneBridge"
-        assert i4.__mro__[1] is CompressedTensorsINT4Mixin
+        assert i4.__mro__[1] is CompressedTensorsINT4DequantMixin
 
     def test_distinct_mixins_get_distinct_classes(self):
         assert fp8_bridge_class_for(_PlusOneBridge) is not nvfp4_bridge_class_for(_PlusOneBridge)
@@ -147,5 +149,5 @@ class TestNamedBridgesUseGenericMixins:
         from megatron.bridge.orbit.model_bridges.kimi_k25_vl_nvfp4_bridge import KimiK25VLNVFP4Bridge
         from megatron.bridge.orbit.model_bridges.qwen3_moe_fp8_bridge import Qwen3MoEFP8Bridge
 
-        assert issubclass(Qwen3MoEFP8Bridge, FP8PreserveMixin)
+        assert issubclass(Qwen3MoEFP8Bridge, BlockFP8PreserveMixin)
         assert issubclass(KimiK25VLNVFP4Bridge, ModelOptNVFP4DequantMixin)

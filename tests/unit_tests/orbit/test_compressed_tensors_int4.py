@@ -5,7 +5,7 @@ import torch
 
 from megatron.bridge.models.conversion.quantization_utils import dequantize_int4, quantize_to_int4
 from megatron.bridge.orbit.conversion.compressed_tensors_int4 import (
-    CompressedTensorsINT4Mixin,
+    CompressedTensorsINT4DequantMixin,
     hf_state_has_int4_triplets,
     int4_bridge_class_for,
     synthesize_virtual_weight_keys,
@@ -117,7 +117,7 @@ class TestMixinBehavior:
         cls_b = int4_bridge_class_for(_RecordingBridge)
         assert cls_a is cls_b
         assert cls_a.__mro__[0] is cls_a
-        assert cls_a.__mro__[1] is CompressedTensorsINT4Mixin
+        assert cls_a.__mro__[1] is CompressedTensorsINT4DequantMixin
         assert issubclass(cls_a, _RecordingBridge)
         assert cls_a.__name__ == "INT4_RecordingBridge"
 
@@ -166,4 +166,4 @@ class TestNamedBridgesUseGenericMixin:
         from megatron.bridge.orbit.model_bridges.qwen3_int4_bridge import Qwen3INT4Bridge, Qwen3MoEINT4Bridge
 
         for cls in (Qwen3INT4Bridge, Qwen3MoEINT4Bridge, LlamaINT4Bridge, DeepSeekV3INT4Bridge):
-            assert issubclass(cls, CompressedTensorsINT4Mixin)
+            assert issubclass(cls, CompressedTensorsINT4DequantMixin)

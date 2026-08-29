@@ -79,7 +79,7 @@ def hf_state_has_int4_triplets(keys: Iterable[str]) -> bool:
     return len(synthesize_virtual_weight_keys(keys)) > len(keys)
 
 
-class CompressedTensorsINT4Mixin:
+class CompressedTensorsINT4DequantMixin:
     """Architecture-independent INT4 triplet support for model bridges.
 
     Compose mixin-first with any registered bridge class::
@@ -145,7 +145,7 @@ class CompressedTensorsINT4Mixin:
 
 
 def int4_bridge_class_for(base_cls: type, *, extra_mixins: tuple[type, ...] = ()) -> type:
-    """Compose :class:`CompressedTensorsINT4Mixin` with a bridge class, cached.
+    """Compose :class:`CompressedTensorsINT4DequantMixin` with a bridge class, cached.
 
     Args:
         base_cls: The architecture's bridge class (usually the one registered
@@ -158,11 +158,13 @@ def int4_bridge_class_for(base_cls: type, *, extra_mixins: tuple[type, ...] = ()
     """
     from megatron.bridge.orbit.conversion.bridge_compose import quant_bridge_class_for
 
-    return quant_bridge_class_for(CompressedTensorsINT4Mixin, base_cls, extra_mixins=extra_mixins, name_prefix="INT4")
+    return quant_bridge_class_for(
+        CompressedTensorsINT4DequantMixin, base_cls, extra_mixins=extra_mixins, name_prefix="INT4"
+    )
 
 
 def int4_bridge_for(auto_bridge):
     """Return the registered bridge for ``auto_bridge``'s architecture, INT4-composed."""
     from megatron.bridge.orbit.conversion.bridge_compose import quant_bridge_for
 
-    return quant_bridge_for(CompressedTensorsINT4Mixin, auto_bridge, name_prefix="INT4")
+    return quant_bridge_for(CompressedTensorsINT4DequantMixin, auto_bridge, name_prefix="INT4")

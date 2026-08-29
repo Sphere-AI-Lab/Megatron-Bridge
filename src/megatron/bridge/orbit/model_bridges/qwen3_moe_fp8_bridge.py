@@ -15,7 +15,7 @@
 """FP8-preserving bridge for Qwen3 MoE.
 
 Thin composition of the architecture-independent
-:class:`~megatron.bridge.orbit.conversion.fp8_preserve.FP8PreserveMixin`
+:class:`~megatron.bridge.orbit.conversion.fp8_preserve.BlockFP8PreserveMixin`
 with the upstream Qwen3 MoE bridge plus the orbit provider extensions
 (fp32 router dtype, ``moe_layer_freq`` derivation). FP8-quantised HF
 checkpoints (``quant_method: fp8``, ``weight_block_size: [128, 128]``) load
@@ -29,9 +29,9 @@ Example:
 """
 
 from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
-from megatron.bridge.orbit.conversion.fp8_preserve import FP8PreserveMixin
+from megatron.bridge.orbit.conversion.fp8_preserve import BlockFP8PreserveMixin
 from megatron.bridge.orbit.model_bridges.qwen3_moe_provider_ext import Qwen3MoEOrbitProviderMixin
 
 
-class Qwen3MoEFP8Bridge(FP8PreserveMixin, Qwen3MoEOrbitProviderMixin, Qwen3MoEBridge):
+class Qwen3MoEFP8Bridge(BlockFP8PreserveMixin, Qwen3MoEOrbitProviderMixin, Qwen3MoEBridge):
     """Qwen3 MoE bridge that keeps FP8 weights in FP8 throughout conversion."""

@@ -19,7 +19,7 @@ Block-FP8 HF checkpoints (``quant_method: fp8``, e4m3fn weights with
 path, because ``ColumnParallelMapping.hf_to_megatron`` casts to the Megatron
 param dtype and ``scatter_to_tp_ranks`` allocates a BF16 output buffer.
 
-:class:`FP8PreserveMixin` keeps FP8 weights in FP8 end to end by temporarily
+:class:`BlockFP8PreserveMixin` keeps FP8 weights in FP8 end to end by temporarily
 setting the target parameter to FP8 dtype before the mapping runs — ``chunk``,
 ``cat``, ``view`` and ``reshape`` are dtype-agnostic, so QKV merge, gate/up
 concat and TP split work unchanged on FP8 tensors. The matching
@@ -41,7 +41,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-class FP8PreserveMixin:
+class BlockFP8PreserveMixin:
     """Architecture-independent FP8-preserving weight load for model bridges."""
 
     def load_weights_hf_to_megatron(
@@ -191,14 +191,14 @@ def _is_row_parallel(mapping) -> bool:
 
 
 def fp8_bridge_class_for(base_cls: type, *, extra_mixins: tuple[type, ...] = ()) -> type:
-    """Compose :class:`FP8PreserveMixin` with a bridge class, cached."""
+    """Compose :class:`BlockFP8PreserveMixin` with a bridge class, cached."""
     from megatron.bridge.orbit.conversion.bridge_compose import quant_bridge_class_for
 
-    return quant_bridge_class_for(FP8PreserveMixin, base_cls, extra_mixins=extra_mixins, name_prefix="FP8")
+    return quant_bridge_class_for(BlockFP8PreserveMixin, base_cls, extra_mixins=extra_mixins, name_prefix="FP8")
 
 
 def fp8_bridge_for(auto_bridge):
     """Return the registered bridge for the architecture, FP8-preserve-composed."""
     from megatron.bridge.orbit.conversion.bridge_compose import quant_bridge_for
 
-    return quant_bridge_for(FP8PreserveMixin, auto_bridge, name_prefix="FP8")
+    return quant_bridge_for(BlockFP8PreserveMixin, auto_bridge, name_prefix="FP8")

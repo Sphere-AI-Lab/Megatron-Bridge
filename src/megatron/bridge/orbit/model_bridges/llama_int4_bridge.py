@@ -15,7 +15,7 @@
 """INT4-preserving bridge for dense Llama models.
 
 Thin composition of the architecture-independent
-:class:`~megatron.bridge.orbit.conversion.compressed_tensors_int4.CompressedTensorsINT4Mixin`
+:class:`~megatron.bridge.orbit.conversion.compressed_tensors_int4.CompressedTensorsINT4DequantMixin`
 with the upstream Llama bridge. Unlike the DeepSeek path, every linear
 (attention Q/K/V/O, gated MLP gate/up/down, lm_head if quantized) may be
 INT4-quantized at the HF level, not just experts; layernorms and embeddings
@@ -31,8 +31,8 @@ Verified against:
 """
 
 from megatron.bridge.models.llama.llama_bridge import LlamaBridge
-from megatron.bridge.orbit.conversion.compressed_tensors_int4 import CompressedTensorsINT4Mixin
+from megatron.bridge.orbit.conversion.compressed_tensors_int4 import CompressedTensorsINT4DequantMixin
 
 
-class LlamaINT4Bridge(CompressedTensorsINT4Mixin, LlamaBridge):
+class LlamaINT4Bridge(CompressedTensorsINT4DequantMixin, LlamaBridge):
     """Llama bridge that preserves INT4 through direct-write conversion."""
