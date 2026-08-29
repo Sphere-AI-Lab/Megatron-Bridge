@@ -597,6 +597,49 @@ def validate_loaded_model_tensors(model_module: torch.nn.Module) -> None:
         )
 
 
+class AdapterInitCallback(Callback):
+    """Report (and optionally repair) OFT rotation parameters at train start.
+
+    ``OFTRotationModule`` builds ``oft_r`` as zeros so the initial rotation is
+    the identity. Under ``init_model_with_meta_device`` that allocation can be
+    materialized by ``to_empty()``, which leaves uninitialized memory instead of
+    zeros and overflows the Cayley transform on the first forward. Set
+    ``QOFT_FORCE_OFT_REZERO=1`` to re-zero any adapter that is not already zero.
+    """
+
+    def on_train_start(self, context) -> None:
+        import os as _os
+
+        force = _os.environ.get("QOFT_FORCE_OFT_REZERO", "0").lower() in ("1", "true", "yes")
+        inspected = nonzero = nonfinite = rezeroed = 0
+        shown = 0
+        with torch.no_grad():
+            for chunk in context.model:
+                for name, param in chunk.named_parameters():
+                    if name.split(".")[-1] != "oft_r":
+                        continue
+                    inspected += 1
+                    finite = bool(torch.isfinite(param).all())
+                    absmax = float(param.abs().max()) if finite else float("inf")
+                    if not finite:
+                        nonfinite += 1
+                    elif absmax > 0:
+                        nonzero += 1
+                    if shown < 4:
+                        shown += 1
+                        print_rank_0(
+                            f"[qoft:adapter-init] {name} device={param.device} dtype={param.dtype} "
+                            f"finite={finite} absmax={absmax:.6g}"
+                        )
+                    if force and (not finite or absmax > 0):
+                        param.zero_()
+                        rezeroed += 1
+        print_rank_0(
+            f"[qoft:adapter-init] oft_r params={inspected} nonzero={nonzero} "
+            f"nonfinite={nonfinite} rezeroed={rezeroed}"
+        )
+
+
 class NanTraceCallback(Callback):
     """Trace where non-finite values first appear in params, activations, grads."""
 
@@ -811,6 +854,29 @@ def _materialize_meta_sharded_tensors_to_cpu(state_dict, sharded_tensor_cls) -> 
                 value.data = torch.empty(value.local_shape, dtype=value.dtype, device="cpu")
 
 
+def reinitialize_meta_materialized_oft_parameters(module, meta_param_names) -> int:
+    """Restore OFT rotation parameters that meta materialization left uninitialized.
+
+    ``OFTRotationModule`` builds ``oft_r`` with ``torch.zeros`` so the initial
+    rotation is the identity, but under ``init_model_with_meta_device`` that
+    allocation lands on the meta device and ``to_empty()`` materializes it as
+    *uninitialized* memory rather than zeros. The resulting garbage overflows
+    the Cayley transform and yields non-finite activations on the very first
+    forward pass. Only parameters that were still on meta immediately before
+    materialization are reset, so adapter weights restored from a checkpoint
+    are never clobbered.
+    """
+    reset = 0
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            if name in meta_param_names and name.split(".")[-1] == "oft_r":
+                param.zero_()
+                reset += 1
+    if reset:
+        print_rank_0(f"[qoft] re-zeroed {reset} meta-materialized OFT rotation parameters")
+    return reset
+
+
 def install_int4_checkpoint_load_patches(
     *,
     scope: str,
@@ -934,7 +1000,11 @@ def install_int4_checkpoint_load_patches(
             )
 
         if torch.cuda.is_available():
+            meta_param_names = {
+                name for name, param in model_module.named_parameters() if param.device.type == "meta"
+            }
             to_empty_if_meta_device(model_module, device=torch.device("cuda", torch.cuda.current_device()))
+            reinitialize_meta_materialized_oft_parameters(model_module, meta_param_names)
             if after_load_hook is not None:
                 after_load_hook(model_module)
         if validate_nonfinite:

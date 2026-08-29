@@ -51,6 +51,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models._qoft_common import (  # noqa: E402
+    AdapterInitCallback,
     MemoryProfileCallback,
     NanTraceCallback,
     disable_evaluation,
@@ -581,7 +582,11 @@ def main() -> None:
     # layers, and the grouped-MoE-safe ModelOpt compress patches apply
     # automatically inside bridge.training.post_training.checkpointing.
 
+    # Opt-in adapter diagnostics: QOFT_ADAPTER_INIT_CHECK=1 reports the OFT
+    # rotation parameters at train start (see AdapterInitCallback).
     callbacks = []
+    if os.environ.get("QOFT_ADAPTER_INIT_CHECK", "0").lower() in ("1", "true", "yes"):
+        callbacks.append(AdapterInitCallback())
     if args.profile_memory and not args.skip_train:
         callbacks.append(MemoryProfileCallback(args.profile_memory_steps, args.quant))
     if args.debug_nan:
