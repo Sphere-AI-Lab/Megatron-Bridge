@@ -30,6 +30,12 @@ class _RecordingBridge:
         self.seen_keys = list(hf_pretrained.state.source.get_all_keys())
         return ["sentinel-task"]
 
+    def maybe_modify_loaded_hf_weight(self, hf_param, hf_state_dict):
+        # Upstream-default behavior: plain indexing (model_bridge.py).
+        if isinstance(hf_param, str):
+            return hf_state_dict[hf_param]
+        return {k: hf_state_dict[v] for k, v in hf_param.items()}
+
 
 class _Source:
     def __init__(self, keys):

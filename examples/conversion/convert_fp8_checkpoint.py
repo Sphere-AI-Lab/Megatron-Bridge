@@ -38,10 +38,12 @@ import sys
 from functools import partial
 
 from megatron.bridge import AutoBridge
+from megatron.bridge.orbit.conversion.fp8_preserve import fp8_bridge_for
 from megatron.bridge.orbit.model_bridges.qwen3_moe_fp8_bridge import Qwen3MoEFP8Bridge
 
 
 def main():
+    """Convert an HF FP8 checkpoint to Megatron format, preserving FP8."""
     parser = argparse.ArgumentParser(
         description="Convert HF FP8 checkpoint to Megatron format (preserving FP8)",
     )
@@ -50,7 +52,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Converting: {args.hf_model_path} -> {args.megatron_path}")
-    print("Using Qwen3MoEFP8Bridge (preserves FP8 weights, no BF16 intermediate)")
+    print("Preserving FP8 weights through conversion (no BF16 intermediate)")
 
     # The standard AutoBridge.import_ckpt flow:
     #   1. AutoBridge.from_hf_pretrained(hf_model)
@@ -69,10 +71,16 @@ def main():
     provider = auto_bridge.to_megatron_provider(load_weights=False)
     provider.perform_initialization = False
 
-    fp8_bridge = Qwen3MoEFP8Bridge()
-    provider.register_pre_wrap_hook(
-        partial(fp8_bridge.load_weights_hf_to_megatron, auto_bridge.hf_pretrained)
-    )
+    architecture = getattr(auto_bridge._causal_lm_architecture, "__name__", str(auto_bridge._causal_lm_architecture))
+    if architecture == "Qwen3MoeForCausalLM":
+        # Named class keeps the orbit Qwen3-MoE provider extensions.
+        fp8_bridge = Qwen3MoEFP8Bridge()
+    else:
+        # Any other registered architecture: compose the generic FP8 mixin
+        # with its registered bridge (same load path the named class uses).
+        print(f"No named FP8 bridge for {architecture}; composing the generic FP8 adapter")
+        fp8_bridge = fp8_bridge_for(auto_bridge)
+    provider.register_pre_wrap_hook(partial(fp8_bridge.load_weights_hf_to_megatron, auto_bridge.hf_pretrained))
 
     if hasattr(provider, "finalize"):
         provider.finalize()

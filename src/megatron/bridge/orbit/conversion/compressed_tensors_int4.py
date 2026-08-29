@@ -138,10 +138,10 @@ class CompressedTensorsINT4Mixin:
                 )
                 logger.info("Dequantized INT4 -> BF16: %s shape=%s", hf_key, list(weight.shape))
                 return weight
-        return hf_state_dict[hf_key]
-
-
-_INT4_BRIDGE_CLASS_CACHE: dict[tuple[type, tuple[type, ...]], type] = {}
+        # Not an INT4 triplet: defer to the next maybe_modify_loaded_hf_weight
+        # in the MRO (upstream default indexes the state dict; a base bridge or
+        # another stacked adapter may transform the tensor instead).
+        return super().maybe_modify_loaded_hf_weight(hf_key, hf_state_dict)
 
 
 def int4_bridge_class_for(base_cls: type, *, extra_mixins: tuple[type, ...] = ()) -> type:
@@ -156,33 +156,13 @@ def int4_bridge_class_for(base_cls: type, *, extra_mixins: tuple[type, ...] = ()
     Returns:
         A subclass ``INT4<base_cls.__name__>`` with mixin-first MRO.
     """
-    cache_key = (base_cls, extra_mixins)
-    int4_cls = _INT4_BRIDGE_CLASS_CACHE.get(cache_key)
-    if int4_cls is None:
-        int4_cls = type(
-            f"INT4{base_cls.__name__}",
-            (CompressedTensorsINT4Mixin, *extra_mixins, base_cls),
-            {},
-        )
-        _INT4_BRIDGE_CLASS_CACHE[cache_key] = int4_cls
-    return int4_cls
+    from megatron.bridge.orbit.conversion.bridge_compose import quant_bridge_class_for
+
+    return quant_bridge_class_for(CompressedTensorsINT4Mixin, base_cls, extra_mixins=extra_mixins, name_prefix="INT4")
 
 
 def int4_bridge_for(auto_bridge):
-    """Return the registered bridge for ``auto_bridge``'s architecture, INT4-composed.
+    """Return the registered bridge for ``auto_bridge``'s architecture, INT4-composed."""
+    from megatron.bridge.orbit.conversion.bridge_compose import quant_bridge_for
 
-    Mirrors ``oft_export.oft_export_bridge_for``: resolve the architecture's
-    registered bridge through upstream dispatch, compose the INT4 mixin first
-    in the MRO, and attach ``hf_pretrained`` / ``hf_config`` to the fresh
-    instance the way upstream's ``_get_model_bridge_impl`` does.
-    """
-    from megatron.bridge.models.conversion import model_bridge as model_bridge_mod
-
-    base = model_bridge_mod.get_model_bridge(auto_bridge._causal_lm_architecture)
-    bridge = int4_bridge_class_for(type(base))()
-
-    hf_pretrained = getattr(auto_bridge, "hf_pretrained", None)
-    if hf_pretrained is not None:
-        bridge.hf_pretrained = hf_pretrained
-        bridge.hf_config = hf_pretrained.config if hasattr(hf_pretrained, "config") else hf_pretrained
-    return bridge
+    return quant_bridge_for(CompressedTensorsINT4Mixin, auto_bridge, name_prefix="INT4")

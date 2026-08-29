@@ -12,61 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NVFP4-preserving bridge for Kimi-K2.5 VL checkpoints."""
+"""NVFP4-preserving bridge for Kimi-K2.5 VL checkpoints.
+
+The load side is the architecture-independent
+:class:`~megatron.bridge.orbit.conversion.modelopt_nvfp4.ModelOptNVFP4DequantMixin`;
+keys without an NVFP4 bundle fall through to the Kimi base bridge, which
+keeps its built-in INT4 triplet handling. What stays here is the emit side:
+re-quantizing converted expert weights into the ``*_packed_fp4`` /
+``*_scale_fp4`` / ``*_scale_2_fp4`` / ``*_shape_fp4`` buffer keys that the
+direct NVFP4 save path consumes.
+"""
 
 from __future__ import annotations
 
-from typing import Dict, Mapping
+from collections.abc import Mapping
 
 import torch
 
-from megatron.bridge.orbit.low_precision.nvfp4 import (
-    dequantize_nvfp4,
-    quantize_to_nvfp4,
-)
 from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
 from megatron.bridge.models.kimi_vl.kimi_k25_vl_bridge import KimiK25VLBridge
+from megatron.bridge.orbit.conversion.modelopt_nvfp4 import ModelOptNVFP4DequantMixin
+from megatron.bridge.orbit.low_precision.nvfp4 import quantize_to_nvfp4
 
 
-class KimiK25VLNVFP4Bridge(KimiK25VLBridge):
+class KimiK25VLNVFP4Bridge(ModelOptNVFP4DequantMixin, KimiK25VLBridge):
     """Kimi-K2.5 bridge variant that consumes and emits NVFP4 expert bundles."""
-
-    def _load_and_dequantize(self, key: str, hf_state_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """Load a weight, dequantizing ModelOpt NVFP4 packed tensors when present."""
-        scale_key = f"{key}_scale"
-        scale_2_key = f"{key}_scale_2"
-        if key.endswith(".weight") and scale_key in hf_state_dict and scale_2_key in hf_state_dict:
-            packed = hf_state_dict[key]
-            shape = torch.tensor(
-                [packed.shape[0], packed.shape[1] * 2],
-                dtype=torch.int64,
-                device=packed.device,
-            )
-            return dequantize_nvfp4(
-                packed,
-                hf_state_dict[scale_key],
-                hf_state_dict[scale_2_key],
-                shape,
-                dtype=torch.bfloat16,
-                device=packed.device,
-            )
-
-        return super()._load_and_dequantize(key, hf_state_dict)
-
-    def maybe_modify_loaded_hf_weight(
-        self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """Load HF weights, dequantizing NVFP4 bundles when present."""
-        if isinstance(hf_param, str):
-            return self._load_and_dequantize(hf_param, hf_state_dict)
-        return {role: self._load_and_dequantize(key, hf_state_dict) for role, key in hf_param.items()}
 
     def maybe_modify_converted_hf_weight(
         self,
         task: WeightConversionTask,
-        converted_weights_dict: Dict[str, torch.Tensor],
+        converted_weights_dict: dict[str, torch.Tensor],
         hf_state_dict: Mapping[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """Re-quantize converted Kimi expert weights to NVFP4 buffer keys."""
         result = {}
         for fqn, tensor in converted_weights_dict.items():
