@@ -23,12 +23,12 @@ parameters are in BF16 and receive gradient updates.
 Prerequisites:
     Convert the HF FP8 checkpoint to Megatron format (preserving FP8):
 
-        python examples/models/qwen3_moe/convert_fp8_checkpoint.py \\
+        python scripts/orbit/conversion/convert_fp8_checkpoint.py \\
             --hf-model-path /path/to/Qwen3-30B-A3B-FP8 \\
             --megatron-path ./checkpoints/Qwen3-30B-A3B-FP8
 
 Usage:
-    torchrun --nproc_per_node=4 examples/models/qwen3_moe/finetune_qoft.py \\
+    torchrun --nproc_per_node=4 scripts/orbit/models/qwen3_moe/finetune_qoft.py \\
         --pretrained-checkpoint ./checkpoints/Qwen3-30B-A3B-FP8 \\
         --tp 2 --ep 2
 """

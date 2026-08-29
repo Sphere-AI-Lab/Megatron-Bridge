@@ -3,7 +3,7 @@
 #
 # Replaces run_lora_finetune.sh / run_oft_finetune.sh (which differed only in
 # their target .py) and covers any model whose recipe is "_peft_common() plus an
-# HF path" -- see examples/finetune_peft.py.
+# HF path" -- see scripts/orbit/finetune_peft.py.
 #
 # Usage:
 #   bash scripts/orbit/run_peft_finetune.sh                       # oft, Llama-3.2-1B
@@ -24,7 +24,7 @@
 #   EXTRA_ARGS     - appended verbatim to the python command
 #
 # INT4 is not covered here: that path installs a checkpoint monkey-patch stack.
-# Use examples/models/*/finetune_qoft_int4.py for INT4.
+# Use scripts/orbit/models/*/finetune_qoft_int4.py for INT4.
 
 set -euo pipefail
 
@@ -69,5 +69,5 @@ echo "  checkpoint: ${MEGATRON_CKPT}"
 echo "  TP=${TP} PP=${PP} EP=${EP} CP=${CP}"
 
 torchrun --nproc_per_node="${NUM_GPUS}" \
-    examples/finetune_peft.py \
+    scripts/orbit/finetune_peft.py \
     "${args[@]}" ${EXTRA_ARGS:-}

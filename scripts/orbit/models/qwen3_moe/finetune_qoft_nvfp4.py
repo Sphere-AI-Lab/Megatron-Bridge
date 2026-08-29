@@ -15,7 +15,7 @@
 
 """Qwen3-30B-A3B MoE QOFT finetuning with NVFP4 base weights.
 
-Smaller-scale companion to ``examples/models/kimi_k25/finetune_qoft_nvfp4.py``
+Smaller-scale companion to ``scripts/orbit/models/kimi_k25/finetune_qoft_nvfp4.py``
 intended for fast iteration on the NVFP4 + grouped-MoE codepath. Same flow:
 ``restore_modelopt_state=True`` + ``init_model_with_meta_device=True`` +
 ``bf16_with_nvfp4_mixed`` mixed precision. The ModelOpt grouped-MoE patches
@@ -32,7 +32,7 @@ moe_intermediate=768.
 
 Usage:
     torchrun --nproc_per_node=8 \\
-        examples/models/qwen3_moe/finetune_qoft_nvfp4.py \\
+        scripts/orbit/models/qwen3_moe/finetune_qoft_nvfp4.py \\
         --pretrained-checkpoint ./checkpoints/Qwen3-30B-A3B-NVFP4 \\
         --tp 2 --ep 4
 """

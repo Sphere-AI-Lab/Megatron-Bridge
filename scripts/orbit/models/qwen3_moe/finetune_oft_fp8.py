@@ -24,12 +24,12 @@ Identical to finetune_oft.py (GPT-OSS) except:
   - Adds FP8 mixed precision (hopper or blackwell)
 
 Usage:
-    torchrun --nproc_per_node=4 examples/models/qwen3_moe/finetune_oft_fp8.py \
+    torchrun --nproc_per_node=4 scripts/orbit/models/qwen3_moe/finetune_oft_fp8.py \
         --pretrained-checkpoint /path/to/qwen3-30b-a3b \
         --tp 2 --ep 2 --fp8-recipe hopper
 
     With Constrained OFT:
-        torchrun --nproc_per_node=4 examples/models/qwen3_moe/finetune_oft_fp8.py \
+        torchrun --nproc_per_node=4 scripts/orbit/models/qwen3_moe/finetune_oft_fp8.py \
             --pretrained-checkpoint /path/to/qwen3-30b-a3b \
             --coft --eps 6e-5
 """

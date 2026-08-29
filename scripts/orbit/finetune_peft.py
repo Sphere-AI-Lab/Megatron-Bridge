@@ -21,14 +21,14 @@ are ~92 lines each that differ only in the HF path string and a couple of tuning
 numbers, and ``_peft_common`` documents the contract directly: the caller MUST
 set ``cfg.model`` and ``cfg.tokenizer.tokenizer_model``. That is what this does.
 
-    torchrun --nproc_per_node=8 examples/finetune_peft.py \
+    torchrun --nproc_per_node=8 scripts/orbit/finetune_peft.py \
         --model-path Qwen/Qwen3-14B \
         --pretrained-checkpoint ./checkpoints/Qwen3-14B-NVFP4 \
         --peft oft --quant nvfp4 --tp 1 --pp 1
 
 Scope: ``--quant`` in {none, fp8, mxfp8, nvfp4}. INT4 is deliberately NOT handled
 here — the INT4 path additionally installs a checkpoint monkey-patch stack (see
-``examples/models/qwen3_moe/finetune_qoft_int4.py`` and the kimi/moonlight
+``scripts/orbit/models/qwen3_moe/finetune_qoft_int4.py`` and the kimi/moonlight
 entrypoints), which is real machinery rather than a config flag. Use those
 entrypoints for INT4 until that stack is extracted into the orbit package.
 """
@@ -48,9 +48,9 @@ from megatron.bridge.training.mixed_precision import get_mixed_precision_config
 
 # Quantization presets. Each entry is applied on top of the _peft_common base.
 # Settings are taken from the per-model entrypoints they replace, not invented:
-#   fp8    <- examples/models/qwen3_moe/finetune_oft_fp8.py
-#   nvfp4  <- examples/models/qwen3_14b/finetune_qoft_nvfp4.py
-#             examples/models/qwen3_moe/finetune_qoft_nvfp4.py
+#   fp8    <- scripts/orbit/models/qwen3_moe/finetune_oft_fp8.py
+#   nvfp4  <- scripts/orbit/models/qwen3_14b/finetune_qoft_nvfp4.py
+#             scripts/orbit/models/qwen3_moe/finetune_qoft_nvfp4.py
 QUANT_PRESETS: dict[str, dict] = {
     "none": {
         "mixed_precision": None,

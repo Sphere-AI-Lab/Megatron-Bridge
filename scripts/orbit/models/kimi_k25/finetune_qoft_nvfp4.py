@@ -38,7 +38,7 @@ Prerequisites:
             ./checkpoints/Kimi-K2.5-NVFP4
 
 Usage:
-    torchrun --nproc_per_node=8 examples/models/kimi_k25/finetune_qoft_nvfp4.py \\
+    torchrun --nproc_per_node=8 scripts/orbit/models/kimi_k25/finetune_qoft_nvfp4.py \\
         --pretrained-checkpoint ./checkpoints/Kimi-K2.5-NVFP4 \\
         --tp 2 --ep 4
 """

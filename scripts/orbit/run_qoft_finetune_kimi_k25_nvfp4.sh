@@ -10,7 +10,7 @@
 #   2. Finetune (this script):
 #        bash run_qoft_finetune_kimi_k25_nvfp4.sh
 #
-# Note: requires examples/models/kimi_k25/finetune_qoft_nvfp4.py (NVFP4
+# Note: requires scripts/orbit/models/kimi_k25/finetune_qoft_nvfp4.py (NVFP4
 # entrypoint) — mirrors the structure of finetune_qoft_int4.py but loads
 # NVFP4 buffers instead of INT4 triplets. Override the entrypoint via
 # FINETUNE_ENTRY=<path> if needed.
@@ -218,7 +218,7 @@ PROFILE_MEMORY="${PROFILE_MEMORY:-0}"
 PROFILE_MEMORY_STEPS="${PROFILE_MEMORY_STEPS:-1}"
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
 SKIP_EVAL="${SKIP_EVAL:-0}"
-FINETUNE_ENTRY="${FINETUNE_ENTRY:-examples/models/kimi_k25/finetune_qoft_nvfp4.py}"
+FINETUNE_ENTRY="${FINETUNE_ENTRY:-scripts/orbit/models/kimi_k25/finetune_qoft_nvfp4.py}"
 
 EXTRA_ARGS=()
 if [ "${SAVE_CHECKPOINTS}" = "1" ]; then

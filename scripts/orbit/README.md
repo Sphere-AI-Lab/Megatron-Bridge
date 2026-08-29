@@ -1,7 +1,8 @@
 # `scripts/orbit/` — Orbit launcher scripts
 
 Launchers and utilities for Orbit's PEFT (OFT / LoRA) finetuning and quantized-checkpoint
-workflows. Everything here is a thin wrapper: the real work lives in `examples/` and in
+workflows. The `run_*.sh` scripts are thin wrappers around the Python entrypoints in this
+tree (`finetune_peft.py`, `models/`, `conversion/`); the core logic lives in
 `src/megatron/bridge/orbit/`.
 
 **Run every script from the repository root**, not from this directory:
@@ -29,7 +30,7 @@ not a replacement.
 ### `run_peft_finetune.sh` — the generic launcher
 
 Covers any model whose recipe is "`_peft_common()` plus an HF path", which is most of them.
-Dispatches to `examples/finetune_peft.py`.
+Dispatches to `scripts/orbit/finetune_peft.py`.
 
 ```bash
 # OFT on Llama-3.2-1B, single GPU (all defaults)
@@ -69,7 +70,7 @@ model-specific scripts below.
 ## Model-specific finetuning launchers
 
 Reach for these when `run_peft_finetune.sh` cannot express the run: INT4, or a model that needs a
-custom pipeline layout / callbacks. Each pairs with an entrypoint under `examples/models/`.
+custom pipeline layout / callbacks. Each pairs with an entrypoint under `scripts/orbit/models/`.
 
 | Script | Model | Base weights | Default GPUs / parallelism |
 |---|---|---|---|

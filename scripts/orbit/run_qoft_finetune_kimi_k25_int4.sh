@@ -250,7 +250,7 @@ echo "  Output: ${OUTPUT_DIR}"
 echo "======================================"
 
 torchrun --nproc_per_node="${NUM_GPUS}" \
-    examples/models/kimi_k25/finetune_qoft_int4.py \
+    scripts/orbit/models/kimi_k25/finetune_qoft_int4.py \
     --pretrained-checkpoint "${MEGATRON_CKPT}" \
     --hf-model-path "${HF_MODEL_PATH}" \
     --tp "${TP}" --ep "${EP}" --pp "${PP}" \

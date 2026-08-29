@@ -83,7 +83,7 @@ echo "[INFO] This launcher exercises resharded load from a TP=1 direct NVFP4 che
 echo "[INFO] Default test layout is TP=${TP}, PP=${PP}, GPUs=${NUM_GPUS}." >&2
 
 torchrun --nproc_per_node="${NUM_GPUS}" \
-    examples/models/qwen3_14b/finetune_qoft_nvfp4.py \
+    scripts/orbit/models/qwen3_14b/finetune_qoft_nvfp4.py \
     --pretrained-checkpoint "${MEGATRON_CKPT}" \
     --tp "${TP}" --pp "${PP}" \
     --train-iters "${TRAIN_ITERS}" \

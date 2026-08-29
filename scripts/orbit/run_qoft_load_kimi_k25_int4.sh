@@ -66,7 +66,7 @@ echo "  Output: ${OUTPUT_DIR}"
 echo "======================================"
 
 torchrun --nproc_per_node="${NUM_GPUS}" \
-    examples/models/kimi_k25/finetune_qoft_int4.py \
+    scripts/orbit/models/kimi_k25/finetune_qoft_int4.py \
     --pretrained-checkpoint "${MEGATRON_CKPT}" \
     --tp "${TP}" --ep "${EP}" --pp "${PP}" \
     --train-iters "${TRAIN_ITERS}" \

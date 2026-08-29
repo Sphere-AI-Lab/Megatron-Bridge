@@ -162,7 +162,7 @@ echo "======================================"
 cd "${SCRIPT_DIR}"
 
 torchrun --nproc_per_node="${NUM_GPUS}" \
-    examples/models/moonlight_16b/finetune_qoft_int4.py \
+    scripts/orbit/models/moonlight_16b/finetune_qoft_int4.py \
     --pretrained-checkpoint "${MEGATRON_CKPT}" \
     --hf-model-path "${HF_MODEL_PATH}" \
     --tp "${TP}" --ep "${EP}" --pp "${PP}" \

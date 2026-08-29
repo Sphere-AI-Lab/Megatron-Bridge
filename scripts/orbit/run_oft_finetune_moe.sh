@@ -53,7 +53,7 @@ echo "Block size: ${BLOCK_SIZE}"
 echo "Output: ${OUTPUT_DIR}"
 echo "======================================"
 torchrun --nproc_per_node="${NUM_GPUS}" \
-    examples/models/qwen3_moe/finetune_oft_fp8.py \
+    scripts/orbit/models/qwen3_moe/finetune_oft_fp8.py \
     --pretrained-checkpoint "${MEGATRON_CKPT}" \
     --tp "${TP}" --ep "${EP}" \
     --block-size "${BLOCK_SIZE}" \

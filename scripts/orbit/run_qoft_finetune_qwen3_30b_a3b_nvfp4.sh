@@ -185,7 +185,7 @@ SAVE_CHECKPOINTS="${SAVE_CHECKPOINTS:-0}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-500}"
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
 SKIP_EVAL="${SKIP_EVAL:-0}"
-FINETUNE_ENTRY="${FINETUNE_ENTRY:-examples/models/qwen3_moe/finetune_qoft_nvfp4.py}"
+FINETUNE_ENTRY="${FINETUNE_ENTRY:-scripts/orbit/models/qwen3_moe/finetune_qoft_nvfp4.py}"
 
 EXTRA_ARGS=()
 if [ "${SAVE_CHECKPOINTS}" = "1" ]; then

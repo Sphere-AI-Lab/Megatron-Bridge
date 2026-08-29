@@ -28,7 +28,7 @@ Usage:
         --megatron-path ./checkpoints/Qwen3-30B-A3B-FP8
 
 Then use the resulting checkpoint with finetune_qoft.py:
-    torchrun --nproc_per_node=4 examples/models/qwen3_moe/finetune_qoft.py \\
+    torchrun --nproc_per_node=4 scripts/orbit/models/qwen3_moe/finetune_qoft.py \\
         --pretrained-checkpoint ./checkpoints/Qwen3-30B-A3B-FP8 \\
         --tp 2 --ep 2
 """

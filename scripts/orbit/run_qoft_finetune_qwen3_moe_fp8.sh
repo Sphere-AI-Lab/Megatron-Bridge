@@ -66,7 +66,7 @@ echo "  Output: ${OUTPUT_DIR}"
 echo "======================================"
 
 torchrun --nproc_per_node="${NUM_GPUS}" \
-    examples/models/qwen3_moe/finetune_qoft.py \
+    scripts/orbit/models/qwen3_moe/finetune_qoft.py \
     --pretrained-checkpoint "${MEGATRON_CKPT}" \
     --tp "${TP}" --ep "${EP}" \
     --train-iters "${TRAIN_ITERS}" \

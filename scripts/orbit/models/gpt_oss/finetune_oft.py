@@ -20,16 +20,16 @@ OFT (Orthogonal Fine-Tuning) learns block-diagonal orthogonal rotations
 applied to the input of linear layers, preserving angular structure.
 
 Usage:
-    torchrun --nproc_per_node=4 examples/models/gpt_oss/finetune_oft.py \
+    torchrun --nproc_per_node=4 scripts/orbit/models/gpt_oss/finetune_oft.py \
         --pretrained-checkpoint /path/to/gpt-oss-20b
 
     With custom parallelism:
-        torchrun --nproc_per_node=4 examples/models/gpt_oss/finetune_oft.py \
+        torchrun --nproc_per_node=4 scripts/orbit/models/gpt_oss/finetune_oft.py \
             --pretrained-checkpoint /path/to/gpt-oss-20b \
             --tp 2 --ep 2
 
     With Constrained OFT:
-        torchrun --nproc_per_node=4 examples/models/gpt_oss/finetune_oft.py \
+        torchrun --nproc_per_node=4 scripts/orbit/models/gpt_oss/finetune_oft.py \
             --pretrained-checkpoint /path/to/gpt-oss-20b \
             --coft --eps 6e-5
 """
