@@ -25,6 +25,7 @@ architecture is detected from the HF config and each architecture keeps the
 exact recipe base and settings its retired entrypoint used:
 
     Qwen3MoeForCausalLM             fp8 | int4 | nvfp4   (qwen3_30b_a3b recipe)
+    Qwen3ForCausalLM                fp8                  (_peft_common + AutoBridge)
     KimiK25ForConditionalGeneration int4 | nvfp4         (_peft_common + AutoBridge)
     DeepseekV3ForCausalLM           int4                 (moonlight_16b recipe)
 
@@ -54,8 +55,10 @@ from models._qoft_common import (  # noqa: E402
     AdapterInitCallback,
     MemoryProfileCallback,
     NanTraceCallback,
+    assert_fp8_request_keys_in_checkpoint,  # noqa: F401
     disable_evaluation,
     ensure_fp8_scale_inv_buffers,
+    fp8_model_state_dict_kwargs_for_checkpoint_keys,  # noqa: F401
     install_fp8_checkpoint_load_patches,
     install_int4_checkpoint_load_patches,
     install_nvfp4_checkpoint_load_patches,
@@ -89,6 +92,28 @@ QWEN3_MOE_OFT_TARGET_MODULES = [
 # per-model entrypoints. ``defaults`` fills any CLI argument left unset;
 # ``quant_defaults`` refines them per quantization format.
 ARCH_SPECS = {
+    "Qwen3ForCausalLM": {
+        "key": "qwen3_dense",
+        "label": "Qwen3 dense",
+        "slug": "qwen3_dense",
+        "trust_remote_code": False,
+        "quants": ("fp8",),
+        "big_block": False,
+        "int4_scope": "all",
+        "validate_nonfinite": False,
+        "defaults": {
+            "tp": 1,
+            "ep": 1,
+            "sp": False,
+            "train_iters": 10,
+            "global_batch_size": 8,
+            "micro_batch_size": 1,
+            "seq_length": 2048,
+        },
+        "quant_defaults": {},
+        "target_modules": {"fp8": None},
+        "tokenizer_from_ckpt": {"fp8": False},
+    },
     "Qwen3MoeForCausalLM": {
         "key": "qwen3_moe",
         "label": "Qwen3 MoE",
@@ -457,6 +482,18 @@ def build_config(args, spec: dict):
         from megatron.bridge.recipes.qwen import qwen3_30b_a3b_peft_config
 
         config = qwen3_30b_a3b_peft_config(peft_scheme=peft)
+    elif spec["key"] == "qwen3_dense":
+        from megatron.bridge import AutoBridge
+        from megatron.bridge.recipes.common import _peft_common
+        from megatron.bridge.recipes.utils.dataset_utils import default_peft_config
+
+        config = _peft_common()
+        config.model = AutoBridge.from_hf_pretrained(
+            args.hf_model_path,
+            trust_remote_code=spec["trust_remote_code"],
+        ).to_megatron_provider(load_weights=False)
+        config.peft = default_peft_config(peft)
+        config.tokenizer.tokenizer_model = args.hf_model_path
     elif spec["key"] == "kimi_k25":
         from megatron.bridge import AutoBridge
         from megatron.bridge.recipes.common import _peft_common
@@ -542,6 +579,11 @@ def build_config(args, spec: dict):
     return config
 
 
+def _debug_flag(name: str) -> bool:
+    """Whether an opt-in debug environment variable is set."""
+    return os.environ.get(name, "0").lower() in ("1", "true", "yes")
+
+
 def main() -> None:
     """Detect the architecture, build the config, install patches, finetune."""
     args = parse_args()
@@ -567,6 +609,23 @@ def main() -> None:
 
     config = build_config(args, spec)
 
+    if _debug_flag("QOFT_DEBUG_ZERO_LR"):
+        # Pin every learning rate to zero so the optimizer cannot change a
+        # single parameter. Any failure that still appears on a later step is
+        # therefore independent of the update -- it comes from the data or from
+        # reused device memory, not from a bad step.
+        config.optimizer.lr = 0.0
+        config.optimizer.min_lr = 0.0
+        config.scheduler.lr_warmup_init = 0.0
+        config.scheduler.lr_warmup_iters = 0
+        print("[qoft-debug] learning rate pinned to 0: parameters are identical on every step")
+
+    if _debug_flag("QOFT_DEBUG_ANOMALY"):
+        # Names the forward operation whose backward produced the first
+        # non-finite value, which module-level hooks cannot do.
+        torch.autograd.set_detect_anomaly(True)
+        print("[qoft-debug] autograd anomaly detection enabled (slow)")
+
     if args.quant == "int4":
         after_load_hook = None
         if args.profile_memory and args.skip_train:
@@ -583,7 +642,10 @@ def main() -> None:
             after_load_hook=after_load_hook,
         )
     elif args.quant == "fp8":
-        install_fp8_checkpoint_load_patches()
+        install_fp8_checkpoint_load_patches(
+            pretrained_checkpoint=args.pretrained_checkpoint,
+            arch_label=spec["label"],
+        )
     elif args.quant == "nvfp4":
         install_nvfp4_checkpoint_load_patches(
             pretrained_checkpoint=args.pretrained_checkpoint,

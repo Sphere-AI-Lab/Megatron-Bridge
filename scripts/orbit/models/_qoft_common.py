@@ -773,6 +773,34 @@ class NanTraceCallback(Callback):
                 f"finite_abs_max={param_issue['finite_abs_max']:.6g}"
             )
 
+        # A gradient buffer must be zero before the step's first accumulation.
+        # Garbage here means the backward accumulates on top of uninitialized
+        # memory, which reads as a huge but perfectly reproducible gradient
+        # (the leftover bytes are a function of the allocation history, so the
+        # magnitude changes whenever unrelated code changes).
+        rank_id = dist.get_rank() if dist.is_initialized() else 0
+        buckets: dict[str, tuple[float, int, str]] = {}
+        for model_chunk in context.model if isinstance(context.model, list) else [context.model]:
+            for name, param in model_chunk.named_parameters():
+                if not param.requires_grad:
+                    continue
+                grad = getattr(param, "main_grad", None)
+                if grad is None:
+                    continue
+                group = "expert" if ".experts." in name else "dense"
+                magnitude = float(grad.detach().abs().max().item())
+                worst, count, where = buckets.get(group, (0.0, 0, "n/a"))
+                buckets[group] = (
+                    max(worst, magnitude),
+                    count + 1,
+                    name if magnitude > worst else where,
+                )
+        for group, (worst, count, where) in sorted(buckets.items()):
+            print(
+                f"[nan-debug][rank{rank_id}] pre-backward main_grad max|.| for {group} params: "
+                f"{worst:.6g} over {count} params (worst: {where})"
+            )
+
     def on_train_step_end(self, context) -> None:
         step = int(context.state.train_state.step)
         if not self._should_trace(step):
@@ -1140,6 +1168,54 @@ def install_int4_checkpoint_load_patches(
 # FP8 (quantized base) checkpoint-load patches
 # --------------------------------------------------------------------------- #
 
+_EXPLICIT_LAYER_KEY_RE = re.compile(r"\.layers\.\d+\.")
+
+
+def fp8_model_state_dict_kwargs_for_checkpoint_keys(
+    model_sd_kwargs: dict[str, Any] | None,
+    checkpoint_keys: Iterable[str],
+) -> dict[str, Any] | None:
+    """Request explicit Megatron layer keys when the FP8 checkpoint uses them."""
+    if not any(_EXPLICIT_LAYER_KEY_RE.search(str(key)) for key in checkpoint_keys):
+        return model_sd_kwargs
+
+    updated_kwargs = dict(model_sd_kwargs or {})
+    metadata = dict(updated_kwargs.get("metadata") or {})
+    metadata["non_homogeneous_layers"] = True
+    updated_kwargs["metadata"] = metadata
+    return updated_kwargs
+
+
+def assert_fp8_request_keys_in_checkpoint(
+    model_state: dict[str, Any],
+    checkpoint_keys: frozenset[str],
+    arch_label: str,
+) -> None:
+    """Fail concisely when the FP8 runtime request contract diverges."""
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
+
+    requested = set()
+    for value in model_state.values():
+        entries = value if isinstance(value, list) else [value]
+        for entry in entries:
+            if not isinstance(entry, ShardedTensor):
+                continue
+            key = str(entry.key)
+            if "._extra_state" in key or key.endswith(".oft_r"):
+                continue
+            requested.add(key)
+
+    missing = sorted(requested - checkpoint_keys)
+    if missing:
+        preview = ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else "")
+        raise RuntimeError(
+            f"{arch_label} FP8 preflight: {len(missing)} requested tensor entries are not in the "
+            f"checkpoint index of {len(checkpoint_keys)} entries: {preview}. The trainer-side "
+            "request contract has diverged from the direct FP8 converter output; fix the "
+            "transform/converter pair (megatron.bridge.orbit.quant.fp8_utils / "
+            "scripts/orbit/conversion/convert_fp8_checkpoint_direct.py), not the checkpoint."
+        )
+
 
 def infer_fp8_scale_inv_shape(weight: torch.Tensor, *, block_size: int = FP8_WEIGHT_BLOCK_SIZE) -> tuple[int, ...]:
     """Return the block-wise ``weight_scale_inv`` shape for an FP8 weight."""
@@ -1187,8 +1263,8 @@ def ensure_fp8_scale_inv_buffers(model):
     return model
 
 
-def install_fp8_checkpoint_load_patches() -> None:
-    """Patch checkpoint loading to read FP8 base weights with their block scales."""
+def install_fp8_checkpoint_load_patches(*, pretrained_checkpoint: str, arch_label: str) -> None:
+    """Load FP8 base weights through the direct converter's checkpoint contract."""
     import megatron.bridge.training.checkpointing as _ckpt_mod
     from megatron.bridge.orbit.quant.fp8_utils import (
         register_fp8_scale_inv_buffers_after_load,
@@ -1200,12 +1276,47 @@ def install_fp8_checkpoint_load_patches() -> None:
 
     original_generate_model_sd = _ckpt_mod._generate_model_state_dict
     original_load_model_sd = _ckpt_mod._load_model_state_dict
+    checkpoint_keys_cache: dict[str, frozenset[str]] = {}
+
+    def _resolve_distributed_checkpoint_dir() -> str:
+        from megatron.core import dist_checkpointing
+
+        if dist_checkpointing.check_is_distributed_checkpoint(pretrained_checkpoint):
+            return pretrained_checkpoint
+        if os.path.isdir(pretrained_checkpoint):
+            iteration_dirs = sorted(
+                entry
+                for entry in os.listdir(pretrained_checkpoint)
+                if entry.startswith("iter_") and os.path.isdir(os.path.join(pretrained_checkpoint, entry))
+            )
+            for entry in reversed(iteration_dirs):
+                candidate = os.path.join(pretrained_checkpoint, entry)
+                if dist_checkpointing.check_is_distributed_checkpoint(candidate):
+                    return candidate
+        return pretrained_checkpoint
+
+    def _checkpoint_tensor_keys() -> frozenset[str]:
+        if "keys" not in checkpoint_keys_cache:
+            from megatron.core import dist_checkpointing
+
+            checkpoint_keys_cache["keys"] = frozenset(
+                str(key) for key in dist_checkpointing.load_tensors_metadata(_resolve_distributed_checkpoint_dir())
+            )
+        return checkpoint_keys_cache["keys"]
 
     def _fp8_generate_model_state_dict(model, model_sd_kwargs=None, ckpt_format="torch_dist", **kwargs):
+        checkpoint_keys = _checkpoint_tensor_keys()
+        model_sd_kwargs = fp8_model_state_dict_kwargs_for_checkpoint_keys(model_sd_kwargs, checkpoint_keys)
         state_dict = original_generate_model_sd(model, model_sd_kwargs, ckpt_format, **kwargs)
+        if ckpt_format != "torch_dist":
+            return state_dict
         for model_key in list(state_dict.keys()):
-            if model_key.startswith("model"):
-                state_dict[model_key] = transform_sharded_state_dict_for_fp8(state_dict[model_key])
+            if not model_key.startswith("model"):
+                continue
+            model_state = _drop_extra_state_entries(state_dict[model_key])
+            model_state = transform_sharded_state_dict_for_fp8(model_state)
+            assert_fp8_request_keys_in_checkpoint(model_state, checkpoint_keys, arch_label)
+            state_dict[model_key] = model_state
         return state_dict
 
     def _fp8_load_model_state_dict(model_module, state_dict, strict=True):
@@ -1235,9 +1346,6 @@ _EXPECTED_NVFP4_MISSING_KEY_RE = re.compile(
     r".*\.(?:experts\.linear_fc[12]\.(?:weight\d*(?:_w|_v)?(?:_packed)?|weight_(?:scale|double_scale|amax)\d+)"
     r"|weight_quantizer\.[A-Za-z_]+\d*)$"
 )
-# Explicit per-layer checkpoint keys (decoder.layers.N....) as opposed to the
-# homogeneous-layer encoding that folds the layer index into sharded offsets.
-_EXPLICIT_LAYER_KEY_RE = re.compile(r"\.layers\.\d+\.")
 # Packed per-expert weight buffers installed by register_nvfp4_buffers_after_load.
 _PACKED_EXPERT_BUFFER_RE = re.compile(r"^weight\d+(?:_w|_v)?_packed$")
 
