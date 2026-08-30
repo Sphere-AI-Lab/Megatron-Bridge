@@ -151,19 +151,37 @@ Each of these was confirmed by reading both trees.
    extractability wart. Both patch targets were **verified present** in mcore
    `235952df` — see §8.
 
-5. **Two seam imports are unguarded**, on the checkpoint-resume path:
-   `checkpointing.py:3008` and `post_training/checkpointing.py:162`. Deleting
-   orbit would `ImportError` on every resume. Guard them so radixark stays
-   runnable without orbit.
+5. **Two seam imports are unguarded — RESOLVED, deliberately left unguarded.**
+   `checkpointing.py` and `post_training/checkpointing.py` import orbit directly
+   on the checkpoint save/resume paths. Guards were briefly added, then removed:
+   extraction reverts each seam hunk *wholesale*, so a seam never executes with
+   orbit absent, making the guard unreachable. All it could do was turn a real
+   failure — a broken modelopt plugin, which `import_plugin` already downgrades to
+   a warning — into a silent no-op on the main resume path. Seam design rule 3 in
+   `UPSTREAM_SEAMS.md` now forbids the guard.
 
 6. **`AdapterWrapper.sharded_state_dict`** in radixark lacks spherelab's
    `_plain_module_sharded_state_dict` fallback. Risk of dropping delta-only
    adapter weights. Needs a runtime check, not a static one.
 
-7. **`LoRA` dataclass default flip:** radixark's `share_expert_adapters`
-   defaults to `False` (spherelab `True`), and radixark has no
-   `sequence_parallel_input_regather`. Orbit sets neither, so this is a silent
-   behaviour change for MoE LoRA runs, not a break.
+7. **`LoRA` dataclass default flip — RESOLVED, keeping radixark's default.**
+   radixark's `share_expert_adapters` defaults to `False` (spherelab `True`), and
+   radixark has no `sequence_parallel_input_regather`. Orbit sets neither.
+
+   Investigated: orbit's own OFT path is unaffected — `GroupedOFTRotation` is
+   unconditionally per-expert and has no sharing option, so it never consults the
+   flag. The only affected site is the `--peft lora` comparison baseline at
+   `scripts/orbit/finetune_qoft.py:307`, which constructs `LoRA(**kwargs)` without
+   the flag. radixark's `False` (per-expert) therefore *matches* orbit OFT's
+   semantics, making that baseline more comparable than spherelab's `True`
+   (shared) did. Decision: do not override; pass `share_expert_adapters=True`
+   explicitly only if reproducing pre-migration LoRA parameter counts.
+
+   Noted while checking: radixark's own `tests/unit_tests/peft/test_lora.py:207`
+   and `test_canonical_lora.py:196` still assert the flag is `True`, so they fail
+   against radixark's own default. Pre-existing upstream staleness, identical in
+   both trees, left untouched — fixing it would add a 4th modified upstream file
+   and break containment.
 
 ### Non-issues (checked, harmless)
 
@@ -318,13 +336,30 @@ return `OFTLinearSplitQKV`, `OFTLinearSplitFC1UpGate`, or
 `OFTLinearGroupedSplitFC1UpGate` (`canonical_oft.py:1507-1538`). These are plain
 `nn.Module` *replacements* for the target module, not `AdapterWrapper`
 subclasses, so radixark's method never runs for them — and `canonical_oft.py`
-defines no `sharded_state_dict` at all. Whether their `oft_r` parameters reach
-the checkpoint therefore depends on how mcore's sharded-state-dict traversal
-treats a plain `nn.Module` child. That is a runtime question; settle it by
-training a CanonicalOFT split-QKV/split-FC1 config for a few steps, saving, and
-grepping the checkpoint for `oft_r` keys. Blocker #7
-(`share_expert_adapters` default flip) likewise changes the trainable parameter
-count for MoE, not just behaviour.
+originally defined no `sharded_state_dict` at all.
+
+**Settled statically, and fixed.** Nothing was dropped: mcore's
+`sharded_state_dict_default` takes its plain-`nn.Module` branch and calls
+`module.state_dict(prefix='', keep_vars=True)` for the *whole subtree*, so the
+`oft_r` parameters do reach the checkpoint. But it passes an empty
+`tensor_parallel_layers_axis_map`, so every tensor is marked replicated — and
+because the subtree is snapshotted in one shot, descendant `sharded_state_dict`
+methods are never consulted. That silently discarded `to_wrap`'s own TP sharding
+and `OFTRotationModule`'s `oft_r` axis map and expert `replica_id` fixups.
+
+Fixed with a `_split_wrapper_sharded_state_dict` helper plus a thin
+`sharded_state_dict` on each of the three wrappers that delegates per child. The
+helper also re-derives `tp_group` from the wrapped TP layer, because
+`sharded_state_dict_default` drops `tp_group` when dispatching to a module's own
+`sharded_state_dict` and `make_sharded_tensors_for_checkpoint` only substitutes
+the default group when `dp_cp_group` is *also* `None` — left as `None`, every TP
+rank would report `replica_id` 0.
+
+Key names are unchanged, but sharding metadata is not: `oft_r` becomes TP-sharded
+on axis 0 where it was previously replicated, so pre-fix and post-fix checkpoints
+are **not interchangeable at TP>1**. At TP=1 nothing changes. This was
+pre-existing spherelab behaviour, not a migration regression, and the fix is
+**unverified** — TP>1 is not reproducible on a CPU-only box.
 
 ### Seam notes
 

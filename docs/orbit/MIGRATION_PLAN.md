@@ -190,14 +190,18 @@ Nothing in Phases 0–2 executes Python. Hand off with this order, cheapest firs
 1. `uv run ruff check .` and `uv run ruff format --check .`
 2. Import smoke test: `import megatron.bridge.orbit` and each subpackage.
 3. `uv run python -m pytest tests/unit_tests/orbit/`
-4. Delete-orbit test: confirm training/resume still imports with orbit absent
-   (this is what blocker #5 protects).
+4. Confirm extraction still reconstructs radixark byte-for-byte (Gate 3 tree
+   proof). The old "delete orbit and confirm training still imports" check is
+   obsolete: the seams are deliberately unguarded, so extraction reverts the seam
+   hunks rather than leaning on an `ImportError` fallback.
 5. One INT4 conversion via `scripts/orbit/conversion/convert_int4_checkpoint_direct.py`.
 6. One short QOFT finetune via `scripts/orbit/finetune_peft.py`.
 
-Blockers #4 (mcore monkeypatch), #6 (`sharded_state_dict` fallback) and #7
-(`share_expert_adapters` default flip) can only be settled at step 4–6. They
-are runtime concerns, flagged not fixed.
+Blockers #5, #6 and #7 are settled (see MEMORY §9). Blocker #4 (mcore
+monkeypatch) remains a runtime concern, flagged not fixed. Additionally, the
+CanonicalOFT split-wrapper sharding fix needs runtime verification at TP>1 —
+save a split-QKV/split-FC1 CanonicalOFT checkpoint and confirm `oft_r` is
+sharded on axis 0 rather than replicated.
 
 ## Future upstream re-fetch (the actual point of all this)
 
