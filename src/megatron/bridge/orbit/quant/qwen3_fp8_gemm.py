@@ -28,10 +28,7 @@ def get_qwen3_fp8_gemm_backend() -> str:
     if backend in {"", "0", "false", "off"}:
         return "qdq"
     if backend not in _VALID_BACKENDS:
-        raise ValueError(
-            f"Unsupported {_BACKEND_ENV}={backend!r}. "
-            "Expected one of: auto, qdq, sglang_native."
-        )
+        raise ValueError(f"Unsupported {_BACKEND_ENV}={backend!r}. Expected one of: auto, qdq, sglang_native.")
     return backend
 
 
@@ -77,17 +74,11 @@ def _normalize_weight_scale(
     scale = weight_scale_inv.detach()
 
     if scale.ndim == 0 or scale.numel() == 1:
-        return (
-            scale.reshape(1)
-            .to(device=weight.device, dtype=torch.float32)
-            .expand(expected)
-            .contiguous()
-        )
+        return scale.reshape(1).to(device=weight.device, dtype=torch.float32).expand(expected).contiguous()
 
     if scale.ndim != 2:
         raise ValueError(
-            "Qwen3 native FP8 GEMM expects scalar or 2D weight_scale_inv, "
-            f"got shape={tuple(scale.shape)}."
+            f"Qwen3 native FP8 GEMM expects scalar or 2D weight_scale_inv, got shape={tuple(scale.shape)}."
         )
 
     if tuple(scale.shape) != expected:
@@ -109,10 +100,7 @@ def _validate_inputs(
 ) -> None:
     """Validate the subset of shapes supported by Qwen3 native block-FP8 GEMM."""
     if block_size != QWEN3_FP8_BLOCK_SIZE:
-        raise ValueError(
-            f"{module_name}: only block size {QWEN3_FP8_BLOCK_SIZE} is supported, "
-            f"got {block_size}."
-        )
+        raise ValueError(f"{module_name}: only block size {QWEN3_FP8_BLOCK_SIZE} is supported, got {block_size}.")
     if not input.is_floating_point():
         raise ValueError(f"{module_name}: input must be a floating point tensor.")
     if input.dim() < 1:
@@ -123,13 +111,11 @@ def _validate_inputs(
         raise ValueError(f"{module_name}: weight must be non-empty, got shape={tuple(weight.shape)}.")
     if input.shape[-1] != weight.shape[1]:
         raise ValueError(
-            f"{module_name}: input last dim {input.shape[-1]} must match "
-            f"weight input dim {weight.shape[1]}."
+            f"{module_name}: input last dim {input.shape[-1]} must match weight input dim {weight.shape[1]}."
         )
     if input.shape[-1] % QWEN3_FP8_BLOCK_SIZE[1] != 0:
         raise ValueError(
-            f"{module_name}: input last dim {input.shape[-1]} must be divisible by "
-            f"{QWEN3_FP8_BLOCK_SIZE[1]}."
+            f"{module_name}: input last dim {input.shape[-1]} must be divisible by {QWEN3_FP8_BLOCK_SIZE[1]}."
         )
     if not isinstance(weight_scale_inv, torch.Tensor):
         raise ValueError(f"{module_name}: weight_scale_inv must be a tensor.")
@@ -187,8 +173,7 @@ def _dequant_fp8_qwen3(
             col_start = block_j * block_k
             col_end = min(col_start + block_k, in_features)
             output[row_start:row_end, col_start:col_end] = (
-                weight_float[row_start:row_end, col_start:col_end]
-                * scale_float[block_i, block_j]
+                weight_float[row_start:row_end, col_start:col_end] * scale_float[block_i, block_j]
             )
 
     return output.to(out_dtype)

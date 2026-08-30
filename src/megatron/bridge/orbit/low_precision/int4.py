@@ -24,11 +24,6 @@ from typing import Any, Dict, Mapping
 
 import torch
 
-from megatron.bridge.orbit.low_precision.common import (
-    TensorSpillManager,
-    add_tensor_entry,
-    prepare_empty_model_state,
-)
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
@@ -40,6 +35,12 @@ from megatron.bridge.models.conversion.param_mapping import (
     merge_qkv_biases,
     merge_qkv_weights,
 )
+from megatron.bridge.orbit.low_precision.common import (
+    TensorSpillManager,
+    add_tensor_entry,
+    prepare_empty_model_state,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -97,16 +98,13 @@ def _infer_int4_group_size(weight_packed: torch.Tensor, weight_scale: torch.Tens
         raise ValueError(f"out_features must be positive, got {out_features}")
     if weight_scale.numel() % out_features != 0:
         raise ValueError(
-            f"weight_scale with {weight_scale.numel()} values cannot be grouped by "
-            f"out_features={out_features}"
+            f"weight_scale with {weight_scale.numel()} values cannot be grouped by out_features={out_features}"
         )
     scale_groups = weight_scale.numel() // out_features
     if scale_groups <= 0:
         raise ValueError(f"scale_groups must be positive, got {scale_groups}")
     if in_features % scale_groups != 0:
-        raise ValueError(
-            f"in_features={in_features} is not divisible by scale_groups={scale_groups}"
-        )
+        raise ValueError(f"in_features={in_features} is not divisible by scale_groups={scale_groups}")
     return in_features // scale_groups
 
 
@@ -174,9 +172,7 @@ def requantize_int4_with_scales(
     """
     out_features, in_features = weight.shape
     if scale.dim() != 2 or scale.shape[0] != out_features or in_features % scale.shape[1] != 0:
-        raise ValueError(
-            f"scale shape {tuple(scale.shape)} does not tile weight shape {tuple(weight.shape)}"
-        )
+        raise ValueError(f"scale shape {tuple(scale.shape)} does not tile weight shape {tuple(weight.shape)}")
     num_groups = scale.shape[1]
     group_size = in_features // num_groups
     weight_shape = torch.tensor([out_features, in_features], dtype=torch.int32)
@@ -195,18 +191,15 @@ def requantize_int4_with_scales(
     return packed, scale, weight_shape
 
 
-def hf_weight_has_int4_triplet(
-    weight_key: str, hf_state_dict: Mapping[str, torch.Tensor]
-) -> bool:
+def hf_weight_has_int4_triplet(weight_key: str, hf_state_dict: Mapping[str, torch.Tensor]) -> bool:
     if not weight_key.endswith(".weight"):
         return False
     base = weight_key[: -len(".weight")]
     return f"{base}.weight_packed" in hf_state_dict
 
 
-def hf_param_uses_int4(
-    hf_param: Any, hf_state_dict: Mapping[str, torch.Tensor]
-) -> bool:
+def hf_param_uses_int4(hf_param: Any, hf_state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """Return True if an HF param name, or any name nested in a dict, is INT4-packed."""
     if isinstance(hf_param, str):
         return hf_weight_has_int4_triplet(hf_param, hf_state_dict)
     if isinstance(hf_param, dict):
@@ -219,9 +212,7 @@ def convert_hf_weight_for_direct_save(task: Any, hf_weights: Any) -> torch.Tenso
     mapping = task.mapping
 
     if getattr(mapping, "tp_size", 1) != 1:
-        raise ValueError(
-            "Direct INT4 converter currently supports only single-rank TP=1 checkpoint writes."
-        )
+        raise ValueError("Direct INT4 converter currently supports only single-rank TP=1 checkpoint writes.")
 
     if isinstance(mapping, AutoMapping):
         converted = hf_weights
@@ -288,10 +279,7 @@ def _load_hf_int4_triplets(
     if isinstance(hf_param, str):
         return _load_hf_int4_triplet(hf_param, hf_state_dict)
     if isinstance(hf_param, dict):
-        triplets = {
-            role: _load_hf_int4_triplets(key, hf_state_dict)
-            for role, key in hf_param.items()
-        }
+        triplets = {role: _load_hf_int4_triplets(key, hf_state_dict) for role, key in hf_param.items()}
         if all(isinstance(value, _Int4Triplet) for value in triplets.values()):
             return triplets  # type: ignore[return-value]
     return None
@@ -344,9 +332,7 @@ def _convert_hf_int4_triplet_for_direct_save(task: Any, hf_triplets: Any) -> _In
     mapping = task.mapping
 
     if getattr(mapping, "tp_size", 1) != 1:
-        raise ValueError(
-            "Direct INT4 converter currently supports only single-rank TP=1 checkpoint writes."
-        )
+        raise ValueError("Direct INT4 converter currently supports only single-rank TP=1 checkpoint writes.")
 
     if isinstance(
         mapping,
@@ -404,9 +390,7 @@ def build_int4_direct_model_state_dict(
 ) -> dict[str, Any]:
     """Create the prebuilt ``state_dict['model']`` for direct INT4 checkpoint save."""
     if len(meta_model) != 1:
-        raise ValueError(
-            "Direct INT4 converter currently supports a single Megatron model chunk (no VP stages)."
-        )
+        raise ValueError("Direct INT4 converter currently supports a single Megatron model chunk (no VP stages).")
 
     model_state = prepare_empty_model_state(model_template)
     conversion_tasks = int4_bridge.build_conversion_tasks(hf_pretrained, meta_model)
@@ -483,9 +467,7 @@ def build_int4_direct_model_state_dict(
 # Dense Megatron linear weight keys: attention QKV / output proj + gated MLP
 # fc1 / fc2. Matches the names produced by the Llama bridge's mapping registry
 # for GPTModel (`decoder.layers.{i}.self_attention.linear_qkv.weight`, etc.).
-_DENSE_LINEAR_WEIGHT_RE = re.compile(
-    r"^(.*\.(?:linear_qkv|linear_proj|linear_fc1|linear_fc2|router))\.weight$"
-)
+_DENSE_LINEAR_WEIGHT_RE = re.compile(r"^(.*\.(?:linear_qkv|linear_proj|linear_fc1|linear_fc2|router))\.weight$")
 _DENSE_LINEAR_TRIPLET_RE = re.compile(
     r"^(.*\.(?:linear_qkv|linear_proj|linear_fc1|linear_fc2|router))\.weight_(packed|scale|shape)$"
 )
@@ -648,13 +630,10 @@ def transform_sharded_state_dict_for_int4_dense(
         global_in = sh_ten.global_shape[-1]
 
         if local_in % 8 != 0:
-            raise ValueError(
-                f"INT4 requires in-features divisible by 8, got {local_in} for {key}"
-            )
+            raise ValueError(f"INT4 requires in-features divisible by 8, got {local_in} for {key}")
         if local_in % group_size != 0:
             raise ValueError(
-                f"INT4 requires in-features divisible by group_size={group_size}, "
-                f"got {local_in} for {key}"
+                f"INT4 requires in-features divisible by group_size={group_size}, got {local_in} for {key}"
             )
 
         packed_in = local_in // 8
@@ -666,17 +645,9 @@ def transform_sharded_state_dict_for_int4_dense(
         out_offset_full = (
             out_offset_override
             if out_offset_override is not None
-            else (
-                sh_ten.global_offset[prepend]
-                if len(sh_ten.global_offset) > prepend
-                else 0
-            )
+            else (sh_ten.global_offset[prepend] if len(sh_ten.global_offset) > prepend else 0)
         )
-        in_offset_full = (
-            sh_ten.global_offset[prepend + 1]
-            if len(sh_ten.global_offset) > prepend + 1
-            else 0
-        )
+        in_offset_full = sh_ten.global_offset[prepend + 1] if len(sh_ten.global_offset) > prepend + 1 else 0
 
         has_explicit_layer_idx = _EXPLICIT_LAYER_KEY_RE.search(key) is not None
         if prepend > 0 and not has_explicit_layer_idx:
@@ -691,15 +662,23 @@ def transform_sharded_state_dict_for_int4_dense(
             if global_layer_idx is None:
                 ckpt_key = key
             else:
-                ckpt_key = re.sub(
-                    r"(^|\.)layers\.", rf"\1layers.{global_layer_idx}.", key, count=1
-                )
+                ckpt_key = re.sub(r"(^|\.)layers\.", rf"\1layers.{global_layer_idx}.", key, count=1)
 
             triplets = [
-                ("_packed", (local_out, packed_in), (global_out, global_packed_in),
-                 (out_offset_full, in_offset_full // 8), torch.int32),
-                ("_scale", (local_out, num_groups), (global_out, global_num_groups),
-                 (out_offset_full, in_offset_full // group_size), scale_dtype),
+                (
+                    "_packed",
+                    (local_out, packed_in),
+                    (global_out, global_packed_in),
+                    (out_offset_full, in_offset_full // 8),
+                    torch.int32,
+                ),
+                (
+                    "_scale",
+                    (local_out, num_groups),
+                    (global_out, global_num_groups),
+                    (out_offset_full, in_offset_full // group_size),
+                    scale_dtype,
+                ),
                 ("_shape", (2,), (2,), (0,), torch.int64),
             ]
 
@@ -723,11 +702,7 @@ def transform_sharded_state_dict_for_int4_dense(
                         f"original_dense_data_device={original_device}"
                     ) from exc
                 cumulative_allocated_bytes += alloc_bytes
-                axis_frags = (
-                    weight_axis_fragmentations
-                    if suffix != "_shape"
-                    else (1,)
-                )
+                axis_frags = weight_axis_fragmentations if suffix != "_shape" else (1,)
                 new_sd[ckpt_key + suffix] = ShardedTensor(
                     key=ckpt_key + suffix,
                     data=data,

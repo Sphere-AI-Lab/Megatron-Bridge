@@ -20,20 +20,17 @@ These helpers operate on the canonical Kimi-K2 native INT4 triplet format:
     weight_shape:   [2]              int64
 """
 
-import torch
-
 import re
 from typing import Any, Dict
 
-_EXPERT_WEIGHT_RE = re.compile(
-    r"^(.*\.experts\.linear_fc[12])\.weight(\d+)$"
-)
+import torch
+
+
+_EXPERT_WEIGHT_RE = re.compile(r"^(.*\.experts\.linear_fc[12])\.weight(\d+)$")
 # Also matches the base "weight" key (no digit suffix) for expert grouped linears.
 # This key is produced by sharded_state_dict() but has no corresponding checkpoint
 # entry — the per-expert weight{N} entries handle all experts.
-_EXPERT_BASE_WEIGHT_RE = re.compile(
-    r"^.*\.experts\.linear_fc[12]\.weight$"
-)
+_EXPERT_BASE_WEIGHT_RE = re.compile(r"^.*\.experts\.linear_fc[12]\.weight$")
 
 
 def _empty_storage_view(tensor: torch.Tensor) -> torch.Tensor:
@@ -101,16 +98,14 @@ def transform_sharded_state_dict_for_int4(
     print(f"[INT4 transform] Processing {len(sharded_state_dict)} keys", flush=True)
     # Debug: find expert weight keys by type
     from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+
     expert_by_type: Dict[str, int] = {}
     for k, v in sharded_state_dict.items():
         if "experts" in k and "linear_fc" in k and "weight" in k.split(".")[-1]:
             tname = type(v).__name__
             expert_by_type[tname] = expert_by_type.get(tname, 0) + 1
     print(f"[INT4 transform] Expert weight keys by type: {expert_by_type}", flush=True)
-    canonical_keys = {
-        _canonicalize_expert_key_for_checkpoint(k)
-        for k in sharded_state_dict.keys()
-    }
+    canonical_keys = {_canonicalize_expert_key_for_checkpoint(k) for k in sharded_state_dict.keys()}
     new_sd: Dict[str, Any] = {}
     for key, value in sharded_state_dict.items():
         # Materialize any meta-device ShardedTensors on CPU so PyTorch's
@@ -225,7 +220,7 @@ def transform_sharded_state_dict_for_int4(
         global_in = sh_ten.global_shape[-1]
 
         # INT4 packed: 8 INT4 values packed into one int32 along in-features dim
-        packed_in = local_in // 8            # e.g. 2048 / 8 = 256
+        packed_in = local_in // 8  # e.g. 2048 / 8 = 256
         global_packed_in = global_in // 8
         # Scale: one fp16 scale value per group of `group_size` elements
         num_groups = local_in // group_size  # e.g. 2048 / 32 = 64
@@ -248,23 +243,25 @@ def transform_sharded_state_dict_for_int4(
         # checkpoint's per-expert tensor layout (no prepended expert axis).
         triplets = [
             # weight_packed: [out, in/8] int32 — the quantized weights
-            ("_packed", (local_out, packed_in),
-                        (global_out, global_packed_in),
-                        (out_offset, in_offset // 8),
-                        weight_axis_fragmentations,
-                        torch.int32),
+            (
+                "_packed",
+                (local_out, packed_in),
+                (global_out, global_packed_in),
+                (out_offset, in_offset // 8),
+                weight_axis_fragmentations,
+                torch.int32,
+            ),
             # weight_scale: [out, in/group_size] fp16 — per-group scale factors
-            ("_scale",  (local_out, num_groups),
-                        (global_out, global_num_groups),
-                        (out_offset, in_offset // group_size),
-                        weight_axis_fragmentations,
-                        scale_dtype),
+            (
+                "_scale",
+                (local_out, num_groups),
+                (global_out, global_num_groups),
+                (out_offset, in_offset // group_size),
+                weight_axis_fragmentations,
+                scale_dtype,
+            ),
             # weight_shape: [2] int64 — original (out, in) dimensions
-            ("_shape",  (2,),
-                        (2,),
-                        (0,),
-                        (1,),
-                        torch.int64),
+            ("_shape", (2,), (2,), (0,), (1,), torch.int64),
         ]
 
         for suffix, local_sh, global_sh, off, axis_frags, dtype in triplets:
@@ -300,9 +297,7 @@ def register_int4_buffers_after_load(
     them as persistent buffers on the corresponding modules, and empties the
     BF16 ``.weight{N}`` parameters to free memory.
     """
-    _TRIPLET_RE = re.compile(
-        r"^(.*\.experts\.linear_fc[12])\.weight(\d+)_(packed|scale|shape)$"
-    )
+    _TRIPLET_RE = re.compile(r"^(.*\.experts\.linear_fc[12])\.weight(\d+)_(packed|scale|shape)$")
 
     # Group triplets by (module_path, expert_idx)
     triplets: Dict[tuple, Dict[str, torch.Tensor]] = {}

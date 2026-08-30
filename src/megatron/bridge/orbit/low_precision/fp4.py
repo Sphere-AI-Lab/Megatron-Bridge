@@ -23,10 +23,6 @@ from typing import Any, Mapping
 
 import torch
 
-from megatron.bridge.orbit.low_precision.common import (
-    add_tensor_entry,
-    prepare_empty_model_state,
-)
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
@@ -38,7 +34,12 @@ from megatron.bridge.models.conversion.param_mapping import (
     merge_qkv_biases,
     merge_qkv_weights,
 )
+from megatron.bridge.orbit.low_precision.common import (
+    add_tensor_entry,
+    prepare_empty_model_state,
+)
 from megatron.bridge.orbit.quant.fp8_utils import merge_gated_mlp_scale_inv, merge_qkv_scale_inv
+
 
 logger = logging.getLogger(__name__)
 
@@ -123,10 +124,7 @@ def _load_quant_bundles(
     if isinstance(hf_param, str):
         return _load_quant_bundle(hf_param, hf_state_dict)
     if isinstance(hf_param, dict):
-        bundles = {
-            role: _load_quant_bundles(key, hf_state_dict)
-            for role, key in hf_param.items()
-        }
+        bundles = {role: _load_quant_bundles(key, hf_state_dict) for role, key in hf_param.items()}
         if all(isinstance(value, _QuantBundle) for value in bundles.values()):
             kinds = {value.kind for value in bundles.values() if isinstance(value, _QuantBundle)}
             if len(kinds) == 1:
@@ -193,9 +191,7 @@ def _convert_fp4_scale_for_direct_save(task: Any, bundles: _QuantBundle | dict[s
     mapping = task.mapping
 
     if getattr(mapping, "tp_size", 1) != 1:
-        raise ValueError(
-            "Direct FP4 converter currently supports only single-rank TP=1 checkpoint writes."
-        )
+        raise ValueError("Direct FP4 converter currently supports only single-rank TP=1 checkpoint writes.")
 
     if isinstance(
         mapping,
@@ -231,9 +227,7 @@ def _convert_fp8_scale_for_direct_save(task: Any, bundles: _QuantBundle | dict[s
     mapping = task.mapping
 
     if getattr(mapping, "tp_size", 1) != 1:
-        raise ValueError(
-            "Direct FP4/FP8 converter currently supports only single-rank TP=1 checkpoint writes."
-        )
+        raise ValueError("Direct FP4/FP8 converter currently supports only single-rank TP=1 checkpoint writes.")
 
     if isinstance(
         mapping,
@@ -270,9 +264,7 @@ def convert_hf_weight_for_direct_save(task: Any, hf_weights: Any) -> torch.Tenso
     mapping = task.mapping
 
     if getattr(mapping, "tp_size", 1) != 1:
-        raise ValueError(
-            "Direct FP4 converter currently supports only single-rank TP=1 checkpoint writes."
-        )
+        raise ValueError("Direct FP4 converter currently supports only single-rank TP=1 checkpoint writes.")
 
     if isinstance(mapping, AutoMapping):
         converted = hf_weights
@@ -331,9 +323,7 @@ def build_fp4_direct_model_state_dict(
 ) -> dict[str, Any]:
     """Build a direct-save Megatron model state for DeepSeek-style FP4/FP8 HF checkpoints."""
     if len(meta_model) != 1:
-        raise ValueError(
-            "Direct FP4 converter currently supports a single Megatron model chunk (no VP stages)."
-        )
+        raise ValueError("Direct FP4 converter currently supports a single Megatron model chunk (no VP stages).")
 
     model_state = prepare_empty_model_state(model_template)
     conversion_tasks = bridge.build_conversion_tasks(hf_pretrained, meta_model)

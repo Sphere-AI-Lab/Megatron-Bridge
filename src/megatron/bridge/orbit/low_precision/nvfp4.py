@@ -16,31 +16,15 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import gc
 import re
 import time
+from copy import deepcopy
 from typing import Any, Iterable, Mapping
 
 import torch
-
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 
-# INT4 is the structural reference for the NVFP4 dist-ckpt load path; reuse the
-# byte-identical helpers (replica-id tag, payload extractor, empty-storage view)
-# and the per-layer-key regex so the two paths stay in lockstep.
-from megatron.bridge.orbit.low_precision.int4 import (
-    _empty_storage_view,
-    _EXPLICIT_LAYER_KEY_RE,
-    _loaded_tensor_payload,
-    _replica_id_with_current_tp_rank,
-)
-
-from megatron.bridge.orbit.low_precision.common import (
-    TensorSpillManager,
-    add_tensor_entry,
-    prepare_empty_model_state,
-)
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
@@ -52,6 +36,21 @@ from megatron.bridge.models.conversion.param_mapping import (
     merge_qkv_biases,
     merge_qkv_weights,
 )
+from megatron.bridge.orbit.low_precision.common import (
+    TensorSpillManager,
+    add_tensor_entry,
+    prepare_empty_model_state,
+)
+
+# INT4 is the structural reference for the NVFP4 dist-ckpt load path; reuse the
+# byte-identical helpers (replica-id tag, payload extractor) and the
+# per-layer-key regex so the two paths stay in lockstep.
+from megatron.bridge.orbit.low_precision.int4 import (
+    _EXPLICIT_LAYER_KEY_RE,
+    _loaded_tensor_payload,
+    _replica_id_with_current_tp_rank,
+)
+
 
 __all__ = [
     "NVFP4_GROUP_SIZE",
@@ -92,8 +91,22 @@ _EXPERT_KEY_EXCLUDE_RE = re.compile(r"\.experts\.linear_fc[12]\.weight\d*(_[wv])
 # Low nibble = even input index, high nibble = odd input index (per modelopt /
 # flashinfer / sglang parity).
 _E2M1_DECODE = (
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 )
 
 
@@ -135,13 +148,9 @@ def dequantize_nvfp4(
         from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
 
         try:
-            qtensor = NVFP4QTensor(
-                torch.Size((out_features, in_features)), dtype, w_u8
-            )
+            qtensor = NVFP4QTensor(torch.Size((out_features, in_features)), dtype, w_u8)
         except TypeError:
-            qtensor = NVFP4QTensor(
-                w_u8, metadata={"shape": (out_features, in_features), "dtype": dtype}
-            )
+            qtensor = NVFP4QTensor(w_u8, metadata={"shape": (out_features, in_features), "dtype": dtype})
         return qtensor.dequantize(
             dtype=dtype,
             scale=ws,
@@ -155,7 +164,7 @@ def dequantize_nvfp4(
     low = (w_u8 & 0x0F).to(torch.int64)
     high = ((w_u8 >> 4) & 0x0F).to(torch.int64)
     lookup = torch.tensor(_E2M1_DECODE, dtype=torch.float32, device=w_u8.device)
-    vals_low = lookup[low]   # [out, in/2]
+    vals_low = lookup[low]  # [out, in/2]
     vals_high = lookup[high]  # [out, in/2]
 
     vals = torch.empty(out_features, in_features, dtype=torch.float32, device=w_u8.device)
@@ -175,9 +184,7 @@ def quantize_to_nvfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor,
 
     out_features, in_features = weight.shape
     if in_features % NVFP4_GROUP_SIZE != 0:
-        raise ValueError(
-            f"in_features must be divisible by {NVFP4_GROUP_SIZE}, got {in_features}"
-        )
+        raise ValueError(f"in_features must be divisible by {NVFP4_GROUP_SIZE}, got {in_features}")
 
     from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
 
@@ -277,9 +284,7 @@ def _selective_nvfp4_quant_cfg(base_quant_cfg: Any, module_names: Iterable[str])
                 cfg.append({"quantizer_name": f"{name}.input_quantizer", "cfg": deepcopy(enabled_input)})
         return cfg
 
-    raise TypeError(
-        f"Unsupported ModelOpt quant_cfg type: {type(base_quant_cfg).__name__}; expected dict or list"
-    )
+    raise TypeError(f"Unsupported ModelOpt quant_cfg type: {type(base_quant_cfg).__name__}; expected dict or list")
 
 
 def apply_modelopt_nvfp4_to_meta_model(
@@ -352,9 +357,7 @@ def extract_nvfp4_weight_bundle(
         missing = [key for key in expected_keys.values() if key not in available_keys]
 
     if missing:
-        raise KeyError(
-            f"Missing NVFP4 bundle tensors for {weight_key}: {', '.join(missing)}"
-        )
+        raise KeyError(f"Missing NVFP4 bundle tensors for {weight_key}: {', '.join(missing)}")
 
     keys_to_load = list(expected_keys.values())
     if hasattr(hf_state_dict, "source") and hasattr(hf_state_dict.source, "load_tensors"):
@@ -474,8 +477,7 @@ def _split_megatron_weight_key(megatron_weight_key: str) -> tuple[str, str, str]
     match = _MEGATRON_WEIGHT_KEY_RE.fullmatch(megatron_weight_key)
     if match is None:
         raise ValueError(
-            "Expected Megatron weight key ending in '.weight' or '.weight<expert_idx>', "
-            f"got: {megatron_weight_key}"
+            f"Expected Megatron weight key ending in '.weight' or '.weight<expert_idx>', got: {megatron_weight_key}"
         )
     return megatron_weight_key, match.group("prefix"), match.group("expert_idx") or ""
 
@@ -499,9 +501,7 @@ def build_megatron_nvfp4_weight_entries(
     required = {"weight", "weight_scale", "weight_scale_2", "input_scale"}
     missing = required.difference(bundle)
     if missing:
-        raise KeyError(
-            f"Missing NVFP4 bundle fields for {megatron_weight_key}: {', '.join(sorted(missing))}"
-        )
+        raise KeyError(f"Missing NVFP4 bundle fields for {megatron_weight_key}: {', '.join(sorted(missing))}")
 
     weight_scale_2 = bundle["weight_scale_2"].reshape(()).to(torch.float32)
     input_scale = bundle["input_scale"].reshape(()).to(torch.float32)
@@ -662,10 +662,7 @@ def normalize_weight_scale_2_for_shared_fused_scale(
     largest branch scalar as the shared global value and scaling each branch's
     blockwise ``weight_scale`` by ``branch_scale_2 / shared_scale_2``.
     """
-    candidates = {
-        name: bundle["weight_scale_2"].reshape(()).to(torch.float32)
-        for name, bundle in bundles.items()
-    }
+    candidates = {name: bundle["weight_scale_2"].reshape(()).to(torch.float32) for name, bundle in bundles.items()}
     shared = torch.stack(tuple(candidates.values())).amax()
     if shared.item() <= 0.0:
         raise ValueError(
@@ -710,8 +707,7 @@ def build_fused_nvfp4_weight_entries(
     if split_swiglu_layout is not None:
         if set(bundles) != {"gate", "up"}:
             raise ValueError(
-                f"Split SwiGLU NVFP4 layout for {megatron_weight_key} requires gate/up bundles, "
-                f"got: {sorted(bundles)}"
+                f"Split SwiGLU NVFP4 layout for {megatron_weight_key} requires gate/up bundles, got: {sorted(bundles)}"
             )
 
         weight_key, weight_prefix, expert_idx = _split_megatron_weight_key(megatron_weight_key)
@@ -769,10 +765,7 @@ def build_fused_nvfp4_weight_entries(
             return entries, quantizer_state
 
         if split_swiglu_layout != _SPLIT_SWIGLU_LAYOUT_SPLIT_KEYS:
-            raise ValueError(
-                f"Unsupported split SwiGLU NVFP4 layout for {megatron_weight_key}: "
-                f"{split_swiglu_layout}"
-            )
+            raise ValueError(f"Unsupported split SwiGLU NVFP4 layout for {megatron_weight_key}: {split_swiglu_layout}")
 
         entries = {
             weight_w_key: bundles["gate"]["weight"],
@@ -833,10 +826,7 @@ def _uses_split_swiglu_weight_layout(
     if isinstance(model_template.get(megatron_weight_key), ShardedTensorFactory):
         return _SPLIT_SWIGLU_LAYOUT_FACTORY
 
-    if (
-        f"{megatron_weight_key}_w" in model_template
-        and f"{megatron_weight_key}_v" in model_template
-    ):
+    if f"{megatron_weight_key}_w" in model_template and f"{megatron_weight_key}_v" in model_template:
         return _SPLIT_SWIGLU_LAYOUT_SPLIT_KEYS
 
     return None
@@ -854,9 +844,7 @@ def convert_hf_weight_for_direct_save(task: Any, hf_weights: Any) -> torch.Tenso
     mapping = task.mapping
 
     if getattr(mapping, "tp_size", 1) != 1:
-        raise ValueError(
-            "Direct NVFP4 converter currently supports only single-rank TP=1 checkpoint writes."
-        )
+        raise ValueError("Direct NVFP4 converter currently supports only single-rank TP=1 checkpoint writes.")
 
     if isinstance(mapping, AutoMapping):
         converted = hf_weights
@@ -929,7 +917,7 @@ def collect_nvfp4_target_module_names(
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
             eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
             print(
-                f"  [{i+1}/{total_tasks}] found {len(module_names)} NVFP4 target modules | "
+                f"  [{i + 1}/{total_tasks}] found {len(module_names)} NVFP4 target modules | "
                 f"elapsed {elapsed_str} ETA {eta_str}",
                 flush=True,
             )
@@ -946,9 +934,7 @@ def build_nvfp4_direct_model_state_dict(
 ) -> dict[str, Any]:
     """Populate a direct-save model state dict from NVFP4 bridge conversion tasks."""
     if len(meta_model) != 1:
-        raise ValueError(
-            "Direct NVFP4 converter currently supports a single Megatron model chunk."
-        )
+        raise ValueError("Direct NVFP4 converter currently supports a single Megatron model chunk.")
 
     model_state = prepare_empty_model_state(model_template)
     if conversion_tasks is None:
@@ -1019,10 +1005,7 @@ def build_nvfp4_direct_model_state_dict(
                 # weights. The exception is a factory-backed split-SwiGLU weight
                 # entry, where we must preserve the original factory metadata.
                 template_entry = None
-                if (
-                    split_swiglu_layout == _SPLIT_SWIGLU_LAYOUT_FACTORY
-                    and key == task.param_name
-                ):
+                if split_swiglu_layout == _SPLIT_SWIGLU_LAYOUT_FACTORY and key == task.param_name:
                     template_entry = model_template.get(task.param_name)
                 add_tensor_entry(
                     model_state,
@@ -1046,7 +1029,7 @@ def build_nvfp4_direct_model_state_dict(
                 elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
                 eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
                 print(
-                    f"  [{i+1}/{total_tasks}] {num_regular} regular, {num_nvfp4} NVFP4 | "
+                    f"  [{i + 1}/{total_tasks}] {num_regular} regular, {num_nvfp4} NVFP4 | "
                     f"elapsed {elapsed_str} ETA {eta_str} | {task.param_name}",
                     flush=True,
                 )
@@ -1072,7 +1055,7 @@ def build_nvfp4_direct_model_state_dict(
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
             eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
             print(
-                f"  [{i+1}/{total_tasks}] {num_regular} regular, {num_nvfp4} NVFP4 | "
+                f"  [{i + 1}/{total_tasks}] {num_regular} regular, {num_nvfp4} NVFP4 | "
                 f"elapsed {elapsed_str} ETA {eta_str} | {task.param_name}",
                 flush=True,
             )
@@ -1080,10 +1063,7 @@ def build_nvfp4_direct_model_state_dict(
         if (i + 1) % gc_interval == 0:
             gc.collect()
 
-    print(
-        f"Prepared direct checkpoint state dict: {num_regular} regular tensors, "
-        f"{num_nvfp4} NVFP4 mappings"
-    )
+    print(f"Prepared direct checkpoint state dict: {num_regular} regular tensors, {num_nvfp4} NVFP4 mappings")
     return model_state
 
 
@@ -1165,7 +1145,7 @@ def transform_sharded_state_dict_for_nvfp4_dense(
         axis_fragmentations = list(sub_sh_ten.axis_fragmentations[prepend:])
         local_shape = list(sub_sh_ten.local_shape)
         if len(local_shape) > len(global_shape):
-            local_shape = local_shape[-len(global_shape):]
+            local_shape = local_shape[-len(global_shape) :]
 
         if same_key_splits:
             if global_shape[0] % split_factor != 0:
@@ -1186,8 +1166,7 @@ def transform_sharded_state_dict_for_nvfp4_dense(
         local_in = local_shape[-1]
         if local_in % 2 != 0:
             raise ValueError(
-                f"NVFP4 split SwiGLU requires in-features divisible by 2, "
-                f"got {local_in} for {checkpoint_key}"
+                f"NVFP4 split SwiGLU requires in-features divisible by 2, got {local_in} for {checkpoint_key}"
             )
         local_shape[-1] = local_in // 2
         global_shape[-1] //= 2
@@ -1278,10 +1257,7 @@ def transform_sharded_state_dict_for_nvfp4_dense(
         # in-axis cleanly or the dist-ckpt loader cannot stitch shards back
         # together.
         if local_in % 2 != 0:
-            raise ValueError(
-                f"NVFP4 requires in-features divisible by 2 (pack factor), "
-                f"got {local_in} for {skey}"
-            )
+            raise ValueError(f"NVFP4 requires in-features divisible by 2 (pack factor), got {local_in} for {skey}")
         if local_in % NVFP4_GROUP_SIZE != 0:
             raise ValueError(
                 f"NVFP4 requires in-features divisible by NVFP4_GROUP_SIZE="
@@ -1301,17 +1277,9 @@ def transform_sharded_state_dict_for_nvfp4_dense(
         out_offset_full = (
             out_offset_override
             if out_offset_override is not None
-            else (
-                sh_ten.global_offset[prepend]
-                if len(sh_ten.global_offset) > prepend
-                else 0
-            )
+            else (sh_ten.global_offset[prepend] if len(sh_ten.global_offset) > prepend else 0)
         )
-        in_offset_full = (
-            sh_ten.global_offset[prepend + 1]
-            if len(sh_ten.global_offset) > prepend + 1
-            else 0
-        )
+        in_offset_full = sh_ten.global_offset[prepend + 1] if len(sh_ten.global_offset) > prepend + 1 else 0
 
         # Megatron may emit linear weights in a stacked-layer layout
         # (key path has a literal `layers.` segment and prepend_axis_num=1
@@ -1390,9 +1358,7 @@ def transform_sharded_state_dict_for_nvfp4_dense(
             # weight_quantizer._scale -> fp8_e4m3fn [out, in/16]
             scale_st = ShardedTensor(
                 key=ckpt_scale_key,
-                data=torch.empty(
-                    (local_out, num_groups), dtype=torch.float8_e4m3fn, device="cpu"
-                ),
+                data=torch.empty((local_out, num_groups), dtype=torch.float8_e4m3fn, device="cpu"),
                 dtype=torch.float8_e4m3fn,
                 local_shape=(local_out, num_groups),
                 global_shape=(global_out, global_num_groups),
@@ -1557,9 +1523,7 @@ def register_nvfp4_buffers_after_load_dense(
         # strictly required for the bf16 forward path, but cheap to retain
         # and matches the spec ledger. Co-locate with the dequantized weight
         # (which lives on packed.device when w_param is on meta).
-        scale_target_device = (
-            w_param.device if w_param.device.type != "meta" else packed.device
-        )
+        scale_target_device = w_param.device if w_param.device.type != "meta" else packed.device
         module.register_buffer(
             "_nvfp4_weight_scale",
             scale.to(scale_target_device),
@@ -1573,7 +1537,5 @@ def register_nvfp4_buffers_after_load_dense(
 
         registered += 1
 
-    print(
-        f"[NVFP4 dense register] Registered NVFP4 buffers for {registered} dense linears"
-    )
+    print(f"[NVFP4 dense register] Registered NVFP4 buffers for {registered} dense linears")
     return registered

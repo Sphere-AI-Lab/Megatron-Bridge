@@ -47,6 +47,7 @@ from .nvfp4 import (
     scale_to_amax,
 )
 
+
 __all__ = [
     "add_tensor_entry",
     "apply_modelopt_fp8_to_meta_model",

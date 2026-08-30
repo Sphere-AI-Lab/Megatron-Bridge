@@ -16,16 +16,12 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import time
+from copy import deepcopy
 from typing import Any, Iterable, Mapping
 
 import torch
 
-from megatron.bridge.orbit.low_precision.common import (
-    add_tensor_entry,
-    prepare_empty_model_state,
-)
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
@@ -37,7 +33,12 @@ from megatron.bridge.models.conversion.param_mapping import (
     merge_qkv_biases,
     merge_qkv_weights,
 )
+from megatron.bridge.orbit.low_precision.common import (
+    add_tensor_entry,
+    prepare_empty_model_state,
+)
 from megatron.bridge.orbit.quant.fp8_utils import merge_gated_mlp_scale_inv, merge_qkv_scale_inv
+
 
 __all__ = [
     "apply_modelopt_fp8_to_meta_model",
@@ -60,15 +61,11 @@ def apply_modelopt_fp8_to_meta_model(
     quant_cfg = deepcopy(mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG)
     if module_names is not None:
         quant_cfg["quant_cfg"] = quant_cfg.get("quant_cfg", {}).copy()
-        enabled_weight_cfg = deepcopy(
-            quant_cfg["quant_cfg"].get("*weight_quantizer", {"enable": True})
-        )
+        enabled_weight_cfg = deepcopy(quant_cfg["quant_cfg"].get("*weight_quantizer", {"enable": True}))
         quant_cfg["quant_cfg"]["*weight_quantizer"] = {"enable": False}
 
         for module_name in sorted(set(module_names)):
-            quant_cfg["quant_cfg"][f"{module_name}.weight_quantizer"] = deepcopy(
-                enabled_weight_cfg
-            )
+            quant_cfg["quant_cfg"][f"{module_name}.weight_quantizer"] = deepcopy(enabled_weight_cfg)
 
     def _noop_forward_loop(_m):
         return None
@@ -163,9 +160,7 @@ def convert_hf_weight_for_direct_save(task: Any, hf_weights: Any) -> torch.Tenso
     mapping = task.mapping
 
     if getattr(mapping, "tp_size", 1) != 1:
-        raise ValueError(
-            "Direct FP8 converter currently supports only single-rank TP=1 checkpoint writes."
-        )
+        raise ValueError("Direct FP8 converter currently supports only single-rank TP=1 checkpoint writes.")
 
     if isinstance(mapping, AutoMapping):
         converted = hf_weights
@@ -250,9 +245,7 @@ def build_fp8_direct_model_state_dict(
 ) -> dict[str, Any]:
     """Build a direct-save Megatron model state with explicit FP8 scale entries."""
     if len(meta_model) != 1:
-        raise ValueError(
-            "Direct FP8 converter currently supports a single Megatron model chunk (no VP stages)."
-        )
+        raise ValueError("Direct FP8 converter currently supports a single Megatron model chunk (no VP stages).")
 
     model_state = prepare_empty_model_state(model_template)
     conversion_tasks = bridge.build_conversion_tasks(hf_pretrained, meta_model)
@@ -295,7 +288,7 @@ def build_fp8_direct_model_state_dict(
             elapsed = time.monotonic() - t_start
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
             print(
-                f"  [{i+1}/{total_tasks}] {num_weights} weights, {num_scales} scales, "
+                f"  [{i + 1}/{total_tasks}] {num_weights} weights, {num_scales} scales, "
                 f"{num_modelopt_weight_keys} modelopt weight keys | "
                 f"elapsed {elapsed_str} | {task.param_name}",
                 flush=True,

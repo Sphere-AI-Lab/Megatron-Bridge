@@ -32,12 +32,8 @@ _GROUPED_EXPERT_WEIGHT_RE = re.compile(r"^(.*\.experts\.linear_fc[12])\.weight(\
 _GROUPED_EXPERT_BASE_WEIGHT_RE = re.compile(r"^.*\.experts\.linear_fc[12]\.weight$")
 _GROUPED_EXPERT_SCALE_INV_RE = re.compile(r"^(.*\.experts\.linear_fc[12])\.weight(\d+)_scale_inv$")
 _GROUPED_EXPERT_SPLIT_WEIGHT_RE = re.compile(r"^(.*\.experts\.linear_fc1)\.weight(\d+)_([wv])$")
-_DIRECT_FP8_LINEAR_WEIGHT_RE = re.compile(
-    r"^(.*\.(?:linear_qkv|linear_proj|linear_fc1|linear_fc2))\.weight$"
-)
-_DIRECT_FP8_SCALE_INV_RE = re.compile(
-    r"^(.*\.(?:linear_qkv|linear_proj|linear_fc1|linear_fc2))\.weight_scale_inv$"
-)
+_DIRECT_FP8_LINEAR_WEIGHT_RE = re.compile(r"^(.*\.(?:linear_qkv|linear_proj|linear_fc1|linear_fc2))\.weight$")
+_DIRECT_FP8_SCALE_INV_RE = re.compile(r"^(.*\.(?:linear_qkv|linear_proj|linear_fc1|linear_fc2))\.weight_scale_inv$")
 _DIRECT_FP8_SPLIT_WEIGHT_RE = re.compile(r"^(.*\.linear_fc1)\.weight_([wv])$")
 
 
@@ -48,8 +44,7 @@ def _canonicalize_expert_key_for_checkpoint(key: str) -> str:
 def _is_extra_state_entry(key: str, value: Any) -> bool:
     candidates = [key, getattr(value, "key", None), getattr(value, "unique_key", None)]
     return any(
-        isinstance(candidate, str)
-        and "_extra_state" in _canonicalize_expert_key_for_checkpoint(candidate)
+        isinstance(candidate, str) and "_extra_state" in _canonicalize_expert_key_for_checkpoint(candidate)
         for candidate in candidates
     )
 
@@ -148,8 +143,7 @@ def transform_sharded_state_dict_for_fp8(
         if same_key_splits:
             if global_shape[0] % split_factor != 0:
                 raise ValueError(
-                    f"Unexpected SwiGLU split shape for {split_key}: "
-                    f"{global_shape[0]} not divisible by {split_factor}"
+                    f"Unexpected SwiGLU split shape for {split_key}: {global_shape[0]} not divisible by {split_factor}"
                 )
             if axis_fragmentations[0] % split_factor != 0:
                 raise ValueError(
@@ -434,9 +428,9 @@ def register_fp8_scale_inv_buffers_after_load(
             continue
 
         if split_match is not None:
-            dense_split_weights.setdefault(split_match.group(1), {})[
-                split_match.group(2)
-            ] = _loaded_tensor_payload(value)
+            dense_split_weights.setdefault(split_match.group(1), {})[split_match.group(2)] = _loaded_tensor_payload(
+                value
+            )
             continue
 
         if match is None and dense_match is None:
@@ -447,9 +441,7 @@ def register_fp8_scale_inv_buffers_after_load(
         for attr in module_path.split("."):
             module = getattr(module, attr)
 
-        buffer_name = (
-            f"weight{match.group(2)}_scale_inv" if match is not None else "weight_scale_inv"
-        )
+        buffer_name = f"weight{match.group(2)}_scale_inv" if match is not None else "weight_scale_inv"
         payload = _loaded_tensor_payload(value).to(dtype=torch.float32)
         weight_name = f"weight{match.group(2)}" if match is not None else "weight"
         weight = getattr(module, weight_name, None)
@@ -467,18 +459,14 @@ def register_fp8_scale_inv_buffers_after_load(
     for (module_path, weight_idx), parts in grouped_split_weights.items():
         if not {"w", "v"}.issubset(parts):
             continue
-        loaded_state_dict[f"{module_path}.weight{weight_idx}"] = torch.cat(
-            [parts["w"], parts["v"]], dim=0
-        )
+        loaded_state_dict[f"{module_path}.weight{weight_idx}"] = torch.cat([parts["w"], parts["v"]], dim=0)
         loaded_state_dict.pop(f"{module_path}.weight{weight_idx}_w", None)
         loaded_state_dict.pop(f"{module_path}.weight{weight_idx}_v", None)
 
     for module_path, parts in dense_split_weights.items():
         if not {"w", "v"}.issubset(parts):
             continue
-        loaded_state_dict[f"{module_path}.weight"] = torch.cat(
-            [parts["w"], parts["v"]], dim=0
-        )
+        loaded_state_dict[f"{module_path}.weight"] = torch.cat([parts["w"], parts["v"]], dim=0)
         loaded_state_dict.pop(f"{module_path}.weight_w", None)
         loaded_state_dict.pop(f"{module_path}.weight_v", None)
 
@@ -488,6 +476,7 @@ def register_fp8_scale_inv_buffers_after_load(
 # ------------------------------------------------------------------ #
 # Dequantization
 # ------------------------------------------------------------------ #
+
 
 def dequant_fp8(
     w_fp8: torch.Tensor,
@@ -516,9 +505,7 @@ def dequant_fp8(
                 dequant_fp8_block_triton,
             )
 
-            return dequant_fp8_block_triton(
-                w_fp8, scale_inv.to(torch.float32), out_dtype
-            )
+            return dequant_fp8_block_triton(w_fp8, scale_inv.to(torch.float32), out_dtype)
         except Exception:
             # Fall through to PyTorch reference on any kernel failure.
             pass
@@ -534,6 +521,7 @@ def dequant_fp8(
 # ------------------------------------------------------------------ #
 # Scale-inv merging (mirrors weight merge during checkpoint conversion)
 # ------------------------------------------------------------------ #
+
 
 def merge_qkv_scale_inv(config, q_s, k_s, v_s):
     """Merge Q/K/V ``weight_scale_inv`` following the Megatron QKV interleave.
@@ -553,7 +541,6 @@ def merge_qkv_scale_inv(config, q_s, k_s, v_s):
     head_num = config.num_attention_heads
     num_query_groups = config.num_query_groups
     heads_per_group = head_num // num_query_groups
-    head_size = config.kv_channels or (config.hidden_size // head_num)
 
     in_blocks = q_s.shape[-1]
     # Each head occupies head_size / block_size rows in the scale tensor.
