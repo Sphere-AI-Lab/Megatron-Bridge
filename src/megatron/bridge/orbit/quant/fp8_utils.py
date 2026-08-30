@@ -331,9 +331,10 @@ def transform_sharded_state_dict_for_fp8(
                         same_key_splits,
                     )
                 fused_local_shape = tuple(value.data.shape)
+                prepend = sh_ten.prepend_axis_num
                 rank_offset = sh_ten.global_offset[-2] // split_local_out
                 fused_out_offset = rank_offset * fused_local_out
-                fused_axis_fragmentations = list(sh_ten.axis_fragmentations)
+                fused_axis_fragmentations = list(sh_ten.axis_fragmentations[prepend:])
                 if same_key_splits:
                     fused_global_out = sh_ten.global_shape[-2]
                     if fused_axis_fragmentations[-2] % split_factor != 0:
@@ -345,11 +346,11 @@ def transform_sharded_state_dict_for_fp8(
                 else:
                     fused_global_out = sh_ten.global_shape[-2] * split_factor
                 fused_axis_fragmentations = tuple(fused_axis_fragmentations)
-                fused_global_shape = tuple(sh_ten.global_shape[:-2]) + (
+                fused_global_shape = tuple(sh_ten.global_shape[prepend:-2]) + (
                     fused_global_out,
                     sh_ten.global_shape[-1],
                 )
-                fused_global_offset = tuple(sh_ten.global_offset[:-2]) + (
+                fused_global_offset = tuple(sh_ten.global_offset[prepend:-2]) + (
                     fused_out_offset,
                     sh_ten.global_offset[-1],
                 )
@@ -368,7 +369,7 @@ def transform_sharded_state_dict_for_fp8(
         sh_ten = value if isinstance(value, ShardedTensor) else _split_factory(value)[0]
         prepend = sh_ten.prepend_axis_num
         weight_axis_fragmentations = sh_ten.axis_fragmentations[prepend:]
-        weight_local_shape = tuple(sh_ten.local_shape[prepend:])
+        weight_local_shape = tuple(sh_ten.local_shape)
         weight_global_shape = tuple(sh_ten.global_shape[prepend:])
         weight_global_offset = tuple(sh_ten.global_offset[prepend:])
         new_sd[canonical_key] = ShardedTensor(
