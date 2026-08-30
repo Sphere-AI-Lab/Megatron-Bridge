@@ -773,6 +773,31 @@ class NanTraceCallback(Callback):
             f"skipped={context.skipped_iter} lr={lr_text}"
         )
 
+        # Attribute the global grad norm: top trainable parameters by local
+        # gradient norm (reads main_grad, falls back to .grad). Printed on
+        # every rank — the global norm is a cross-rank reduction, so a sane
+        # rank 0 does not clear the other ranks.
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        grad_norms: list[tuple[float, str]] = []
+        total_sq = 0.0
+        model_chunks = context.model if isinstance(context.model, list) else [context.model]
+        for chunk in model_chunks:
+            for name, param in chunk.named_parameters():
+                if not param.requires_grad:
+                    continue
+                grad = getattr(param, "main_grad", None)
+                if grad is None:
+                    grad = param.grad
+                if grad is None:
+                    continue
+                norm_value = float(grad.detach().float().norm().item())
+                total_sq += norm_value * norm_value
+                grad_norms.append((norm_value, name))
+        grad_norms.sort(reverse=True)
+        print(f"[nan-debug][rank{rank}] local param-grad total-norm {total_sq**0.5:.6g} over {len(grad_norms)} params")
+        for norm_value, name in grad_norms[:6]:
+            print(f"[nan-debug][rank{rank}]   grad-norm {norm_value:.6g}  {name}")
+
         param_issue = _first_nonfinite_named_parameter(context.model, include_grad=False)
         if param_issue is not None:
             print_rank_0(
