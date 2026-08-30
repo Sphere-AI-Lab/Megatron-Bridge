@@ -1412,6 +1412,15 @@ class _SplitLNCanonicalOFTQKV(nn.Module):
         ln_out = ln_out.contiguous()
         return self._qkv(ln_out)
 
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        # Without this override, __getattr__ resolves `sharded_state_dict` to
+        # self._orig_module's own bound method (nn.Module has no such attribute
+        # to short-circuit the lookup first), silently dropping self._qkv's
+        # oft_r adapters from every checkpoint. self._qkv.to_wrap is the same
+        # orig_module instance, so delegating to it covers both the base
+        # weight/bias/LN weight and the three Q/K/V rotations.
+        return self._qkv.sharded_state_dict(prefix, sharded_offsets, metadata)
+
     def __getattr__(self, name: str):
         try:
             return super().__getattr__(name)
@@ -1440,6 +1449,12 @@ class _SplitLNCanonicalOFTFC1(nn.Module):
             ln_out = gather_from_sequence_parallel_region(ln_out, tensor_parallel_output_grad=True)
         ln_out = ln_out.contiguous()
         return self._fc1(ln_out)
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        # See _SplitLNCanonicalOFTQKV.sharded_state_dict: without this override
+        # __getattr__ silently resolves to self._orig_module's own method,
+        # dropping self._fc1's oft_r adapters from every checkpoint.
+        return self._fc1.sharded_state_dict(prefix, sharded_offsets, metadata)
 
     def __getattr__(self, name: str):
         try:

@@ -73,10 +73,17 @@ def normalize_hf_dataset_source(config) -> None:
     ``namespace/name`` repository ids, so loading fails with HfUriError before
     training starts. Rewrite the known bare ids to their canonical namespaced
     form (the identical dataset).
+
+    ``default_squad_config`` (what ``_peft_common`` actually builds) sets
+    ``dataset_name`` directly on the ``HFDatasetConfig``, not on a nested
+    ``.source`` object, so patch that shape too.
     """
-    source = getattr(getattr(config, "dataset", None), "source", None)
-    name = getattr(source, "dataset_name", None)
-    if name == "squad":
+    dataset = getattr(config, "dataset", None)
+    if getattr(dataset, "dataset_name", None) == "squad":
+        dataset.dataset_name = "rajpurkar/squad"
+
+    source = getattr(dataset, "source", None)
+    if getattr(source, "dataset_name", None) == "squad":
         source.dataset_name = "rajpurkar/squad"
 
 
