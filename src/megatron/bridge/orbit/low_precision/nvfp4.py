@@ -480,6 +480,59 @@ def _split_megatron_weight_key(megatron_weight_key: str) -> tuple[str, str, str]
     return megatron_weight_key, match.group("prefix"), match.group("expert_idx") or ""
 
 
+def nvfp4_quantizer_entry_names(weight_prefix: str, expert_suffix: str = "") -> dict[str, str]:
+    """Canonical on-disk names for one NVFP4 weight's quantizer state.
+
+    This is the single definition of the NVFP4 checkpoint key format. The
+    converter uses it to name what it writes and the trainer uses it to name
+    what it requests, so the two cannot describe different layouts. Anything
+    that spells these keys out by hand is a drift waiting to happen.
+
+    ``expert_suffix`` is the expert index for grouped-MoE modules (``"0"``,
+    ``"1"``, …) or ``""`` for a dense linear. ``input_quantizer._amax`` never
+    takes a suffix: every expert in a grouped linear sees the same activation.
+
+    Args:
+        weight_prefix: Module path up to the weight, e.g.
+            ``decoder.layers.0.mlp.experts.linear_fc1``.
+        expert_suffix: Expert index as a string, or ``""`` for dense modules.
+
+    Returns:
+        Mapping of role (``scale``, ``double_scale``, ``amax``, ``input_amax``)
+        to its canonical checkpoint key.
+    """
+    return {
+        "scale": f"{weight_prefix}.weight_quantizer._scale{expert_suffix}",
+        "double_scale": f"{weight_prefix}.weight_quantizer._double_scale{expert_suffix}",
+        "amax": f"{weight_prefix}.weight_quantizer._amax{expert_suffix}",
+        "input_amax": f"{weight_prefix}.input_quantizer._amax",
+    }
+
+
+def nvfp4_weight_entry_names(weight_prefix: str, expert_suffix: str = "", *, swiglu: bool = False) -> dict[str, str]:
+    """Canonical on-disk names for one NVFP4 weight's packed data.
+
+    Companion to :func:`nvfp4_quantizer_entry_names`; see that docstring for why
+    both sides must share one definition. SwiGLU ``linear_fc1`` stores the gate
+    and up halves separately (``_w`` / ``_v``); everything else stores a single
+    packed weight.
+
+    Args:
+        weight_prefix: Module path up to the weight.
+        expert_suffix: Expert index as a string, or ``""`` for dense modules.
+        swiglu: Whether the weight is a fused SwiGLU gate+up projection.
+
+    Returns:
+        Mapping of role (``weight``, or ``weight_w``/``weight_v``) to its key.
+    """
+    if swiglu:
+        return {
+            "weight_w": f"{weight_prefix}.weight{expert_suffix}_w",
+            "weight_v": f"{weight_prefix}.weight{expert_suffix}_v",
+        }
+    return {"weight": f"{weight_prefix}.weight{expert_suffix}"}
+
+
 def build_megatron_nvfp4_weight_entries(
     megatron_weight_key: str,
     bundle: Mapping[str, torch.Tensor],
@@ -506,12 +559,13 @@ def build_megatron_nvfp4_weight_entries(
     weight_scale_2 = bundle["weight_scale_2"].reshape(()).to(torch.float32)
     input_scale = bundle["input_scale"].reshape(()).to(torch.float32)
 
+    names = nvfp4_quantizer_entry_names(weight_prefix, expert_idx)
     return {
         weight_key: bundle["weight"],
-        f"{weight_prefix}.weight_quantizer._scale{expert_idx}": bundle["weight_scale"],
-        f"{weight_prefix}.weight_quantizer._double_scale{expert_idx}": weight_scale_2,
-        f"{weight_prefix}.weight_quantizer._amax{expert_idx}": scale_to_amax(weight_scale_2),
-        f"{weight_prefix}.input_quantizer._amax": scale_to_amax(input_scale),
+        names["scale"]: bundle["weight_scale"],
+        names["double_scale"]: weight_scale_2,
+        names["amax"]: scale_to_amax(weight_scale_2),
+        names["input_amax"]: scale_to_amax(input_scale),
     }
 
 
