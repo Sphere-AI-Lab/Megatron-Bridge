@@ -1084,8 +1084,7 @@ def save_checkpoint(
                     # async strategy when saving sharded ModelOpt state. The default
                     # path stays on the module-level save_sharded_modelopt_state
                     # symbol so existing tests can patch it.
-                    _orbit_async_strategy = getattr(ckpt_cfg, "async_strategy", None)
-                    if _orbit_async_strategy is not None and _orbit_async_strategy != "nvrx":
+                    if ckpt_cfg.async_strategy != "nvrx":
                         from megatron.bridge.orbit.training.modelopt_checkpoint import (
                             _save_sharded_modelopt_state_with_async_strategy,
                         )
@@ -1094,7 +1093,7 @@ def save_checkpoint(
                             model,
                             checkpoint_name,
                             (ckpt_cfg.ckpt_format, 1),
-                            async_strategy=_orbit_async_strategy,
+                            async_strategy=ckpt_cfg.async_strategy,
                         )
                     else:
                         save_sharded_modelopt_state(model, checkpoint_name, (ckpt_cfg.ckpt_format, 1))

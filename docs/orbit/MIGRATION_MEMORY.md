@@ -348,12 +348,22 @@ methods are never consulted. That silently discarded `to_wrap`'s own TP sharding
 and `OFTRotationModule`'s `oft_r` axis map and expert `replica_id` fixups.
 
 Fixed with a `_split_wrapper_sharded_state_dict` helper plus a thin
-`sharded_state_dict` on each of the three wrappers that delegates per child. The
-helper also re-derives `tp_group` from the wrapped TP layer, because
-`sharded_state_dict_default` drops `tp_group` when dispatching to a module's own
-`sharded_state_dict` and `make_sharded_tensors_for_checkpoint` only substitutes
-the default group when `dp_cp_group` is *also* `None` — left as `None`, every TP
-rank would report `replica_id` 0.
+`sharded_state_dict` on each of the three wrappers that delegates per child,
+passing `child.tp_group` straight through.
+
+**The fix does not cover the grouped MoE path.** It fully lands only for
+`OFTLinearSplitQKV` and `OFTLinearSplitFC1UpGate`, whose adapter children are
+`OFTRotationModule`, which *does* define `sharded_state_dict`
+(`oft/oft_layers.py:616`). `OFTLinearGroupedSplitFC1UpGate` builds
+`GroupedOFTRotation` instead (`canonical_oft.py:687`), and that class has **no**
+`sharded_state_dict` while owning an `nn.Parameter` (line 515) plus two buffers
+— so delegating merely pushes the problem one level down and `oft_r` is still
+emitted **replicated** for grouped MoE. `to_wrap`'s own TP sharding is now
+honoured in all three, which was the larger loss.
+
+Closing the MoE gap means deciding the correct axis map for a
+`(num_local_experts, num_blocks, n_elements)` parameter under EP/ETP. That was
+deliberately not invented — it is an open runtime task, not a static one.
 
 Key names are unchanged, but sharding metadata is not: `oft_r` becomes TP-sharded
 on axis 0 where it was previously replicated, so pre-fix and post-fix checkpoints

@@ -85,11 +85,13 @@ sharded ModelOpt state. The default path must stay on the module-level
 `orbit.training.modelopt_checkpoint._save_sharded_modelopt_state_with_async_strategy`,
 the default stays on `save_sharded_modelopt_state`.
 
-**radixark adaptation:** read the strategy defensively with
-`getattr(ckpt_cfg, "async_strategy", None)`. radixark already treats
-`async_strategy` as possibly-absent (it introspects `_save_params` for it a few
-dozen lines above, for mcore dev-branch compat), so do not assume the attribute
-exists.
+**radixark adaptation:** read the field directly as `ckpt_cfg.async_strategy`.
+radixark declares `async_strategy: str = "nvrx"` on `CheckpointConfig`
+(`training/config.py:678`), so it always exists and can never be `None` — no
+`getattr` default, no `is not None` check. (An earlier version of this note claimed
+radixark treats the field as possibly-absent. That was wrong: the `_save_params`
+introspection a few dozen lines above concerns mcore's `save()` signature, not the
+config field.)
 
 **If orbit is removed:** revert this hunk, which restores the single
 `save_sharded_modelopt_state` call. Do not guard the import.

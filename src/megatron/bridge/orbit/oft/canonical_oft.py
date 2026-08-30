@@ -78,29 +78,15 @@ def _split_wrapper_sharded_state_dict(
     """
     from megatron.core.transformer.utils import sharded_state_dict_default
 
-    # sharded_state_dict_default drops tp_group when it dispatches to a module's own
-    # sharded_state_dict, and make_sharded_tensors_for_checkpoint only substitutes the
-    # default group when dp_cp_group is also None. Left as None, every TP rank would
-    # report replica_id 0. Re-derive it from the wrapped TP layer instead.
-    tp_group = getattr(module, "tp_group", None)
-    if tp_group is None:
-        tp_group = getattr(getattr(module, "to_wrap", None), "tp_group", None)
-    if tp_group is None:
-        if getattr(module, "is_expert", False):
-            tp_group = parallel_state.get_expert_tensor_parallel_group()
-        else:
-            tp_group = parallel_state.get_tensor_model_parallel_group()
-
     sharded_state_dict = {}
     for name, child in module.named_children():
-        child_tp_group = getattr(child, "tp_group", None)
         sharded_state_dict.update(
             sharded_state_dict_default(
                 child,
                 f"{prefix}{name}.",
                 sharded_offsets,
                 metadata,
-                tp_group=tp_group if child_tp_group is None else child_tp_group,
+                tp_group=child.tp_group,
             )
         )
     return sharded_state_dict
