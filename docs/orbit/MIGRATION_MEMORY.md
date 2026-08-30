@@ -371,6 +371,30 @@ are **not interchangeable at TP>1**. At TP=1 nothing changes. This was
 pre-existing spherelab behaviour, not a migration regression, and the fix is
 **unverified** — TP>1 is not reproducible on a CPU-only box.
 
+### Fallback audit — CLOSED
+
+The migration authored exactly **two** fallbacks, both since removed:
+
+- the four-level `tp_group` chain in `_split_wrapper_sharded_state_dict` (three
+  levels were unreachable; now reads `child.tp_group` directly);
+- `getattr(ckpt_cfg, "async_strategy", None)` in seam 2 (radixark declares the
+  field as `str = "nvrx"`, so it always exists).
+
+Every other defensive construct in orbit is **inherited verbatim** from
+spherelab, verified against the `feature/generic-int4-adapter` blobs: 5
+`except ImportError` guards for optional Triton/TE deps, and 16 broad
+`except Exception` handlers.
+
+The riskiest inherited one is `peft_ext/recompute_ext.py:71`, a blanket
+`except Exception` that downgrades a *correctness* fix to a printed warning — if
+it fires, adapter-only training with recompute silently produces zero gradients.
+It mirrors upstream `peft/recompute.py:121` exactly, so it was left alone to keep
+the port diffable against upstream. Worth a runtime assertion instead, if that
+path ever misbehaves.
+
+**Standing rule from the user:** do not add fallbacks. If one seems necessary,
+surface it for review first.
+
 ### Seam notes
 
 - **Seam 3 is a gap-fill, not an invention.** radixark already applies the same
