@@ -440,10 +440,12 @@ checkpoint concerns, left unfixed because they need MoE-capable hardware:**
    "canonical = one OFT per matrix" principle. Treat it as a design question for
    the OFT owner, not a defect.
 
-2. **Grouped fc1 adapters checkpoint as replicated.** `GroupedOFTRotation` has no
-   `sharded_state_dict` yet owns the 3D `oft_r` `(E, num_blocks, n_elements)`
-   (`canonical_oft.py:500`), so per-expert rotations are written with no EP/TP
-   sharding metadata. Same root cause as blocker #6.
+2. **FIXED (unverified at EP>1).** `GroupedOFTRotation` now has a
+   `sharded_state_dict` (`canonical_oft.py`) that shards its 3D `oft_r`
+   `(E, num_blocks, n_elements)` across the expert-parallel group on axis 0,
+   mirroring how `megatron.core.transformer.moe.experts` computes its own
+   EP-axis offset. Checked at EP=1 (local==global shape, no crash); EP>1
+   needs real hardware to confirm, same caveat as blocker #6's TP fix.
 
 3. **The expert `replica_id` rewrite is suspect** (`oft_layers.py:650-660`,
    carrying the original authors' own TODO). It writes an EP-derived value into
