@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>QOFT consolidation and quantized-base training bring-up</title>
-<script type="application/json" id="report-meta">{"title": "QOFT consolidation and quantized-base training bring-up", "kind": "development", "date": "2026-08-30", "tags": ["orbit", "qoft", "peft", "int4", "fp8", "nvfp4", "consolidation", "slurm"], "subtitle": "", "generated": "2026-08-30T03:25:22+00:00", "meta": {"date": "2026-08-30", "commit": "6d61cc041023", "branch": "feature/relocate-conversion-scripts (= feature/generic-int4-adapter)", "tree": "dirty", "host": "slurm-login-567db7474-fv2mx", "python": "3.10.12", "tip": "6d61cc04", "repo": "Sphere-AI-Lab/Megatron-Bridge", "cluster": "slurm (slinky, H200/B200)", "reporting_period": "2026-08-29 to 2026-08-30"}, "profile": "development-log", "status": "draft", "source": {"path": "docs/reports/_src/2026-08-30-qoft-consolidation-and-training-bringup.md", "sha256": "d2559804fd8f0457799f6b096330fb1a3ccdbd8b56e0355b384bc902ecf7b58e", "assets": []}}</script>
+<script type="application/json" id="report-meta">{"title": "QOFT consolidation and quantized-base training bring-up", "kind": "development", "date": "2026-08-30", "tags": ["orbit", "qoft", "peft", "int4", "fp8", "nvfp4", "consolidation", "slurm"], "subtitle": "", "generated": "2026-08-30T04:28:36+00:00", "meta": {"date": "2026-08-30", "commit": "e5a1dbeb40d1", "branch": "feature/relocate-conversion-scripts (= feature/generic-int4-adapter)", "host": "slurm-login-567db7474-fv2mx", "python": "3.10.12", "tip": "e5a1dbeb", "repo": "Sphere-AI-Lab/Megatron-Bridge", "cluster": "slurm (slinky, H200/B200)", "reporting_period": "2026-08-29 to 2026-08-30 (waves 1-3)"}, "profile": "development-log", "status": "draft", "source": {"path": "docs/reports/_src/2026-08-30-qoft-consolidation-and-training-bringup.md", "sha256": "7d22b61876253534e1d4894ed1eeda9d90ce80207dd23c818a63b27687ba2350", "assets": []}}</script>
 <style>
 
 </style>
@@ -13,28 +13,30 @@
 <button class="theme-toggle" type="button" aria-label="Toggle color theme">Theme</button>
 <div class="page">
 <div class="doc-layout">
-<details class="toc" open><summary>Contents</summary><ol><li class="lvl-2"><a href="#status">Status</a></li><li class="lvl-2"><a href="#wave-1-2026-08-29-consolidation">Wave 1 (2026-08-29): consolidation</a></li><li class="lvl-2"><a href="#wave-2-2026-08-30-one-checkpoint-contract-first-loss">Wave 2 (2026-08-30): one checkpoint contract, first loss</a></li><li class="lvl-3"><a href="#root-cause-of-the-nvfp4-load-failure">Root cause of the NVFP4 load failure</a></li><li class="lvl-3"><a href="#design-decision-single-source-of-truth">Design decision: single source of truth</a></li><li class="lvl-3"><a href="#the-three-commits-reviewable-without-repository-access">The three commits, reviewable without repository access</a></li><li class="lvl-3"><a href="#the-run-ladder">The run ladder</a></li><li class="lvl-3"><a href="#evidence-package-the-remaining-backward-defect">Evidence package: the remaining backward defect</a></li><li class="lvl-3"><a href="#also-captured-this-wave">Also captured this wave</a></li><li class="lvl-2"><a href="#defects-fixed-in-wave-1">Defects fixed in wave 1</a></li><li class="lvl-2"><a href="#open-moonlight-int4-nan-wave-1-re-framed-by-wave-2">Open: Moonlight INT4 NaN (wave 1, re-framed by wave 2)</a></li><li class="lvl-2"><a href="#open-deepep-and-the-cuda-wheel-skew-wave-1">Open: DeepEP and the CUDA wheel skew (wave 1)</a></li><li class="lvl-2"><a href="#open-kimi-training-path-forward-signature-wave-2-round-1">Open: Kimi training-path forward signature (wave 2, round 1)</a></li><li class="lvl-2"><a href="#environment-work-wave-1">Environment work (wave 1)</a></li><li class="lvl-2"><a href="#actions">Actions</a></li><li class="lvl-2"><a href="#reproduction">Reproduction</a></li></ol></details>
+<details class="toc" open><summary>Contents</summary><ol><li class="lvl-2"><a href="#status">Status</a></li><li class="lvl-2"><a href="#wave-1-2026-08-29-consolidation">Wave 1 (2026-08-29): consolidation</a></li><li class="lvl-2"><a href="#wave-2-2026-08-30-one-checkpoint-contract-first-loss">Wave 2 (2026-08-30): one checkpoint contract, first loss</a></li><li class="lvl-3"><a href="#root-cause-of-the-nvfp4-load-failure">Root cause of the NVFP4 load failure</a></li><li class="lvl-3"><a href="#design-decision-single-source-of-truth">Design decision: single source of truth</a></li><li class="lvl-3"><a href="#the-three-commits-reviewable-without-repository-access">The three commits, reviewable without repository access</a></li><li class="lvl-3"><a href="#the-run-ladder">The run ladder</a></li><li class="lvl-3"><a href="#evidence-package-the-remaining-backward-defect">Evidence package: the remaining backward defect</a></li><li class="lvl-2"><a href="#wave-3-2026-08-30-ablation-campaign-what-the-blowup-is-not">Wave 3 (2026-08-30): ablation campaign — what the blowup is NOT</a></li><li class="lvl-3"><a href="#the-ablation-that-localizes-it">The ablation that localizes it</a></li><li class="lvl-3"><a href="#closed-by-measurement">Closed by measurement</a></li><li class="lvl-3"><a href="#the-meta-device-placeholder-finding-and-its-correction">The meta-device placeholder finding, and its correction</a></li><li class="lvl-3"><a href="#version-dependent-magnitudes">Version-dependent magnitudes</a></li><li class="lvl-3"><a href="#the-step-1-nan-is-a-separate-phenomenon">The step-1 NaN is a separate phenomenon</a></li><li class="lvl-3"><a href="#structural-finding-the-quantized-expert-path-requires-oft">Structural finding: the quantized expert path requires OFT</a></li><li class="lvl-3"><a href="#controls-that-could-not-be-run">Controls that could not be run</a></li><li class="lvl-3"><a href="#also-captured-this-wave">Also captured this wave</a></li><li class="lvl-2"><a href="#defects-fixed-in-wave-1">Defects fixed in wave 1</a></li><li class="lvl-2"><a href="#open-moonlight-int4-nan-wave-1-re-framed-by-wave-2">Open: Moonlight INT4 NaN (wave 1, re-framed by wave 2)</a></li><li class="lvl-2"><a href="#open-deepep-and-the-cuda-wheel-skew-wave-1">Open: DeepEP and the CUDA wheel skew (wave 1)</a></li><li class="lvl-2"><a href="#open-kimi-training-path-forward-signature-wave-2-round-1">Open: Kimi training-path forward signature (wave 2, round 1)</a></li><li class="lvl-2"><a href="#environment-work-wave-1">Environment work (wave 1)</a></li><li class="lvl-2"><a href="#actions">Actions</a></li><li class="lvl-2"><a href="#reproduction">Reproduction</a></li></ol></details>
 <main>
 <header class="doc-header">
 <div class="doc-state"><span class="doc-profile">Development log</span><span class="doc-status status-draft">Draft</span></div><div class="doc-kind">development</div><h1 class="doc-title">QOFT consolidation and quantized-base training bring-up</h1>
 <div class="doc-tags"><span>orbit</span><span>qoft</span><span>peft</span><span>int4</span><span>fp8</span><span>nvfp4</span><span>consolidation</span><span>slurm</span></div>
-<dl class="meta"><div><dt>date</dt><dd>2026-08-30</dd></div><div><dt>commit</dt><dd>6d61cc041023</dd></div><div><dt>branch</dt><dd>feature/relocate-conversion-scripts (= feature/generic-int4-adapter)</dd></div><div><dt>tree</dt><dd class="flag-dirty">dirty</dd></div><div><dt>host</dt><dd>slurm-login-567db7474-fv2mx</dd></div><div><dt>python</dt><dd>3.10.12</dd></div><div><dt>tip</dt><dd>6d61cc04</dd></div><div><dt>repo</dt><dd>Sphere-AI-Lab/Megatron-Bridge</dd></div><div><dt>cluster</dt><dd>slurm (slinky, H200/B200)</dd></div><div><dt>reporting_period</dt><dd>2026-08-29 to 2026-08-30</dd></div></dl>
+<dl class="meta"><div><dt>date</dt><dd>2026-08-30</dd></div><div><dt>commit</dt><dd>e5a1dbeb40d1</dd></div><div><dt>branch</dt><dd>feature/relocate-conversion-scripts (= feature/generic-int4-adapter)</dd></div><div><dt>host</dt><dd>slurm-login-567db7474-fv2mx</dd></div><div><dt>python</dt><dd>3.10.12</dd></div><div><dt>tip</dt><dd>e5a1dbeb</dd></div><div><dt>repo</dt><dd>Sphere-AI-Lab/Megatron-Bridge</dd></div><div><dt>cluster</dt><dd>slurm (slinky, H200/B200)</dd></div><div><dt>reporting_period</dt><dd>2026-08-29 to 2026-08-30 (waves 1-3)</dd></div></dl>
 </header>
 <section class="report-summary" aria-label="Outcome">
 <p class="summary-label">Outcome</p>
-<p class="summary-title">The consolidated QOFT entrypoint now loads the NVFP4 Qwen3 checkpoint end-to-end and has produced the first loss value of the whole campaign (4.79) — the remaining blocker is uninitialized token-row garbage entering the backward pass at the MoE boundary, with per-rank gradient magnitudes spanning fifteen orders of magnitude.</p>
-<p class="summary-detail">Wave 1 (2026-08-29) consolidated five per-model entrypoints into one and hit two environmental blockers. Wave 2 (2026-08-30) unified the NVFP4 checkpoint contract into one source of truth shared by the trainer and the RL loader, fixed the load end-to-end in six three-minute iterations, and localized the remaining defect precisely enough to hand to a MoE/dispatcher owner: forward is proven healthy; backward receives junk gradient rows for padded tokens — the same fingerprint as the still-open Moonlight forward NaN.</p>
+<p class="summary-title">The consolidated QOFT entrypoint now loads the NVFP4 Qwen3 checkpoint end-to-end and produces the campaign's first loss (4.79); two independent defects remain, and a 24-run ablation has closed six candidate causes for them — including both hypotheses this report previously advanced.</p>
+<p class="summary-detail">Wave 1 consolidated five per-model entrypoints into one. Wave 2 unified the NVFP4 checkpoint contract into a single source of truth shared by the trainer and the RL loader, fixing the load end-to-end. Wave 3 established by measurement what the remaining failure is not: not cross-rank dispatch (EP=1 fails earlier), not the dequantized weights (verified against the BF16 release at 9.4% error, 0.9955 correlation), not adapter initialization, not oversized activations (max 708, identical on every rank), not uninitialized gradient buffers (zero before the backward), and not the meta-device placeholders (they carry zero-byte storage — a correction to this report's own earlier claim). What remains is a row-aligned NaN entering the expert backward at step 1 but not step 0, which persists even in the configuration whose gradients are healthy, plus a separate ~2000x gradient excess confined to the dense-quantized attention adapters.</p>
 </section>
 <h2 id="status">Status<a class="anchor" href="#status" aria-hidden="true">#</a></h2>
 <p><span data-status="done">done: consolidation written and pushed</span> ·
-<p><span data-status="done">done: config-equivalence verified</span> ·
-<span data-status="done">done: NVFP4 load contract unified + verified</span> ·
+<p><span data-status="done">done: NVFP4 load contract unified + verified</span> ·
 <span data-status="done">done: first loss produced (4.79, tp1/ep4)</span> ·
-<span data-status="open">open: backward pad-row garbage (MoE boundary)</span> ·
+<span data-status="done">done: 6 candidate causes eliminated by measurement</span> ·
+<span data-status="open">open: step-1 row-aligned NaN in the expert backward</span> ·
+<span data-status="open">open: dense-attention adapter gradient excess</span> ·
 <span data-status="open">open: tp≥2 scalar sharding validation</span> ·
-<span data-status="open">open: Moonlight INT4 NaN (same fingerprint?)</span> ·
+<span data-status="open">open: Moonlight INT4 forward NaN</span> ·
 <span data-status="open">open: DeepEP / CUDA wheel skew</span> ·
 <span data-status="open">open: Kimi padding_mask forward signature</span> ·
+<span data-status="blocked">blocked: same-model BF16 control (3 unrelated defects)</span> ·
 <span data-status="open">open: retire old entrypoints</span></p></p>
 <h2 id="wave-1-2026-08-29-consolidation">Wave 1 (2026-08-29): consolidation<a class="anchor" href="#wave-1-2026-08-29-consolidation" aria-hidden="true">#</a></h2>
 <p>The intended end state is two launchers: <code>run_peft_finetune.sh</code> for high-precision bases and
@@ -72,11 +74,9 @@ are regenerable, so no backward compatibility is owed. Rejected: renaming the co
 to match the trainer's accidental layout (chains the format to ModelOpt internals and breaks the
 proven RL consumer), and a standalone declarative schema (a second source of truth).</p></p>
 </aside>
-<p>Implementation (commits <code>52b54eb6</code> wiring, <code>70bf69ed</code> library fix, <code>6d61cc04</code> diagnostics —
-<strong>all three exist only in the cluster worktree</strong> <code>~/miles-orbit-dev/worktrees/mbridge-relocate</code>
-on the slurm login; a login-pod outage blocked the push at the time of writing, so they are not
-on origin. The next section summarizes their content so this report is reviewable without
-repository access):</p>
+<p>Implementation (commits <code>52b54eb6</code> wiring, <code>70bf69ed</code> library fix, <code>6d61cc04</code> diagnostics, all
+pushed to <code>origin/feature/relocate-conversion-scripts</code>; wave 3 adds <code>e5a1dbeb</code>. The next section
+summarizes their content so this report is reviewable without repository access):</p>
 <ul><li><code>install_nvfp4_checkpoint_load_patches()</code> in <code>_qoft_common.py</code>, shaped identically to the INT4<p>installer: plain bf16 meta build, dense+expert transforms applied in <code>_generate_model_state_dict</code>,
 packed expert buffers + dense bf16 dequantization in <code>_load_model_state_dict</code>, the ModelOpt
 auto-restore seam no-op'd, <code>_extra_state</code> requests dropped (they use a naming family the grouped
@@ -176,6 +176,108 @@ mechanism, two symptoms, two architectures. Owner needed: orbit's MoE dispatcher
 <ol><li>Zero-fill or mask pad rows: zero <code>grad_output</code> rows beyond each expert's real token count<p>inside the OFT adapter backward (or zero the dispatcher's buffers at allocation) — if step-0
 grad norms collapse to the rank-0 magnitudes (~1e2), the hypothesis is confirmed.</p></li><li><code>--moe-permute-fusion false</code> equivalent (config <code>moe_permute_fusion=False</code>) — for Moonlight<p>this <em>moved</em> the NaN, consistent with buffer-layout dependence.</p></li><li>Compare against the RL trainer's dispatcher configuration (orbit repo,<p><code>backends/megatron_utils/</code>) — RL trains OFT-on-NVFP4 stably; a difference in its
 pad/capacity handling would be load-bearing.</p></li><li>Single-expert-parallel run (<code>EP=1</code>, <code>NUM_GPUS=2</code>): removes alltoall entirely; a clean run<p>pins the defect to the dispatch path rather than the OFT/dequant math.</p></li></ol>
+<h2 id="wave-3-2026-08-30-ablation-campaign-what-the-blowup-is-not">Wave 3 (2026-08-30): ablation campaign — what the blowup is NOT<a class="anchor" href="#wave-3-2026-08-30-ablation-campaign-what-the-blowup-is-not" aria-hidden="true">#</a></h2>
+<p>24 short runs (jobs 5237–5290, execution <code>20260830T033241Z-r198449508</code>, ~3 min each on 2–4 H200s)
+narrowed the remaining defect by elimination. <strong>Read this section before re-deriving anything: six
+plausible causes are now closed by measurement, including two the wave-2 report proposed.</strong></p>
+<h3 id="the-ablation-that-localizes-it">The ablation that localizes it<a class="anchor" href="#the-ablation-that-localizes-it" aria-hidden="true">#</a></h3>
+<p>All rows are Qwen3-30B-A3B NVFP4, tp1/ep4, OFT, step 0, <code>lr=0</code>, identical data:</p>
+<div class="table-wrap"><table><thead><tr><th>Adapters on</th><th>Loss</th><th>Global grad norm</th><th>Per-rank local param-grad totals</th></tr></thead><tbody><tr><td><strong>experts only</strong> (<code>linear_fc1,linear_fc2</code>)</td><td>4.8102</td><td><strong>22.2</strong></td><td><strong>0.59 / 0.40 / 0.58 / 0.54</strong></td></tr><tr><td><code>linear_qkv</code> + experts</td><td>4.7907</td><td>1.4e12</td><td>7.5e3 / 5.8e5 / 6.6e10 / 1.1e11</td></tr><tr><td><code>linear_proj</code> + experts</td><td>4.8102</td><td>1.5e13</td><td>11.7 / 1.5e9 / 158 / 8.2e12</td></tr><tr><td>all four (default)</td><td>4.7907</td><td>4.29e4 †</td><td>726 / 7010 / 33478 / 47214</td></tr></tbody></table></div>
+<p>† at branch tip; the same configuration reported 2.7e17 at an earlier commit — see <em>Version-dependent
+magnitudes</em> below.</p>
+<p>The excess is confined to the <strong>dense-NVFP4 attention adapters</strong>. <code>linear_qkv</code> is column-parallel and
+<code>linear_proj</code> is row-parallel — opposite <code>input_is_parallel</code> paths in <code>OFTRotationModule</code> — and both
+inflate, so this is not a tensor-parallel bug. The 96 dense-quantized modules in this checkpoint are
+exactly the 48 layers × 2 attention linears.</p>
+<h3 id="closed-by-measurement">Closed by measurement<a class="anchor" href="#closed-by-measurement" aria-hidden="true">#</a></h3>
+<aside class="decision">
+<p class="block-label">Eliminated</p>
+<p><strong>1. Cross-rank alltoall dispatch.</strong> <code>EP=1</code> removes it entirely and the
+<p>run still fails — <em>earlier</em> (step 0, not step 1) and in pure attention
+(<code>layers.14.self_attention.linear_qkv</code>, finite values to 3.26e38). The wave-2
+pad-row-in-dispatch hypothesis is dead as a sole explanation.<br>
+<strong>2. Corrupted dequantized weights.</strong> An independent pure-torch NVFP4 dequantizer
+(<code>check_dense_dequant.py</code>, runs on the login node with
+<code>dcp.load(..., no_dist=True)</code>; no GPU or megatron import needed) reproduced layer 0's
+<code>linear_proj</code> from the checkpoint and compared it against the original BF16 release:
+9.4% relative Frobenius error, 0.9955 Pearson correlation, absmax 0.75 vs 0.75, RMS 0.019294 vs
+0.019304. That is exactly what 4-bit quantization should cost.<br>
+<strong>3. Adapter initialization.</strong> 192 <code>oft_r</code> parameters, all exactly zero,
+all finite, all on CUDA → R = I, so the forward is the base model and 4.79 is its genuine loss.<br>
+<strong>4. A vacuous forward.</strong> Zeroing all 4608 packed expert buffers
+(<code>QOFT_DEBUG_ZERO_EXPERT_BUFFERS=1</code>) moves the loss 4.79 → 16.10, so the grouped-expert
+path really does contribute. Earlier runs agreeing on 4.790725 was not evidence of a dead path.<br>
+<strong>5. Enormous-but-finite activations.</strong> The tracer now records the largest finite
+activation per step: <strong>708</strong>, at <code>layers.47.self_attention.linear_proj</code>,
+<em>identical on all four ranks</em>. A NaN check cannot see a 1e30 activation; this measurement
+can, and there isn't one.<br>
+<strong>6. Uninitialized gradient buffers.</strong> <code>main_grad</code> max|·| measured
+immediately before the backward is <strong>0</strong> for all 96 dense and all 96 expert
+parameters on every rank. The large gradients are genuinely computed, not accumulated onto
+garbage.</p></p>
+</aside>
+<h3 id="the-meta-device-placeholder-finding-and-its-correction">The meta-device placeholder finding, and its correction<a class="anchor" href="#the-meta-device-placeholder-finding-and-its-correction" aria-hidden="true">#</a></h3>
+<p>The load path shared by both quantized installers calls <code>to_empty_if_meta_device</code>, which materializes
+leftover meta tensors as <em>uninitialized</em> memory while only <code>oft_r</code> was re-zeroed afterwards. A new
+audit names every such tensor: <strong>3072</strong> (Qwen3 NVFP4) and <strong>1664</strong> (Moonlight INT4) per-expert bf16
+placeholders.</p>
+<p>That looked like the root cause and is not. Measurement showed <strong>all of them carry zero-byte
+storage</strong> — the emptying done by <code>register_*_buffers_after_load</code> survives materialization, so they
+hold no data at all. Two consequences: they were never garbage (which is why zeroing them left
+Moonlight's forward NaN untouched), and <em>writing</em> to them is an illegal access that surfaces as an
+opaque <code>NCCL Error 1: unhandled cuda error</code>. The committed guard (<code>_has_full_storage</code>) zeroes only
+tensors with real backing storage and reports the split.</p>
+<h3 id="version-dependent-magnitudes">Version-dependent magnitudes<a class="anchor" href="#version-dependent-magnitudes" aria-hidden="true">#</a></h3>
+<p>The default configuration is <strong>reproducible within a commit</strong> and unstable across commits:</p>
+<div class="codeblock"><div class="lang">text</div><pre><code>commit 6d61cc04   grad_norm 2.7e17
+commit e5a1dbeb   grad_norm 42867.7 / 42862.4 / 42861.5   (three identical runs)
+                  per-rank totals 726.2 / 726.3 / 726.4, 7010.7 / 7012.8 / 7012.0</code></pre></div>
+<p>The only relevant change between them was adding tensor allocations inside a tracing hook. Leftover
+bytes are a deterministic function of the allocation history, so this pattern — exactly reproducible
+for a given binary, wildly different when unrelated code shifts the allocator — is the signature of
+a read of uninitialized memory somewhere in the backward. Note this makes any single gradient
+magnitude un-citable across versions; only the <em>ratio</em> between configurations is stable.</p>
+<h3 id="the-step-1-nan-is-a-separate-phenomenon">The step-1 NaN is a separate phenomenon<a class="anchor" href="#the-step-1-nan-is-a-separate-phenomenon" aria-hidden="true">#</a></h3>
+<p><code>clip_grad=1.0</code> is active (confirmed in the optimizer config), so a large finite gradient is scaled
+down and cannot by itself destroy the next step. And the NaN appears at step 1 in <strong>both</strong> the
+exploding configuration and the healthy experts-only one (grad norm 22). So gradient magnitude and
+the NaN are two different problems; fixing the first will not fix the second.</p>
+<p>The NaN's geometry is unchanged from wave 2 and is the strongest remaining clue: it arrives as
+<code>grad_output</code> at an expert <code>linear_fc2</code> adapter, always as <strong>complete token rows</strong> (1536 = 2 rows of
+768; 33024 = 43 rows), with the layer varying between runs. Step 0 is clean and step 1 is not, which
+is consistent with allocator behaviour — freshly mapped pages read as zero on first touch, while
+pages recycled from the pool after step 0 carry its leftovers.</p>
+<h3 id="structural-finding-the-quantized-expert-path-requires-oft">Structural finding: the quantized expert path requires OFT<a class="anchor" href="#structural-finding-the-quantized-expert-path-requires-oft" aria-hidden="true">#</a></h3>
+<p>Any configuration that leaves the expert linears unwrapped — attention-only OFT targets, or LoRA
+anywhere — dies with <code>RuntimeError: cannot reshape tensor of 0 elements into shape [-1, 0]</code>. The
+base expert weights are deliberately storage-emptied and the <em>only</em> code that consumes the packed
+NVFP4 buffers lives inside the OFT wrapper. There is therefore no "base model without adapters"
+comparison available on this path, and QLoRA on grouped NVFP4 is not merely unimplemented but
+structurally absent.</p>
+<h3 id="controls-that-could-not-be-run">Controls that could not be run<a class="anchor" href="#controls-that-could-not-be-run" aria-hidden="true">#</a></h3>
+<p>The same-model BF16 control (Qwen3-30B-A3B, no quantization, same OFT targets and topology) is still
+blocked, having hit three unrelated defects in sequence: <code>finetune_peft.py</code> setting
+<code>packed_sequence_specs</code> on a dataset config that lacks it (<strong>fixed</strong>, guarded); then the
+homogeneous-vs-explicit layer-schema mismatch that <code>finetune_qoft.py</code> handles by detection and
+<code>finetune_peft.py</code> does not; then, on a dense Qwen3-8B substitute, this environment's cuDNN
+fused-attention defect — which <code>NVTE_FUSED_ATTN=0</code> avoids for the quantized path but which conflicts
+with the bf16 path's <code>auto</code> backend. Prior project history (the OFT port verified bit-identical
+against orbit for both PEFT trainer steps) is the only current evidence that OFT-on-attention is
+sound in BF16.</p>
+<aside class="risk">
+<p class="block-label">Where the next analyst should start</p>
+<p>Two independent questions remain, and they need different owners.
+<p><strong>(a) The step-1 row-aligned NaN</strong> — present with healthy gradients, so it is the
+more fundamental defect. Instrument the MoE combine/unpermute path to dump which token rows of the
+gradient buffer are never written at step 1, or zero-fill the dispatcher's gradient buffers at
+allocation and see whether the NaN disappears. The step-0-clean/step-1-dirty pattern points at
+buffer reuse rather than at a missing write on first use.
+<strong>(b) The dense-attention gradient magnitude</strong> — decide first whether ~4e4 at
+<code>lr=0</code> with activations of 708 is even anomalous for OFT at initialization, by
+comparing against a BF16 OFT run once one of the three blockers above is cleared. If it is
+anomalous, the version-dependence says to look for an uninitialized read in the dense adapter's
+backward, not in the forward or the weights.</p></p>
+</aside>
 <h3 id="also-captured-this-wave">Also captured this wave<a class="anchor" href="#also-captured-this-wave" aria-hidden="true">#</a></h3>
 <ul><li><strong>tp≥2 open item</strong>: mcore sharding validation rejects the transform's scalar quantizer entries<p>(<code>Invalid access pattern for ShardedTensor(key='…weight_quantizer._double_scale32', …
 local_shape=(), global_shape=())</code>) at tp2 — the <code>_replica_id_with_current_tp_rank</code> semantics
@@ -217,7 +319,7 @@ tag exists on neither public PyPI nor <code>pypi.nvidia.com</code>; build recipe
 <code>STRAGGLER_DET_SKIP_CUPTI_EXT_BUILD=1</code>. <code>transformers</code> must stay 5.12.1 despite the fork's
 <code>&lt;=5.6</code> metadata pin.</p>
 <h2 id="actions">Actions<a class="anchor" href="#actions" aria-hidden="true">#</a></h2>
-<div class="table-wrap"><table><thead><tr><th>action</th><th>owner</th><th>status</th><th>evidence or trigger</th></tr></thead><tbody><tr><td>Backward pad-row garbage: run probes 1–4, fix dispatcher or mask</td><td>MoE/dispatcher owner (or next agent)</td><td>Open</td><td>this report's evidence package</td></tr><tr><td>tp≥2 scalar sharding validation for quantized loads</td><td>next agent</td><td>Open</td><td>job 5190 error</td></tr><tr><td>Phase 2 SSoT: converters consume the contract modules; regenerate checkpoints; unify the three installers behind one generic one; toy round-trip matrix per (arch, quant)</td><td>next agent</td><td>Open</td><td>nvfp4 cell trains stably</td></tr><tr><td>Kimi <code>padding_mask</code> pass-through + rerun (answers the MLA discriminator for Moonlight)</td><td>next agent</td><td>Open</td><td>small fix, job 5163 evidence</td></tr><tr><td>DeepEP build retry with <code>CCCL_DISABLE_CTK_COMPATIBILITY_CHECK</code></td><td>next agent</td><td>Open</td><td>wave-1 analysis</td></tr><tr><td>Retire the five old entrypoints</td><td>after training verified</td><td>Open</td><td>deliberately retained as baseline</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>action</th><th>owner</th><th>status</th><th>evidence or trigger</th></tr></thead><tbody><tr><td>Step-1 row-aligned NaN in the expert backward (present even with healthy gradients)</td><td>MoE/dispatcher owner</td><td>Open</td><td>wave-3 evidence; step-0-clean/step-1-dirty</td></tr><tr><td>Decide whether the dense-attention gradient magnitude is anomalous at all, then chase the uninitialized read if so</td><td>next agent</td><td>Open</td><td>needs any BF16 OFT baseline</td></tr><tr><td>Unblock the same-model BF16 control: port <code>finetune_qoft.py</code>'s explicit-layer-schema detection into <code>finetune_peft.py</code>, and set the attention backend in config instead of via <code>NVTE_FUSED_ATTN</code></td><td>next agent</td><td>Blocked</td><td>3 defects hit in sequence</td></tr><tr><td>tp≥2 scalar sharding validation for quantized loads</td><td>next agent</td><td>Open</td><td>job 5190 error</td></tr><tr><td>Phase 2 SSoT: converters consume the contract modules; regenerate checkpoints; unify the three installers behind one generic one; toy round-trip matrix per (arch, quant)</td><td>next agent</td><td>Open</td><td>nvfp4 cell trains stably</td></tr><tr><td>Kimi <code>padding_mask</code> pass-through + rerun (answers the MLA discriminator for Moonlight)</td><td>next agent</td><td>Open</td><td>small fix, job 5163 evidence</td></tr><tr><td>DeepEP build retry with <code>CCCL_DISABLE_CTK_COMPATIBILITY_CHECK</code></td><td>next agent</td><td>Open</td><td>wave-1 analysis</td></tr><tr><td>Retire the five old entrypoints</td><td>after training verified</td><td>Open</td><td>deliberately retained as baseline</td></tr></tbody></table></div>
 <h2 id="reproduction">Reproduction<a class="anchor" href="#reproduction" aria-hidden="true">#</a></h2>
 <div class="codeblock"><div class="lang">bash</div><pre><code># worktree ~/miles-orbit-dev/worktrees/mbridge-relocate, branch tip 6d61cc04
 export PYTHONPATH="$WT/src:$WT/3rdparty/Megatron-LM"
@@ -230,16 +332,23 @@ env QUANT=nvfp4 \
     NUM_GPUS=4 TP=1 EP=4 TRAIN_ITERS=3 GLOBAL_BATCH_SIZE=4 \
     EXTRA_ARGS="--skip-eval --log-interval 1 --debug-nan" \
     bash scripts/orbit/run_qoft_finetune.sh</code></pre></div>
-<p><code>--debug-nan</code> prints the per-rank gradient attribution and the first-non-finite trace.
-<code>--skip-train</code> exercises load only. <code>QOFT_ADAPTER_INIT_CHECK=1</code> reports adapter state at start.
-Moonlight INT4 repro is unchanged from wave 1 (2 GPUs, <code>--quant int4</code>).</p>
+<p><code>--debug-nan</code> prints, per rank: the first non-finite tensor, per-parameter gradient attribution, the
+largest finite activation, and <code>main_grad</code> max|·| before the backward.
+<code>QOFT_ADAPTER_INIT_CHECK=1</code> reports adapter state at train start.
+<code>QOFT_DEBUG_ZERO_EXPERT_BUFFERS=1</code> destroys the packed expert weights (loss must move if the
+grouped-expert path is live). <code>--skip-train</code> exercises load only. Moonlight INT4 repro is unchanged
+from wave 1 (2 GPUs, <code>--quant int4</code>).</p>
+<p>Two infrastructure notes for anyone running these in parallel: co-tenant jobs collide on torchrun's
+default port, so set <code>PET_MASTER_PORT=$((20000 + SLURM_JOB_ID % 10000))</code>; and <code>NVTE_FUSED_ATTN=0</code> is
+required for the quantized path on this environment but breaks any path whose attention backend is
+<code>auto</code>.</p>
 <p>Run stores with full logs:
 <code>~/.local/state/remote-cluster-runs/slurm/megatron-bridge/feature-relocate-conversion-scripts/</code>
 — wave 1: jobs 5079–5152; wave 2 round 1: 5162/5163 (exec <code>20260829T223839Z-r29444327</code>);
 wave 2 NVFP4 ladder: jobs 5185–5199 (exec <code>20260829T235425Z-r2281915244</code>, labels
 <code>qoft-qwen3-nvfp4-train-r2</code> … <code>-r10-rankattr</code>). Mirrored on the workstation under the same
 suffix.</p>
-<footer class="doc-footer">Generated 2026-08-30 03:25 UTC by htmlreport</footer>
+<footer class="doc-footer">Generated 2026-08-30 04:28 UTC by htmlreport</footer>
 </main>
 </div>
 </div>
