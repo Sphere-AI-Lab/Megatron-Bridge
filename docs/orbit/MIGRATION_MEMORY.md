@@ -260,8 +260,21 @@ therefore safe as written, though it remains the one extractability wart.
 **Conclusion:** the vendored file's header ("updated for TE 2.14.0") is
 accurate. Commit C5 needs no adaptation work — copy the file as-is.
 
-Everything above is static analysis. No Python has been executed; no GPU
-verification has been done (that is Phase 3, handed to the user).
+Everything above is static analysis. No GPU verification has been done (that is
+Phase 3, handed to the user).
+
+**Import verification is now complete and clean:** all **604 imported names
+across all 83 orbit Python files** resolve against radixark, mcore `235952df`,
+TE v2.14 and modelopt 0.46.0, with **no remaining false positives**. Reaching
+that required fixing three blind spots in the AST checker, each of which had
+produced spurious "missing symbol" reports:
+
+1. tuple-unpacking assignment (`X, HAVE_X = safe_import_from(...)`) — this had
+   wrongly flagged 4 symbols in radixark's own `peft/utils.py`;
+2. **relative** star imports (`from .gemm import *`) — this had wrongly flagged
+   TE's `general_gemm` and modelopt's `SequentialQuantizer`;
+3. star imports nested inside `with` blocks (modelopt's
+   `with import_plugin(...): from .mcore_dist_checkpointing import *`).
 
 ## 9. Findings from executing Phase 1 (C3–C10)
 
@@ -298,12 +311,29 @@ trainable parameter count for MoE, not just behaviour.
   `_load_checkpoint_from_path` — the training resume path — has no modelopt
   restore at all. Orbit calls the same `restore_modelopt_state` radixark
   imports, adding only a `has_modelopt_state` guard.
-- **Seam 2 may be redundant — unverified.**
-  `_save_sharded_modelopt_state_with_async_strategy` is a fork of *ModelOpt's*
-  `save_sharded_modelopt_state` that exists only to thread `async_strategy=`
-  into `dist_checkpointing.save`. `nvidia-modelopt` is not installed locally, so
-  whether ModelOpt's own version already accepts that argument could not be
-  checked. If it does, delete orbit's fork and seam 2 with it.
+- **Seam 2 is justified — RESOLVED, no longer an open question.** modelopt 0.46.0
+  is now installed at `/home/kerryliu/uv-cu12/.venv`, and static inspection
+  settles it: ModelOpt's own
+  `save_sharded_modelopt_state(model, checkpoint_name, sharded_strategy=None, prefix="")`
+  (`torch/opt/plugins/mcore_dist_checkpointing.py:112`) has **no**
+  `async_strategy` parameter and calls
+  `dist_checkpointing.save(modelopt_state, name, sharded_strategy)` with three
+  positional args. mcore's `save` **does** accept
+  `async_strategy: Optional[str] = "nvrx"` (`serialization.py:342`). So orbit's
+  fork is the only way to thread the strategy through. Keep seam 2.
+- **The seam guards can silently disable orbit.** `modelopt.torch.opt.plugins`
+  exposes `restore_modelopt_state` / `save_sharded_modelopt_state` only via
+  `with import_plugin("megatron core dist checkpointing"): from
+  .mcore_dist_checkpointing import *`, and `import_plugin` swallows
+  `ModuleNotFoundError` (and every other exception) with a warning only. If that
+  plugin fails to load, those names vanish, orbit's top-level import at
+  `training/modelopt_checkpoint.py:16` raises ImportError, and the seams'
+  `except ImportError: pass` quietly no-ops — ModelOpt state would then not be
+  restored before the sharded load, with no clear diagnostic.
+  **This is not hypothetical:** the venv above cannot import modelopt at all
+  because `requests` is missing, so as it stands seams 2 and 3 would silently do
+  nothing. Install `requests` before Phase 3, and consider logging at debug
+  level in those `except ImportError` handlers rather than a bare `pass`.
 
 ### Known, deliberately not fixed
 
