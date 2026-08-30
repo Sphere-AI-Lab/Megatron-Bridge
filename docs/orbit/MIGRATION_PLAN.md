@@ -47,12 +47,31 @@ Landed on `feature/orbit-on-radixark` (newest last):
 | `505641ca` | docs: Phase 0 verification results |
 | `e170c021` | **C1** — orbit namespace root + NOTICE |
 | `8e904156` | **C2** — orbit/quant + orbit/low_precision |
+| `89362b78` | docs: correct the migration rule to containment plus dedup |
+| `f30b856c` | **C3** — orbit/peft_ext (+ 2 oft leaf files) |
+| `3e17ba98` | fix: make the C2 modules lint-clean |
 
-Next: **C3**. Remaining: C3–C10, then Phase 2.
+Next: **C4**. Remaining: C4–C10, then Phase 2.
 
-One deviation from the table below: subpackage `__init__.py` files ship with
-their own content commit rather than all landing in C1, because several of them
-eagerly import their submodules and would otherwise leave C1 un-importable.
+Deviations from the commit table below, all recorded rather than silent:
+
+1. Subpackage `__init__.py` files ship with their own content commit rather than
+   all landing in C1, because several of them eagerly import their submodules
+   and would otherwise leave C1 un-importable.
+2. `orbit/oft/__init__.py` and `orbit/oft/param_names.py` shipped in **C3**, not
+   C4. `peft_ext/peft_mixin.py` and `peft_ext/recompute_ext.py` both import the
+   param-name predicates at module level, so C3 would not import without them.
+   Both are leaves — `param_names.py` has no imports at all and the `__init__`
+   is docstring-only — so this is the same importability rule as deviation 1
+   applied across a subpackage boundary. C4 adds the rest of `orbit/oft/`.
+   Note `param_names.py`'s only consumers are the two `peft_ext` modules,
+   despite it living under `oft/`; it was left in place rather than moved, to
+   avoid gratuitous layout drift from the source branch.
+3. A separate lint commit (`3e17ba98`) follows C3 because the C2 files carried
+   pre-existing ruff violations inherited from spherelab. `ruff.toml` is
+   byte-identical between the two bases, so this was never a migration
+   artifact — spherelab just never linted those paths. Kept out of C3 so the
+   content commit stays reviewable.
 
 **Blocker #2 is retracted.** radixark already defines `dequantize_int4` and
 `quantize_to_int4` in `models/kimi_vl/utils.py`, functionally identical to the
