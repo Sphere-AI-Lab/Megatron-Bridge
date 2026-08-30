@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Kimi-K2.5 QOFT finetuning — INT4 base weights + BF16 OFT adapters.
+
+QOFT (Quantized OFT) keeps the base model expert weights in INT4 permanently
+(analogous to QLoRA keeping weights in NF4).  Only the OFT rotation parameters
+are in BF16 and receive gradient updates.
+
+Architecture: 61 layers, 384 routed experts + 1 shared, hidden=7168, 64 heads,
+Multi-Latent Attention (MLA), ~1T parameters.
+
+Prerequisites:
+    Convert the HF INT4 checkpoint to Megatron format:
+
+        python scripts/orbit/conversion/convert_int4_checkpoint_direct.py \\
+            --hf-model-path /path/to/Kimi-K2.5 \\
+            --megatron-path ./checkpoints/Kimi-K2.5-INT4
+
+Usage:
+    torchrun --nproc_per_node=8 scripts/orbit/models/kimi_k25/finetune_qoft_int4.py \\
+        --pretrained-checkpoint ./checkpoints/Kimi-K2.5-INT4 \\
+        --tp 2 --ep 4
+"""
+
+# ruff: noqa: D101, D103  # operational scripts: helpers here are entrypoint plumbing, not API
+
+import argparse
+import os
+import re
+from collections import defaultdict
+
+import torch
+import torch.distributed as dist
+
+from megatron.bridge import AutoBridge
+from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
+from megatron.bridge.orbit.oft.oft import OFT
+from megatron.bridge.orbit.quant.int4_utils import (
+    register_int4_buffers_after_load,
+    transform_sharded_state_dict_for_int4,
+)
+from megatron.bridge.recipes.common import _peft_common
+from megatron.bridge.recipes.kimi.kimi_k2 import _get_kimi_k2_pipeline_layout
+from megatron.bridge.recipes.utils.finetune_utils import default_peft_config
+from megatron.bridge.training.callbacks import Callback
+from megatron.bridge.training.comm_overlap import CommOverlapConfig
+from megatron.bridge.training.finetune import finetune
+from megatron.bridge.training.gpt_step import forward_step
+from megatron.bridge.training.mixed_precision import MixedPrecisionConfig
+from megatron.bridge.utils.common_utils import print_rank_0
+
+
+KIMI_K25_ALL_LINEAR_OFT_TARGET_MODULES = [
+    "linear_q_down_proj",
+    "linear_q_up_proj",
+    "linear_kv_down_proj",
+    "linear_kv_up_proj",
+    "linear_proj",
+    "linear_fc1",
+    "linear_fc2",
+]
+
+
+def _parse_target_modules(value: str) -> list[str]:
+    return [module for module in re.split(r"[\s,]+", value.strip()) if module]
+
+
+def _format_nbytes(num_bytes: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
+def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
+    if tensor is None or tensor.device.type == "meta":
+        return 0
+    try:
+        return tensor.untyped_storage().nbytes()
+    except RuntimeError:
+        return 0
+
+
+def _add_tensor_storage(summary: dict[str, int], seen_storages: set, bucket: str, tensor: torch.Tensor) -> None:
+    nbytes = _tensor_storage_nbytes(tensor)
+    if nbytes == 0:
+        return
+
+    try:
+        storage = tensor.untyped_storage()
+        key = (tensor.device.type, tensor.device.index, storage.data_ptr(), nbytes)
+    except RuntimeError:
+        return
+
+    if key in seen_storages:
+        return
+    seen_storages.add(key)
+    summary[bucket] += nbytes
+    summary["total_unique_storage_bytes"] += nbytes
+
+
+def _summarize_model_storage(model_chunks) -> dict[str, int]:
+    summary = defaultdict(int)
+    seen_storages = set()
+
+    for model_chunk in model_chunks:
+        for _, param in model_chunk.named_parameters():
+            if param is None:
+                continue
+
+            summary["parameter_tensors"] += 1
+            summary["parameter_numel"] += param.numel()
+            if param.requires_grad:
+                summary["trainable_parameter_numel"] += param.numel()
+            else:
+                summary["frozen_parameter_numel"] += param.numel()
+
+            if _tensor_storage_nbytes(param) == 0:
+                summary["empty_parameter_tensors"] += 1
+                continue
+
+            bucket = "trainable_parameter_storage_bytes" if param.requires_grad else "frozen_parameter_storage_bytes"
+            _add_tensor_storage(summary, seen_storages, bucket, param)
+
+        for name, buffer in model_chunk.named_buffers():
+            if buffer is None:
+                continue
+
+            summary["buffer_tensors"] += 1
+            summary["buffer_numel"] += buffer.numel()
+
+            if name.endswith("_packed"):
+                bucket = "int4_packed_storage_bytes"
+            elif name.endswith("_scale"):
+                bucket = "int4_scale_storage_bytes"
+            elif name.endswith("_shape"):
+                bucket = "int4_shape_storage_bytes"
+            else:
+                bucket = "other_buffer_storage_bytes"
+
+            _add_tensor_storage(summary, seen_storages, bucket, buffer)
+
+    return dict(summary)
+
+
+def _collect_parameter_entries(model_chunks) -> tuple[list[dict], list[dict]]:
+    frozen_entries = []
+    trainable_entries = []
+
+    for model_chunk in model_chunks:
+        for name, param in model_chunk.named_parameters():
+            if param is None:
+                continue
+
+            nbytes = _tensor_storage_nbytes(param)
+            if nbytes == 0:
+                continue
+
+            entry = {
+                "name": name,
+                "nbytes": nbytes,
+                "shape": tuple(param.shape),
+                "dtype": str(param.dtype).replace("torch.", ""),
+            }
+            if param.requires_grad:
+                trainable_entries.append(entry)
+            else:
+                frozen_entries.append(entry)
+
+    frozen_entries.sort(key=lambda item: item["nbytes"], reverse=True)
+    trainable_entries.sort(key=lambda item: item["nbytes"], reverse=True)
+    return frozen_entries, trainable_entries
+
+
+def _collect_buffer_entries(model_chunks) -> tuple[list[dict], list[dict]]:
+    int4_entries = []
+    other_entries = []
+
+    for model_chunk in model_chunks:
+        for name, buffer in model_chunk.named_buffers():
+            if buffer is None:
+                continue
+
+            nbytes = _tensor_storage_nbytes(buffer)
+            if nbytes == 0:
+                continue
+
+            if name.endswith("_packed"):
+                buffer_kind = "packed"
+            elif name.endswith("_scale"):
+                buffer_kind = "scale"
+            elif name.endswith("_shape"):
+                buffer_kind = "shape"
+            else:
+                buffer_kind = "other"
+
+            entry = {
+                "name": name,
+                "nbytes": nbytes,
+                "shape": tuple(buffer.shape),
+                "dtype": str(buffer.dtype).replace("torch.", ""),
+                "kind": buffer_kind,
+            }
+
+            if buffer_kind == "other":
+                other_entries.append(entry)
+            else:
+                int4_entries.append(entry)
+
+    int4_entries.sort(key=lambda item: item["nbytes"], reverse=True)
+    other_entries.sort(key=lambda item: item["nbytes"], reverse=True)
+    return int4_entries, other_entries
+
+
+def _log_parameter_table(title: str, entries: list[dict], limit: int = 12) -> None:
+    if not entries:
+        print_rank_0(f"[memory:{title}] none")
+        return
+
+    print_rank_0(f"[memory:{title}] top_{min(limit, len(entries))}")
+    for idx, entry in enumerate(entries[:limit], start=1):
+        print_rank_0(
+            "[memory:{title}] {idx:02d} {size:>10}  {dtype:<8}  {shape}  {name}".format(
+                title=title,
+                idx=idx,
+                size=_format_nbytes(entry["nbytes"]),
+                dtype=entry["dtype"],
+                shape=entry["shape"],
+                name=entry["name"],
+            )
+        )
+
+
+def _log_buffer_table(title: str, entries: list[dict], limit: int = 12) -> None:
+    if not entries:
+        print_rank_0(f"[memory:{title}] none")
+        return
+
+    print_rank_0(f"[memory:{title}] top_{min(limit, len(entries))}")
+    for idx, entry in enumerate(entries[:limit], start=1):
+        print_rank_0(
+            "[memory:{title}] {idx:02d} {size:>10}  {dtype:<8}  {kind:<6}  {shape}  {name}".format(
+                title=title,
+                idx=idx,
+                size=_format_nbytes(entry["nbytes"]),
+                dtype=entry["dtype"],
+                kind=entry["kind"],
+                shape=entry["shape"],
+                name=entry["name"],
+            )
+        )
+
+
+def _cuda_memory_snapshot() -> dict[str, int] | None:
+    if not torch.cuda.is_available():
+        return None
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    torch.cuda.synchronize(device)
+    return {
+        "allocated_bytes": torch.cuda.memory_allocated(device),
+        "reserved_bytes": torch.cuda.memory_reserved(device),
+        "max_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "max_reserved_bytes": torch.cuda.max_memory_reserved(device),
+    }
+
+
+def _log_cuda_memory(tag: str) -> None:
+    snapshot = _cuda_memory_snapshot()
+    if snapshot is None:
+        print_rank_0(f"[memory:{tag}] CUDA unavailable")
+        return
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    values = torch.tensor(
+        [
+            snapshot["allocated_bytes"],
+            snapshot["reserved_bytes"],
+            snapshot["max_allocated_bytes"],
+            snapshot["max_reserved_bytes"],
+        ],
+        device=device,
+        dtype=torch.int64,
+    )
+    min_values = values.clone()
+    max_values = values.clone()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(min_values, op=dist.ReduceOp.MIN)
+        dist.all_reduce(max_values, op=dist.ReduceOp.MAX)
+
+    labels = [
+        "allocated",
+        "reserved",
+        "peak_allocated",
+        "peak_reserved",
+    ]
+    parts = []
+    for idx, label in enumerate(labels):
+        min_val = int(min_values[idx].item())
+        max_val = int(max_values[idx].item())
+        if min_val == max_val:
+            parts.append(f"{label}={_format_nbytes(max_val)}")
+        else:
+            parts.append(f"{label}=min {_format_nbytes(min_val)}, max {_format_nbytes(max_val)}")
+
+    print_rank_0(f"[memory:{tag}] " + ", ".join(parts))
+
+
+def _log_model_storage_summary(model_chunks) -> None:
+    summary = _summarize_model_storage(model_chunks)
+    frozen_entries, trainable_entries = _collect_parameter_entries(model_chunks)
+    int4_buffer_entries, other_buffer_entries = _collect_buffer_entries(model_chunks)
+    lines = [
+        "[memory:model-storage] unique_storage={}".format(
+            _format_nbytes(summary.get("total_unique_storage_bytes", 0))
+        ),
+        "[memory:model-storage] frozen_params={} trainable_params={} empty_param_tensors={}".format(
+            _format_nbytes(summary.get("frozen_parameter_storage_bytes", 0)),
+            _format_nbytes(summary.get("trainable_parameter_storage_bytes", 0)),
+            summary.get("empty_parameter_tensors", 0),
+        ),
+        "[memory:model-storage] int4_packed={} int4_scale={} int4_shape={} other_buffers={}".format(
+            _format_nbytes(summary.get("int4_packed_storage_bytes", 0)),
+            _format_nbytes(summary.get("int4_scale_storage_bytes", 0)),
+            _format_nbytes(summary.get("int4_shape_storage_bytes", 0)),
+            _format_nbytes(summary.get("other_buffer_storage_bytes", 0)),
+        ),
+        "[memory:model-storage] parameter_numel={} trainable_parameter_numel={} buffer_numel={}".format(
+            summary.get("parameter_numel", 0),
+            summary.get("trainable_parameter_numel", 0),
+            summary.get("buffer_numel", 0),
+        ),
+    ]
+    for line in lines:
+        print_rank_0(line)
+    _log_parameter_table("frozen-params", frozen_entries)
+    _log_parameter_table("trainable-params", trainable_entries)
+    _log_buffer_table("int4-buffers", int4_buffer_entries)
+    _log_buffer_table("other-buffers", other_buffer_entries)
+
+
+class MemoryProfileCallback(Callback):
+    def __init__(self, profile_steps: int):
+        self.profile_steps = max(1, profile_steps)
+
+    def on_train_start(self, context) -> None:
+        if not torch.cuda.is_available():
+            return
+        _log_model_storage_summary(context.model)
+        torch.cuda.reset_peak_memory_stats(torch.cuda.current_device())
+        _log_cuda_memory("after-load-before-step0")
+
+    def on_train_step_start(self, context) -> None:
+        if not torch.cuda.is_available():
+            return
+        step = int(context.state.train_state.step)
+        if step < self.profile_steps:
+            torch.cuda.reset_peak_memory_stats(torch.cuda.current_device())
+            _log_cuda_memory(f"step{step}-start")
+
+    def on_train_step_end(self, context) -> None:
+        if not torch.cuda.is_available():
+            return
+        step = int(context.state.train_state.step)
+        if step < self.profile_steps:
+            _log_cuda_memory(f"step{step}-end")
+
+
+def _set_sequence_length(config, seq_length: int) -> None:
+    config.model.seq_length = seq_length
+    if getattr(config, "dataset", None) is not None:
+        config.dataset.seq_length = seq_length
+        packed_sequence_specs = getattr(config.dataset, "packed_sequence_specs", None)
+        if packed_sequence_specs is not None:
+            packed_sequence_specs.packed_sequence_size = seq_length
+
+
+def _disable_evaluation(config) -> None:
+    config.validation.eval_iters = 0
+    config.validation.eval_interval = None
+
+
+_EXPECTED_INT4_MISSING_KEY_RE = re.compile(
+    r".*\.experts\.linear_fc[12]\.(?:weight\d+|weight|weight\d+_(?:packed|scale|shape))$"
+)
+
+
+def _is_expected_int4_missing_key(key: str) -> bool:
+    return key.endswith("._extra_state") or _EXPECTED_INT4_MISSING_KEY_RE.fullmatch(key) is not None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Kimi-K2.5 QOFT finetuning (INT4 base weights)",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--pretrained-checkpoint",
+        type=str,
+        required=True,
+        help="Path to INT4 Megatron checkpoint (converted via convert_int4_checkpoint_direct.py)",
+    )
+    parser.add_argument(
+        "--hf-model-path", type=str, default="moonshotai/Kimi-K2.5", help="HF model path for config/tokenizer"
+    )
+    parser.add_argument("--tp", type=int, default=2)
+    parser.add_argument("--ep", type=int, default=4)
+    parser.add_argument("--pp", type=int, default=1)
+    parser.add_argument("--sp", action="store_true", default=True)
+    parser.add_argument("--train-iters", type=int, default=10)
+    parser.add_argument("--global-batch-size", type=int, default=32)
+    parser.add_argument("--micro-batch-size", type=int, default=1)
+    parser.add_argument("--seq-length", type=int, default=2048)
+    parser.add_argument(
+        "--distributed-timeout-minutes",
+        type=int,
+        default=None,
+        help="Override torch.distributed process-group timeout in minutes.",
+    )
+    parser.add_argument("--block-size", type=int, default=32)
+    parser.add_argument("--coft", action="store_true", default=False)
+    parser.add_argument("--eps", type=float, default=6e-5)
+    parser.add_argument("--block-share", action="store_true", default=False)
+    parser.add_argument("--module-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--target-modules",
+        type=_parse_target_modules,
+        default=list(KIMI_K25_ALL_LINEAR_OFT_TARGET_MODULES),
+        help=(
+            "Comma or whitespace separated Megatron module names to wrap with OFT. "
+            "Defaults to all Kimi MLA attention projections plus MLP/expert linears."
+        ),
+    )
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument(
+        "--save-checkpoints",
+        action="store_true",
+        default=False,
+        help="Enable saving/loading run checkpoints under output-dir/checkpoints.",
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=500,
+        help="Checkpoint save interval when --save-checkpoints is enabled.",
+    )
+    parser.add_argument(
+        "--profile-memory",
+        action="store_true",
+        default=False,
+        help="Print model storage and CUDA allocator memory around training steps.",
+    )
+    parser.add_argument(
+        "--profile-memory-steps",
+        type=int,
+        default=1,
+        help="Number of initial training steps to profile when --profile-memory is enabled.",
+    )
+    parser.add_argument(
+        "--skip-train",
+        action="store_true",
+        default=False,
+        help="Load the checkpoint, register INT4 buffers, initialize OFT, then exit without training.",
+    )
+    parser.add_argument(
+        "--skip-eval",
+        action="store_true",
+        default=False,
+        help="Disable validation/evaluation after training. Useful for long-sequence memory smoke tests.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    # OFT adapter config — rotation parameters are BF16, base weights stay INT4
+    oft = OFT(
+        target_modules=args.target_modules,
+        block_size=args.block_size,
+        coft=args.coft,
+        eps=args.eps,
+        block_share=args.block_share,
+        module_dropout=args.module_dropout,
+    )
+
+    # Start from PEFT common config
+    config = _peft_common()
+    if args.distributed_timeout_minutes is not None:
+        config.dist.distributed_timeout_minutes = args.distributed_timeout_minutes
+
+    # Model config — Kimi K2.5 (LLM backbone, not VL)
+    # init_model_with_meta_device=True: build model on meta device (zero memory),
+    # then materialize during checkpoint load. This avoids the ~2TB BF16 allocation
+    # that would OOM on both GPU and CPU for a 1T-param model.
+    config.model = AutoBridge.from_hf_pretrained(
+        args.hf_model_path,
+        trust_remote_code=True,
+    ).to_megatron_provider(load_weights=False)
+    config.model.init_model_with_meta_device = True
+    config.model.perform_initialization = False
+
+    # PEFT
+    config.peft = default_peft_config(oft)
+
+    # Checkpoint
+    config.checkpoint.pretrained_checkpoint = args.pretrained_checkpoint
+
+    # Parallelism
+    config.model.tensor_model_parallel_size = args.tp
+    config.model.expert_model_parallel_size = args.ep
+    config.model.pipeline_model_parallel_size = args.pp
+    config.model.sequence_parallel = args.sp
+    config.model.expert_tensor_parallel_size = 1
+    config.model.virtual_pipeline_model_parallel_size = None
+    config.model.context_parallel_size = 1
+    config.model.pipeline_dtype = torch.bfloat16 if args.pp > 1 else None
+
+    # Pipeline layout for PP > 1
+    if args.pp > 1:
+        config.model.pipeline_model_parallel_layout = _get_kimi_k2_pipeline_layout(args.pp, 1)
+    else:
+        config.model.pipeline_model_parallel_layout = None
+
+    # Pipeline split settings
+    config.model.account_for_embedding_in_pipeline_split = False
+    config.model.account_for_loss_in_pipeline_split = False
+
+    # Sequence length
+    _set_sequence_length(config, args.seq_length)
+
+    # Tokenizer
+    # This is an LLM finetune path built on `_peft_common()`, so we need a real
+    # text tokenizer for dataset preprocessing. Prefer the tokenizer assets saved
+    # into the converted Megatron checkpoint, and fall back to the HF model path.
+    checkpoint_tokenizer_dir = os.path.join(args.pretrained_checkpoint, "iter_{:07d}".format(0), "tokenizer")
+    tokenizer_model = checkpoint_tokenizer_dir if os.path.isdir(checkpoint_tokenizer_dir) else args.hf_model_path
+    config.tokenizer.tokenizer_type = "HuggingFaceTokenizer"
+    config.tokenizer.tokenizer_model = tokenizer_model
+    config.tokenizer.hf_tokenizer_kwargs = {"trust_remote_code": True}
+
+    # Training
+    config.train.train_iters = args.train_iters
+    config.train.global_batch_size = args.global_batch_size
+    config.train.micro_batch_size = args.micro_batch_size
+    config.train.manual_gc = True
+    config.train.manual_gc_interval = 5
+    config.train.manual_gc_eval = 5
+
+    # Scheduler
+    config.scheduler.lr_warmup_iters = 2
+    config.scheduler.lr_decay_iters = args.train_iters
+
+    # MoE settings
+    config.model.moe_token_dispatcher_type = "alltoall"
+    config.model.moe_flex_dispatcher_backend = "deepep"
+    config.model.moe_hybridep_num_sms = 16
+    config.model.moe_router_fusion = False
+    config.model.moe_permute_fusion = True
+    config.model.moe_grouped_gemm = True
+    config.model.moe_shared_expert_overlap = True
+
+    # TE
+    config.model.transformer_impl = "transformer_engine"
+
+    # CUDA Graph
+    config.model.cuda_graph_impl = "none"
+    config.model.cuda_graph_scope = "full"
+    config.model.cuda_graph_warmup_steps = 3
+
+    # Kernels
+    config.model.attention_backend = None
+    config.model.cross_entropy_loss_fusion = True
+    config.model.cross_entropy_fusion_impl = "te"
+
+    # Mixed precision
+    config.mixed_precision = MixedPrecisionConfig(
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        autocast_enabled=False,
+        grad_reduce_in_fp32=True,
+    )
+    config.model.moe_router_padding_for_fp8 = False
+
+    # Optimizer precision
+    config.optimizer.use_precision_aware_optimizer = False
+    config.optimizer.main_grads_dtype = torch.float32
+    config.optimizer.main_params_dtype = torch.float32
+    config.optimizer.exp_avg_dtype = torch.float32
+    config.optimizer.exp_avg_sq_dtype = torch.float32
+
+    # Communication
+    config.comm_overlap = CommOverlapConfig(tp_comm_overlap=False)
+    config.comm_overlap.delay_wgrad_compute = False
+    config.comm_overlap.overlap_moe_expert_parallel_comm = False
+
+    # DDP — PEFT typically doesn't need distributed optimizer
+    config.ddp.use_distributed_optimizer = False
+    config.ddp.overlap_param_gather = False
+    config.ddp.grad_reduce_in_fp32 = True
+    config.ddp.overlap_grad_reduce = True
+    config.ddp.check_for_nan_in_grad = True
+
+    # Memory
+    config.model.recompute_granularity = "full"
+    config.model.recompute_method = "uniform"
+    config.model.recompute_num_layers = 1
+
+    # Checkpoint save
+    config.checkpoint.save_interval = args.save_interval if args.save_checkpoints else 0
+    config.checkpoint.async_save = False
+
+    # Optional load-only smoke mode: exercise setup/checkpoint load and then exit.
+    if args.skip_eval:
+        _disable_evaluation(config)
+
+    if args.skip_train:
+        config.validation.skip_train = True
+        _disable_evaluation(config)
+
+    # Output
+    output_dir = args.output_dir or os.path.join(os.getcwd(), "nemo_experiments", "kimi_k25_qoft_int4")
+    if args.save_checkpoints:
+        config.checkpoint.save = os.path.join(output_dir, "checkpoints")
+        config.checkpoint.load = os.path.join(output_dir, "checkpoints")
+    else:
+        config.checkpoint.save = None
+        config.checkpoint.load = None
+        config.logger.log_progress = False
+        config.logger.wandb_save_dir = os.path.join(output_dir, "wandb")
+    config.logger.tensorboard_dir = os.path.join(output_dir, "tb_logs")
+
+    # Logger
+    config.logger.log_interval = 1
+    config.logger.wandb_project = "megatron-bridge-finetuning"
+    config.logger.wandb_exp_name = f"kimi_k25_qoft_int4_bs{args.block_size}_tp{args.tp}_ep{args.ep}"
+
+    # ------------------------------------------------------------------ #
+    # Monkey-patch checkpoint loading to handle INT4 expert weights.
+    #
+    # 1. _generate_model_state_dict: after the model produces its sharded
+    #    state dict (with BF16 expert weight entries), transform expert
+    #    weight keys into INT4 triplet keys so dist_checkpointing.load()
+    #    reads INT4 data directly from the checkpoint.
+    #
+    # 2. _load_model_state_dict: after loading, register INT4 triplets as
+    #    buffers on the expert modules and empty the BF16 weight params.
+    # ------------------------------------------------------------------ #
+    import megatron.core.transformer.moe.experts as _moe_experts
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor as MCoreShardedTensor
+
+    import megatron.bridge.training.checkpointing as _ckpt_mod
+
+    # Patch 1: Replace expert BF16 weight entries with INT4 triplet entries
+    # in the sharded state dict template.
+    _orig_gen_model_sd = _ckpt_mod._generate_model_state_dict
+    _orig_apply_swiglu_sharded_factory = _moe_experts.apply_swiglu_sharded_factory
+
+    def _safe_apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets, singleton_local_shards=False):
+        local_shape = getattr(original_sh_ten, "local_shape", None)
+        if local_shape is not None and len(local_shape) > 0 and local_shape[0] == 0:
+            return original_sh_ten
+        return _orig_apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets, singleton_local_shards)
+
+    _moe_experts.apply_swiglu_sharded_factory = _safe_apply_swiglu_sharded_factory
+
+    def _int4_generate_model_state_dict(model, model_sd_kwargs=None, ckpt_format="torch_dist", **kwargs):
+        state_dict = _orig_gen_model_sd(model, model_sd_kwargs, ckpt_format, **kwargs)
+        for model_key in list(state_dict.keys()):
+            if model_key.startswith("model"):
+                state_dict[model_key] = transform_sharded_state_dict_for_int4(state_dict[model_key])
+        return state_dict
+
+    _ckpt_mod._generate_model_state_dict = _int4_generate_model_state_dict
+
+    # Patch 2: Materialize ALL meta tensors to CPU right before PyTorch sees them.
+    #
+    # Inside dist_checkpointing.load(), the chain is:
+    #   load_preprocess()          → resolves ShardedTensorFactory (creates new meta ShardedTensors)
+    #   extract_sharded_base()     → flattens dict values to lists of ShardedBase
+    #   strategy.load()            → calls mcore_to_pyt_state_dict() → PyTorch loader
+    #
+    # We patch mcore_to_pyt_state_dict() which is the LAST step before PyTorch's
+    # checkpoint planner. At this point, values are List[ShardedTensor]. We walk
+    # all entries and materialize any meta data → CPU.
+    import megatron.core.dist_checkpointing.strategies.torch as _torch_strat
+
+    _orig_mcore_to_pyt = _torch_strat.mcore_to_pyt_state_dict
+
+    def _meta_safe_mcore_to_pyt(state_dict, is_loading=False, **kwargs):
+        if is_loading:
+            for key, val in state_dict.items():
+                if isinstance(val, list):
+                    for sh_ten in val:
+                        if isinstance(sh_ten, MCoreShardedTensor):
+                            if sh_ten.data is not None and sh_ten.data.device.type == "meta":
+                                sh_ten.data = torch.empty(sh_ten.local_shape, dtype=sh_ten.dtype, device="cpu")
+                elif isinstance(val, MCoreShardedTensor):
+                    if val.data is not None and val.data.device.type == "meta":
+                        val.data = torch.empty(val.local_shape, dtype=val.dtype, device="cpu")
+        return _orig_mcore_to_pyt(state_dict, is_loading, **kwargs)
+
+    _torch_strat.mcore_to_pyt_state_dict = _meta_safe_mcore_to_pyt
+
+    # Patch 3: After loading, register INT4 buffers and clean up.
+    def _int4_load_model_state_dict(model_module, state_dict, strict=True):
+        # First register INT4 buffers from the loaded state dict
+        register_int4_buffers_after_load(model_module, state_dict)
+        # Remove INT4 triplet keys before standard load_state_dict (it won't know them)
+        int4_keys = [
+            k for k in state_dict if k.endswith(("_packed", "_scale", "_shape")) and ".experts.linear_fc" in k
+        ]
+        for k in int4_keys:
+            del state_dict[k]
+
+        load_return = model_module.load_state_dict(state_dict, strict=False, assign=True)
+        missing = [key for key in load_return.missing_keys if not _is_expected_int4_missing_key(key)]
+        unexpected = [key for key in load_return.unexpected_keys if not key.endswith("._extra_state")]
+
+        if missing or unexpected:
+            details = []
+            if missing:
+                details.append("missing=" + ", ".join(missing[:20]) + (" ..." if len(missing) > 20 else ""))
+            if unexpected:
+                details.append("unexpected=" + ", ".join(unexpected[:20]) + (" ..." if len(unexpected) > 20 else ""))
+            raise RuntimeError("Unexpected non-INT4 state_dict mismatch during Kimi INT4 load: " + " | ".join(details))
+
+        # Materialize any remaining meta tensors and move CPU-loaded tensors to the
+        # local CUDA device so TE linears do not retain CPU parameters.
+        if torch.cuda.is_available():
+            to_empty_if_meta_device(model_module, device=torch.device("cuda", torch.cuda.current_device()))
+            if args.profile_memory:
+                if args.skip_train:
+                    _log_model_storage_summary([model_module])
+                    torch.cuda.reset_peak_memory_stats(torch.cuda.current_device())
+                    _log_cuda_memory("after-load")
+
+    _ckpt_mod._load_model_state_dict = _int4_load_model_state_dict
+
+    callbacks = []
+    if args.profile_memory and not args.skip_train:
+        callbacks.append(MemoryProfileCallback(args.profile_memory_steps))
+
+    finetune(config=config, forward_step_func=forward_step, callbacks=callbacks or None)
+
+
+if __name__ == "__main__":
+    main()
