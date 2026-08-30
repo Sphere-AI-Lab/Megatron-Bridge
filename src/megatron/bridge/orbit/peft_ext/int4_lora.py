@@ -24,16 +24,19 @@ def _is_int4_packed_linear(module: nn.Module) -> bool:
 
 
 class Int4LoRALinear(LoRALinear):
-    """LoRALinear whose base forward dequantizes INT4-packed weights."""
+    """LoRALinear whose base forward dequantizes INT4-packed weights.
 
-    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    Only ``base_linear_forward`` is overridden; ``forward`` (the
+    adapter-enabled check, ``adapter_forward`` call, and residual add) is
+    inherited from ``LoRALinear`` unchanged, so upstream fixes to that method
+    apply here automatically.
+    """
+
+    def base_linear_forward(
+        self, x: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         # pylint: disable=C0115,C0116
-        linear_output, bias, layernorm_output = _base_linear_forward_int4(self, x)
-        if not self._adapter_enabled:
-            return linear_output, bias
-        adapter_output = self.adapter_forward(self.adapter, layernorm_output.contiguous(), *args, **kwargs)
-        adapter_output = adapter_output.reshape(linear_output.shape)
-        return linear_output + adapter_output, bias
+        return _base_linear_forward_int4(self, x)
 
 
 class Int4LoRA(OrbitPEFTMixin, LoRA):
