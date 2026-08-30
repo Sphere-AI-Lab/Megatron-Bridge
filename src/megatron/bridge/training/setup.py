@@ -213,11 +213,12 @@ def setup(
     # Model, optimizer, and learning rate.
     timers("model-and-optimizer-setup", log_level=0).start(barrier=True)
 
-    # Register PEFT pre-wrap hook if PEFT is configured
-    if cfg.peft is not None:
-        peft_hook = _create_peft_pre_wrap_hook(cfg, state)
-        _register_pre_wrap_hook(cfg.model, peft_hook)
-        print_rank_0("Registered PEFT pre-wrap hook")
+    # orbit-seam(hook-order): the PEFT pre-wrap hook used to be registered here.
+    # It now registers after the ModelOpt block below, so the ModelOpt hook runs
+    # first and quantizer submodules exist before PEFT loads a quantized
+    # pretrained checkpoint. Otherwise the sharded state dict is missing the
+    # per-layer quantizer keys the checkpoint provides and load validation
+    # raises KeyError. Pure reorder -- no orbit import.
 
     if getattr(cfg.model, "restore_modelopt_state", False):
         from megatron.bridge.training.post_training.checkpointing import load_modelopt_state
@@ -240,6 +241,12 @@ def setup(
             return model
 
         _register_pre_wrap_hook(cfg.model, modelopt_pre_wrap_hook)
+
+    # Register PEFT pre-wrap hook if PEFT is configured
+    if cfg.peft is not None:
+        peft_hook = _create_peft_pre_wrap_hook(cfg, state)
+        _register_pre_wrap_hook(cfg.model, peft_hook)
+        print_rank_0("Registered PEFT pre-wrap hook")
 
     # Enable CUDA allocator history tracing before any model tensors are allocated,
     # so snapshots dumped later in training contain a full timeline + stack context.
