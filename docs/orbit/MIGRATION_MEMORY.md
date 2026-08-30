@@ -525,3 +525,65 @@ stay trivially re-appliable. Orbit's own paths are `ruff check` and
 docstrings on the 17 operational scripts and on the vendored TE file (whose
 import list must stay diffable against TE v2.14).
 
+## 10. GPU-era review (`feature/orbit-on-radixark-7f0fb345`)
+
+Everything above was static, CPU-only analysis. This section records what
+changed once real hardware, mcore, and TE were available.
+
+- **Base moved from `bb61fcd0` to `7f0fb3456`.** User decision: downgrade the
+  radixark base 14 commits further back (drops the multi-LoRA redesign, the
+  GLM-5.2 multi-LoRA kernel fix, and the ROCm/grouped-MM alignment work — none
+  of it orbit-owned). `is_grouped_expert_linear` and `share_expert_adapters`
+  already existed at `7f0fb3456` unchanged, and the 3 seam files are
+  byte-identical between the two commits, so `git rebase --onto 7f0fb3456
+  bb61fcd0 <branch>` replayed all 24 orbit commits with zero conflicts. All
+  four Phase 2 extractability gates re-verified and still pass exactly.
+- **mcore submodule now actually pinned, not just used for offline checks.**
+  `.gitmodules` repointed from `NVIDIA/Megatron-LM` to `radixark/Megatron-LM`,
+  gitlink set to `235952df` (`miles-main` HEAD) — this is the commit §8 above
+  already called authoritative; it just wasn't the one recorded in git.
+- **Real verification, not just AST-checked:** in the actual shared venv,
+  `megatron.core`/`megatron.bridge`/`transformer_engine` import cleanly, all 9
+  `orbit` subpackages import, all 29 `tests/unit_tests/orbit/` tests pass,
+  `ruff check`/`ruff format --check` are clean. The §8 "requests missing so
+  seams 2/3 would no-op" risk does **not** apply here — this venv has
+  `requests` and imports `modelopt.torch.opt.plugins` fine.
+- **`Int4LoRALinear` fixed to override `base_linear_forward` instead of
+  duplicating `forward`.** `AdapterWrapper.base_linear_forward(self, x, *args,
+  **kwargs) -> (linear_output, bias, layernorm_output)` is upstream's
+  documented seam for exactly this (present since before the
+  megatron-hub→megatron-bridge rename, PR #251 — not a radixark/miles
+  addition), and `_base_linear_forward_int4` already returned that exact
+  3-tuple. The old code copy-pasted all of `LoRALinear.forward` instead of
+  overriding the one method meant for this, so a future upstream fix to
+  `forward` would have silently not applied to the INT4 path. Now
+  `Int4LoRALinear` only overrides `base_linear_forward` and inherits `forward`.
+- **`_DSV4_OFT_SUFFIXES` removed from `oft/param_names.py`.** Dead: nothing in
+  the current tree (mcore's MoE experts, `CanonicalOFT`, `OFT`) ever produces a
+  Megatron-side parameter name in the `w{1,2,3}_oft_r` shape it matched — MoE
+  experts are always `linear_fc1`/`linear_fc2`, and OFT's rotation parameter is
+  always nested under `.adapter[_slice].oft_r`, already covered by the
+  `".adapter."` / `".oft_r"` checks regardless of the wrapped module's name.
+  Leftover from the 3 dropped `ref_*.py` files, which implemented a bespoke,
+  non-`AdapterWrapper` OFT for DSV4-native models with a flattened name.
+  **Not evaluated as part of this**: `conversion/oft_export.py`'s much larger
+  DSV4 `w1`/`w2`/`w3` regex handling (HF-export-side name translation, a
+  different question) — see the gap noted just below.
+- **`orbit/conversion/oft_export.py` (976 lines: `OrbitOFTExportMixin`,
+  `oft_export_bridge_for`, `export_oft_adapter_weights`, `save_hf_oft_adapter`)
+  has zero callers.** No script under `scripts/orbit/` invokes it and no test
+  under `tests/unit_tests/orbit/` exercises it — confirmed pre-existing, not a
+  migration regression: `origin/feature/generic-int4-adapter` never had a
+  caller for it either. Effect: OFT-trained checkpoints currently have no
+  shipped path back to HF format, and the DSV4 branches inside it can't be
+  proven live or dead by call-graph analysis since the whole module has no
+  live entry point. User decision: document only, do not wire up a script or
+  add tests as part of this review.
+- **Deliberately left alone per user decision, not fixed:** the mcore
+  monkeypatch (blocker #4) — no subclassing alternative exists (it patches a
+  free function mcore calls internally during meta-device init, not a class
+  method orbit controls; the only real fix would touch `3rdparty/Megatron-LM`,
+  which is off-limits) — and the expert `replica_id` formula
+  (`oft_layers.py:655`) — pre-existing with the original authors' own TODO,
+  needs real EP>1 hardware to fix correctly, which this box does not have.
+
