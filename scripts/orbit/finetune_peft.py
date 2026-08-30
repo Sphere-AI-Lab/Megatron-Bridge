@@ -168,7 +168,13 @@ def build_config(args):
     cfg.model.expert_model_parallel_size = args.ep
     cfg.model.context_parallel_size = args.cp
     if args.cp > 1:
-        cfg.dataset.packed_sequence_specs.pad_seq_to_mult = args.cp * 2
+        packed_specs = getattr(cfg.dataset, "packed_sequence_specs", None)
+        if packed_specs is None:
+            raise ValueError(
+                f"--cp {args.cp} needs a dataset with packed_sequence_specs, but "
+                f"{type(cfg.dataset).__name__} has none."
+            )
+        packed_specs.pad_seq_to_mult = args.cp * 2
 
     preset = QUANT_PRESETS[args.quant]
     for key, value in preset["model"].items():
@@ -181,7 +187,12 @@ def build_config(args):
     if args.seq_length is not None:
         cfg.model.seq_length = args.seq_length
         cfg.dataset.seq_length = args.seq_length
-        cfg.dataset.packed_sequence_specs.packed_sequence_size = args.seq_length
+        # Only packed-sequence dataset configs carry packed_sequence_specs;
+        # a plain GPTSFTDatasetConfig does not, and setting it unconditionally
+        # raised AttributeError before training could start.
+        packed_specs = getattr(cfg.dataset, "packed_sequence_specs", None)
+        if packed_specs is not None:
+            packed_specs.packed_sequence_size = args.seq_length
     if args.train_iters is not None:
         cfg.train.train_iters = args.train_iters
     if args.global_batch_size is not None:

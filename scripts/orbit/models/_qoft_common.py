@@ -22,6 +22,7 @@ helpers. ``scripts/orbit/finetune_qoft.py`` is the only intended consumer.
 """
 
 import logging
+import os
 import re
 from collections import defaultdict
 from typing import Any, Iterable
@@ -648,6 +649,8 @@ class NanTraceCallback(Callback):
         self._forward_hit = False
         self._backward_hit = False
         self._hook_handles = []
+        self._max_activation = 0.0
+        self._max_activation_where = "n/a"
 
     def _should_trace(self, step: int) -> bool:
         return step < self.trace_steps
@@ -673,7 +676,24 @@ class NanTraceCallback(Callback):
 
     def _make_forward_hook(self, name: str):
         def _hook(module, inputs, output):
-            if self._current_step is None or self._forward_hit or not self._should_trace(self._current_step):
+            if self._current_step is None or not self._should_trace(self._current_step):
+                return
+
+            # A non-finite check cannot see finite-but-enormous activations,
+            # which produce exploding gradients just as effectively. Track the
+            # largest magnitude any traced module emits.
+            for tensor_name, tensor in _iter_tensor_paths(output, "output"):
+                if not tensor.is_floating_point() or tensor.numel() == 0:
+                    continue
+                finite = tensor.detach()[torch.isfinite(tensor.detach())]
+                if finite.numel() == 0:
+                    continue
+                magnitude = float(finite.abs().max().item())
+                if magnitude > self._max_activation:
+                    self._max_activation = magnitude
+                    self._max_activation_where = f"{name} {tensor_name} shape={tuple(tensor.shape)}"
+
+            if self._forward_hit:
                 return
 
             issue = _describe_nonfinite_tensors(inputs, "input")
@@ -733,6 +753,8 @@ class NanTraceCallback(Callback):
         self._current_step = step
         self._forward_hit = False
         self._backward_hit = False
+        self._max_activation = 0.0
+        self._max_activation_where = "n/a"
 
         if not self._should_trace(step):
             return
@@ -771,6 +793,11 @@ class NanTraceCallback(Callback):
         print_rank_0(
             f"[nan-debug] step {step} end loss={loss_text} grad_norm={grad_norm_text} "
             f"skipped={context.skipped_iter} lr={lr_text}"
+        )
+        rank_id = dist.get_rank() if dist.is_initialized() else 0
+        print(
+            f"[nan-debug][rank{rank_id}] largest finite activation this step: "
+            f"{self._max_activation:.6g} at {self._max_activation_where}"
         )
 
         # Attribute the global grad norm: top trainable parameters by local
@@ -878,6 +905,54 @@ def _materialize_meta_sharded_tensors_to_cpu(state_dict, sharded_tensor_cls) -> 
                 value.data = torch.empty(value.local_shape, dtype=value.dtype, device="cpu")
 
 
+def _has_full_storage(tensor: torch.Tensor) -> bool:
+    """Whether a tensor's storage actually backs all of its elements.
+
+    Quantized-base placeholders are deliberately storage-emptied while their
+    shape metadata is kept, so ``numel()`` overstates what is really allocated.
+    Writing to such a tensor is an illegal memory access.
+    """
+    if tensor.numel() == 0:
+        return False
+    try:
+        storage_elements = tensor.untyped_storage().nbytes() // tensor.element_size()
+    except (RuntimeError, NotImplementedError):
+        return False
+    return storage_elements >= tensor.numel()
+
+
+def report_meta_tensors_before_materialization(module, meta_param_names) -> int:
+    """Name every tensor still on the meta device before ``to_empty`` runs.
+
+    ``to_empty_if_meta_device`` materializes meta tensors as *uninitialized*
+    memory. Only ``oft_r`` is re-zeroed afterwards (see
+    :func:`reinitialize_meta_materialized_oft_parameters`), so any other tensor
+    left on meta silently becomes garbage: rank-varying, finite-but-enormous
+    values that pass a forward pass and then detonate in the backward. Anything
+    reported here that is not an adapter parameter is a checkpoint-coverage
+    defect, not a numerical one.
+
+    Returns the number of non-adapter tensors that were still on meta.
+    """
+    non_adapter = sorted(name for name in meta_param_names if not name.endswith("oft_r"))
+    meta_buffers = sorted(name for name, buf in module.named_buffers() if buf.device.type == "meta")
+
+    if meta_param_names or meta_buffers:
+        print_rank_0(
+            f"[qoft] meta tensors before materialization: {len(meta_param_names)} parameters "
+            f"({len(non_adapter)} non-adapter), {len(meta_buffers)} buffers"
+        )
+    for name in non_adapter[:12]:
+        print_rank_0(f"[qoft]   UNINITIALIZED after to_empty (parameter): {name}")
+    if len(non_adapter) > 12:
+        print_rank_0(f"[qoft]   ... and {len(non_adapter) - 12} more non-adapter parameters")
+    for name in meta_buffers[:12]:
+        print_rank_0(f"[qoft]   UNINITIALIZED after to_empty (buffer): {name}")
+    if len(meta_buffers) > 12:
+        print_rank_0(f"[qoft]   ... and {len(meta_buffers) - 12} more buffers")
+    return len(non_adapter)
+
+
 def reinitialize_meta_materialized_oft_parameters(module, meta_param_names) -> int:
     """Restore OFT rotation parameters that meta materialization left uninitialized.
 
@@ -891,13 +966,34 @@ def reinitialize_meta_materialized_oft_parameters(module, meta_param_names) -> i
     are never clobbered.
     """
     reset = 0
+    placeholders = 0
+    emptied = 0
     with torch.no_grad():
         for name, param in module.named_parameters():
-            if name in meta_param_names and name.split(".")[-1] == "oft_r":
+            if name not in meta_param_names:
+                continue
+            if name.split(".")[-1] == "oft_r":
                 param.zero_()
                 reset += 1
-    if reset:
-        print_rank_0(f"[qoft] re-zeroed {reset} meta-materialized OFT rotation parameters")
+            elif _has_full_storage(param):
+                # Quantized-base placeholders (the per-expert bf16 ``weight{N}``
+                # Parameters whose real data lives in the packed buffers) are
+                # materialized as uninitialized memory when they carry real
+                # storage. The runtime reads the packed buffers, not these, but
+                # leaving garbage in live Parameters makes runs rank-dependent.
+                # Placeholders that were storage-emptied before materialization
+                # keep a zero-byte storage: writing to those is an illegal
+                # access, so they are counted and left alone.
+                param.zero_()
+                placeholders += 1
+            else:
+                emptied += 1
+    if reset or placeholders or emptied:
+        print_rank_0(
+            f"[qoft] meta-materialized tensors: zeroed {reset} OFT rotation parameters and "
+            f"{placeholders} quantized-base placeholders; {emptied} placeholders keep zero-byte "
+            "storage (no data, nothing to zero)"
+        )
     return reset
 
 
@@ -1025,6 +1121,7 @@ def install_int4_checkpoint_load_patches(
 
         if torch.cuda.is_available():
             meta_param_names = {name for name, param in model_module.named_parameters() if param.device.type == "meta"}
+            report_meta_tensors_before_materialization(model_module, meta_param_names)
             to_empty_if_meta_device(model_module, device=torch.device("cuda", torch.cuda.current_device()))
             reinitialize_meta_materialized_oft_parameters(model_module, meta_param_names)
             if after_load_hook is not None:
@@ -1141,6 +1238,8 @@ _EXPECTED_NVFP4_MISSING_KEY_RE = re.compile(
 # Explicit per-layer checkpoint keys (decoder.layers.N....) as opposed to the
 # homogeneous-layer encoding that folds the layer index into sharded offsets.
 _EXPLICIT_LAYER_KEY_RE = re.compile(r"\.layers\.\d+\.")
+# Packed per-expert weight buffers installed by register_nvfp4_buffers_after_load.
+_PACKED_EXPERT_BUFFER_RE = re.compile(r"^weight\d+(?:_w|_v)?_packed$")
 
 
 def _is_expected_nvfp4_missing_key(key: str, handled_dense_weight_keys: frozenset[str]) -> bool:
@@ -1336,6 +1435,19 @@ def install_nvfp4_checkpoint_load_patches(
         register_nvfp4_buffers_after_load_dense(model_module, state_dict)
         register_nvfp4_buffers_after_load(model_module, state_dict)
 
+        if os.environ.get("QOFT_DEBUG_ZERO_EXPERT_BUFFERS", "0").lower() in ("1", "true", "yes"):
+            # Diagnostic: destroy every packed expert weight. If the training
+            # loss is unchanged, the grouped-expert path is not contributing to
+            # the forward at all and any loss agreement across runs is vacuous.
+            zeroed = 0
+            with torch.no_grad():
+                for module in model_module.modules():
+                    for buffer_name, buffer in module.named_buffers(recurse=False):
+                        if _PACKED_EXPERT_BUFFER_RE.match(buffer_name) is not None:
+                            buffer.zero_()
+                            zeroed += 1
+            print_rank_0(f"[qoft-debug] zeroed {zeroed} packed expert weight buffers")
+
         string_keys = [key for key in state_dict if isinstance(key, str)]
         quantized_dense_modules = {
             key[: -len(".weight_quantizer._scale")] for key in string_keys if key.endswith(".weight_quantizer._scale")
@@ -1369,6 +1481,7 @@ def install_nvfp4_checkpoint_load_patches(
 
         if torch.cuda.is_available():
             meta_param_names = {name for name, param in model_module.named_parameters() if param.device.type == "meta"}
+            report_meta_tensors_before_materialization(model_module, meta_param_names)
             to_empty_if_meta_device(model_module, device=torch.device("cuda", torch.cuda.current_device()))
             reinitialize_meta_materialized_oft_parameters(model_module, meta_param_names)
             if after_load_hook is not None:
