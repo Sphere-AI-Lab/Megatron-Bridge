@@ -6,21 +6,23 @@ status: draft
 date: 2026-08-30
 tags: orbit, qoft, peft, int4, fp8, nvfp4, consolidation, slurm
 branch: feature/relocate-conversion-scripts (= feature/generic-int4-adapter)
-tip: e5a1dbeb
+tip: 1aa4b3eb
 repo: Sphere-AI-Lab/Megatron-Bridge
 cluster: slurm (slinky, H200/B200)
-reporting_period: 2026-08-29 to 2026-08-30 (waves 1-3)
+reporting_period: 2026-08-29 to 2026-08-30 (waves 1-4)
 ---
 
 <section class="report-summary" aria-label="Outcome">
   <p class="summary-label">Outcome</p>
   <p class="summary-title">The consolidated QOFT entrypoint now loads the NVFP4 Qwen3 checkpoint end-to-end and produces the campaign's first loss (4.79); two independent defects remain, and a 24-run ablation has closed six candidate causes for them — including both hypotheses this report previously advanced.</p>
-  <p class="summary-detail">Wave 1 consolidated five per-model entrypoints into one. Wave 2 unified the NVFP4 checkpoint contract into a single source of truth shared by the trainer and the RL loader, fixing the load end-to-end. Wave 3 established by measurement what the remaining failure is not: not cross-rank dispatch (EP=1 fails earlier), not the dequantized weights (verified against the BF16 release at 9.4% error, 0.9955 correlation), not adapter initialization, not oversized activations (max 708, identical on every rank), not uninitialized gradient buffers (zero before the backward), and not the meta-device placeholders (they carry zero-byte storage — a correction to this report's own earlier claim). What remains is a row-aligned NaN entering the expert backward at step 1 but not step 0, which persists even in the configuration whose gradients are healthy, plus a separate ~2000x gradient excess confined to the dense-quantized attention adapters.</p>
+  <p class="summary-detail">Wave 1 consolidated five per-model entrypoints into one. Wave 2 unified the NVFP4 checkpoint contract into a single source of truth shared by the trainer and the RL loader, fixing the load end-to-end. Wave 3 established by measurement what the remaining failure is not: not cross-rank dispatch (EP=1 fails earlier), not the dequantized weights (verified against the BF16 release at 9.4% error, 0.9955 correlation), not adapter initialization, not oversized activations (max 708, identical on every rank), not uninitialized gradient buffers (zero before the backward), and not the meta-device placeholders (they carry zero-byte storage — a correction to this report's own earlier claim). What remains is a row-aligned NaN entering the expert backward at step 1 but not step 0, which persists even in the configuration whose gradients are healthy, plus a separate ~2000x gradient excess confined to the dense-quantized attention adapters. Wave 4 gave the checkpoint key format a single definition shared by converter and trainer for both NVFP4 and FP8, verified behaviour-neutral, and stood up a Blackwell (B200) environment since every run so far was on H200, which has no FP4 tensor cores.</p>
 </section>
 
 ## Status
 
 <p><span data-status="done">done: consolidation written and pushed</span> ·
+<span data-status="done">done: checkpoint key format defined once (NVFP4 + FP8)</span> ·
+<span data-status="done">done: B200 environment built, sm_100 verified on card</span> ·
 <span data-status="done">done: NVFP4 load contract unified + verified</span> ·
 <span data-status="done">done: first loss produced (4.79, tp1/ep4)</span> ·
 <span data-status="done">done: 6 candidate causes eliminated by measurement</span> ·
@@ -59,10 +61,12 @@ the model requested per-expert keys (`mlp.experts.experts.96.linear_fc1.weight_w
 converter stored fused-indexed families (`mlp.experts.linear_fc1.weight96_w/_v` +
 `weight_quantizer._scale96`). Diagnosis:
 
-1. **The converter's names are canonical.** `convert_nvfp4_checkpoint_direct.py` builds a plain
-   Megatron meta model (single rank), applies ModelOpt NVFP4 to that skeleton, and uses its
-   sharded state dict as the on-disk schema — matching, name for name, the contract documented in
-   `orbit/quant/nvfp4_utils.py`.
+1. **The converter's names are canonical.** `convert_nvfp4_checkpoint_direct.py` emits keys that
+   match, name for name, the contract documented in `orbit/quant/nvfp4_utils.py`. (Wave 4 corrects
+   how: the ModelOpt-reshaped model's sharded state dict is only an intermediate template for
+   `prepare_empty_model_state` and matches the checkpoint on almost nothing; the on-disk names come
+   from `build_megatron_nvfp4_weight_entries` / `build_fused_nvfp4_weight_entries`, which live in
+   the same contract module the reader uses.)
 2. **The trainer's shape was an accident.** The fork's `orbit-seam(modelopt)` in
    `bridge/training/checkpointing.py` restores a checkpoint's `modelopt_state/` directory
    **unconditionally** (no config gate) before building the load schema. The restored per-expert
@@ -89,7 +93,7 @@ converter stored fused-indexed families (`mlp.experts.linear_fc1.weight96_w/_v` 
 </aside>
 
 Implementation (commits `52b54eb6` wiring, `70bf69ed` library fix, `6d61cc04` diagnostics, all
-pushed to `origin/feature/relocate-conversion-scripts`; wave 3 adds `e5a1dbeb`. The next section
+pushed to `origin/feature/relocate-conversion-scripts`; wave 3 adds `e5a1dbeb`, wave 4 adds `155c15a2`, `92b37e9a`, `ce4cd3d6` and `1aa4b3eb`. The next section
 summarizes their content so this report is reviewable without repository access):
 
 - `install_nvfp4_checkpoint_load_patches()` in `_qoft_common.py`, shaped identically to the INT4
@@ -381,6 +385,77 @@ sound in BF16.
   anomalous, the version-dependence says to look for an uninitialized read in the dense adapter's
   backward, not in the forward or the weights.</p>
 </aside>
+
+## Wave 4 (2026-08-30): the key format gets one definition, and the hardware question
+
+### Blackwell versus Hopper
+
+Every run in waves 1–3 was on **H200 — compute capability 9.0, no FP4 tensor cores at all**. That
+does not invalidate the results, because this path never asks the hardware for FP4 math: dense
+weights are dequantized to bf16 at load and grouped experts are dequantized per expert before a
+plain `F.linear`. Wave 2 also removed the `bf16_with_nvfp4_mixed` preset, which *would* have
+requested TE FP4 GEMMs and was never viable on Hopper.
+
+It does mean the format has never been validated on hardware that supports it natively. Condor has
+B200 (capability 10.0), and an environment now exists there:
+`/fast/zqiu/miles-tmp/envs/mbridge_b200`, Python 3.12 with **torch 2.11.0+cu130** verified on the
+card — `sm_100` present in the compiled arch list, capability `(10, 0)`, and a real 4096² bf16
+matmul returning finite values. modelopt 0.44.0, transformers 5.12.1 and energon 7.4.1 match the
+slurm stack; Transformer Engine 2.17.0 still needs its build to finish (`nccl.h` was the missing
+header — the existing orbit scripts `module load nccl` for exactly this).
+
+<aside class="risk">
+  <p class="block-label">Four cluster constraints worth knowing before repeating this</p>
+  <p><strong>Inodes, not space.</strong> <code>/fast</code> ran out of file-count quota
+  (10,597,879 of 10,605,330) while 5 TB of space sat free; no Python environment can be created
+  under that condition, and every conda failure was that wall in disguise, ending in
+  <code>Errno 122</code>.<br>
+  <strong>Lustre has no flock.</strong> uv cannot hold its cache locks on <code>/fast</code>
+  (<code>os error 38</code>); the cache must live in home. This only surfaces on the first package
+  needing an sdist build, so a wheels-only install looks fine and then fails later.<br>
+  <strong>Login nodes cap thread creation.</strong> <code>mksquashfs</code> cannot run there, which
+  kills container builds; heavy work belongs in an allocation.<br>
+  <strong>B200 is contended.</strong> Two interactive allocations were evicted (SIGTERM) after
+  15–27 minutes. Long work should be a batch job that tolerates eviction, not an interactive
+  session.</p>
+</aside>
+
+### The checkpoint key format now has one definition
+
+Wave 2 made the trainer read the converter's format. It did not stop the two sides from *describing*
+that format independently, and a measurement showed the description of the gap in this report's own
+wave-2 section was wrong: the converter never derived its on-disk names from the ModelOpt-reshaped
+model. That template is only an intermediate passed to `prepare_empty_model_state`; it matches the
+real checkpoint on almost nothing (12,288 missing, 55,776 extra). The actual names always came from
+`build_megatron_nvfp4_weight_entries` / `build_fused_nvfp4_weight_entries` — functions in the *same*
+contract module the reader uses.
+
+The real drift surface was smaller and more mundane: **each side spelled the key format out by
+hand.**
+
+```text
+writer  low_precision/nvfp4.py   f"{prefix}.weight_quantizer._scale{expert_idx}"
+reader  quant/nvfp4_utils.py     f"{prefix}.weight_quantizer._scale{expert_global_idx}"
+```
+
+`nvfp4_quantizer_entry_names()` and `nvfp4_weight_entry_names()` now state the format once and both
+sides call them (`155c15a2`). FP8 had the same problem worse — thirteen hand-written sites plus two
+regexes encoding the convention backwards, all inside one file — so `FP8_SCALE_INV_SUFFIX`,
+`FP8_SWIGLU_HALF_SUFFIXES` and `fp8_entry_names()` do the same there, with the regexes built from
+the same constants (`1aa4b3eb`). FP8 needed no writer-side unification: the HF FP8 checkpoint ships
+`weight_scale_inv` beside each weight, so the converter passes those through rather than
+synthesizing names.
+
+Both refactors are **behaviour-neutral by measurement, not by inspection**. A harness builds the
+reader's template and diffs it against the real 56,115-entry `qwen3-nvfp4-mcore` index; the numbers
+are identical before and after (contract vs checkpoint 5 missing / 432 extra). The FP8 change is
+verified by the unit tests added in `92b37e9a` — 5 passed, unchanged. **No checkpoint needs
+regenerating.**
+
+The residual difference reconciles exactly: the 5 "missing" are homogeneous-layer keys the harness requests
+because it omits the `non_homogeneous_layers` metadata the installer detects, and they correspond to
+240 of the extras (5 families × 48 layers); the remaining 192 extras are `input_quantizer._amax`
+activation scales the file carries and this runtime never reads, because it computes in bf16.
 
 ### Also captured this wave
 
