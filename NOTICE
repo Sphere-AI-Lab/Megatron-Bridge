@@ -1,0 +1,17 @@
+Megatron-Bridge -- Sphere AI Lab fork
+Copyright 2026 Sphere AI Lab
+
+This product is a fork of NVIDIA Megatron-Bridge
+(https://github.com/NVIDIA-NeMo/Megatron-Bridge),
+Copyright (c) NVIDIA CORPORATION & AFFILIATES, licensed under the
+Apache License, Version 2.0.
+
+It is built on the RadixArk fork (https://github.com/radixark/Megatron-Bridge)
+@ bb61fcd0, which itself branches from NVIDIA-NeMo/Megatron-Bridge @ 3b792c46.
+Both are likewise licensed under the Apache License, Version 2.0.
+
+Sphere AI Lab modifications relative to that base ("orbit") live under
+src/megatron/bridge/orbit/, scripts/orbit/, tests/unit_tests/orbit/ and
+docs/orbit/, plus four marked seam hunks in three upstream files as recorded in
+docs/orbit/UPSTREAM_SEAMS.md. They are likewise licensed under the Apache
+License, Version 2.0.
