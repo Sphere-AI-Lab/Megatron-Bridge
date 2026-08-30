@@ -454,9 +454,18 @@ def build_config(args, spec: dict):
     peft = build_peft(args)
 
     if spec["key"] == "qwen3_moe":
+        from megatron.bridge import AutoBridge
         from megatron.bridge.recipes.qwen import qwen3_30b_a3b_peft_config
 
         config = qwen3_30b_a3b_peft_config(peft_scheme=peft)
+        # Keep the recipe's training/dataset/logger/PEFT defaults but build the
+        # model provider from the HF config so the runtime architecture matches
+        # the checkpoint conversion path exactly, the same as kimi_k25/moonlight
+        # below. The recipe otherwise hardcodes Qwen/Qwen3-30B-A3B, ignoring
+        # --hf-model-path / --pretrained-checkpoint entirely.
+        config.model = AutoBridge.from_hf_pretrained(args.hf_model_path, trust_remote_code=True).to_megatron_provider(
+            load_weights=False
+        )
     elif spec["key"] == "kimi_k25":
         from megatron.bridge import AutoBridge
         from megatron.bridge.recipes.common import _peft_common
