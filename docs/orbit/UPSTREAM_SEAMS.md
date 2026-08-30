@@ -18,7 +18,9 @@ Design rules for a seam:
 1. It must be small enough to re-apply by hand after an upstream re-fetch.
 2. It must import orbit **lazily, inside the function** — never at module top
    level, so import order stays unaffected.
-3. It must be **guarded**, so radixark still runs with orbit deleted.
+3. It must **not** be wrapped in `try/except ImportError`. Extraction reverts the
+   whole hunk, so a seam never runs with orbit deleted; a guard would only mask
+   real failures. Import orbit directly and let errors surface.
 4. It must carry an `orbit-seam(<tag>)` comment naming the tag below.
 
 ---
@@ -89,9 +91,8 @@ the default stays on `save_sharded_modelopt_state`.
 dozen lines above, for mcore dev-branch compat), so do not assume the attribute
 exists.
 
-**If orbit is removed:** already safe — the orbit branch is only reachable when
-an explicit non-`nvrx` strategy is configured, but still wrap the import in
-`try/except ImportError` and fall through to `save_sharded_modelopt_state`.
+**If orbit is removed:** revert this hunk, which restores the single
+`save_sharded_modelopt_state` call. Do not guard the import.
 
 ---
 
@@ -124,9 +125,8 @@ None:` guard between those two statements; radixark does that normalisation
 earlier and has no guard here. Insert on the `dp_cp_group` anchor, not on the
 `None` guard.
 
-**If orbit is removed:** this is on the **main checkpoint-resume path** and in
-spherelab the import is unconditional — every resume would `ImportError`. Wrap
-it in `try/except ImportError: pass`.
+**If orbit is removed:** this is on the **main checkpoint-resume path** and the
+import is unconditional, so revert this hunk — do not guard it.
 
 ---
 
@@ -154,8 +154,8 @@ and `_get_modelopt_checkpoint_path(checkpoint_path)` take no `ckpt_step`
 argument. Orbit already calls the latter with a single positional arg, so no
 change is needed — just do not introduce `ckpt_step`.
 
-**If orbit is removed:** unconditional in spherelab; wrap in
-`try/except ImportError: pass`.
+**If orbit is removed:** the import is unconditional, so revert this hunk — do
+not guard it.
 
 ---
 

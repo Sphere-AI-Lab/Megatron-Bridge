@@ -1085,16 +1085,12 @@ def save_checkpoint(
                     # path stays on the module-level save_sharded_modelopt_state
                     # symbol so existing tests can patch it.
                     _orbit_async_strategy = getattr(ckpt_cfg, "async_strategy", None)
-                    _orbit_save = None
                     if _orbit_async_strategy is not None and _orbit_async_strategy != "nvrx":
-                        try:
-                            from megatron.bridge.orbit.training.modelopt_checkpoint import (
-                                _save_sharded_modelopt_state_with_async_strategy as _orbit_save,
-                            )
-                        except ImportError:
-                            _orbit_save = None
-                    if _orbit_save is not None:
-                        _orbit_save(
+                        from megatron.bridge.orbit.training.modelopt_checkpoint import (
+                            _save_sharded_modelopt_state_with_async_strategy,
+                        )
+
+                        _save_sharded_modelopt_state_with_async_strategy(
                             model,
                             checkpoint_name,
                             (ckpt_cfg.ckpt_format, 1),
@@ -2200,16 +2196,11 @@ def _load_checkpoint_from_path(
 
         # orbit-seam(modelopt): restore ModelOpt state before the sharded-load
         # schema is built, so quantizer keys exist for direct-load checkpoints.
-        # Guarded: this is the main resume path and must stay runnable with orbit
-        # deleted.
-        try:
-            from megatron.bridge.orbit.training.modelopt_checkpoint import (
-                _maybe_restore_modelopt_state_for_sharded_load,
-            )
+        from megatron.bridge.orbit.training.modelopt_checkpoint import (
+            _maybe_restore_modelopt_state_for_sharded_load,
+        )
 
-            _maybe_restore_modelopt_state_for_sharded_load(model, checkpoint_name, state_dict)
-        except ImportError:
-            pass
+        _maybe_restore_modelopt_state_for_sharded_load(model, checkpoint_name, state_dict)
 
         sharded_sd_metadata["dp_cp_group"] = pg_collection.dp_cp
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
