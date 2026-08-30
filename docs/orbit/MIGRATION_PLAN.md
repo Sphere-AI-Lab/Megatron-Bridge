@@ -6,9 +6,18 @@ Repo: `/home/kerryliu/Megatron-Bridge-Spherelab`
 Read `MIGRATION_MEMORY.md` first — it holds the verified facts this plan rests
 on. This file is only the execution order.
 
-Guiding rule: **radixark is upstream.** When orbit and radixark disagree, orbit
-changes. Never edit a radixark file to suit orbit unless it is one of the four
-declared seam hunks (3 files).
+Two guiding rules:
+
+1. **Orbit lives in its own namespace.** Never edit a radixark file to suit
+   orbit unless it is one of the four declared seam hunks (3 files). Because
+   orbit code is namespaced, textual conflicts with radixark are rare by
+   construction — this is not a conflict-resolution rule, it is a containment
+   rule.
+2. **Prefer radixark's implementation.** Where radixark already provides a
+   capability, orbit imports it rather than carrying its own copy. Do not
+   vendor, fork, or reimplement something radixark already has. When orbit and
+   radixark genuinely differ on a shared extension point (e.g. an attribute
+   orbit expects on `AdapterWrapper`), orbit adapts to radixark's shape.
 
 ## Phase 0 — verification gap — DONE
 
@@ -28,6 +37,32 @@ Both came back clean — full results in `MIGRATION_MEMORY.md` §8:
   `_LayerNormLinear` (41-field `non_tensor_args` tuple matches at both the
   pack and unpack sites). **C5 needs no adaptation.**
 
+## Progress
+
+Landed on `feature/orbit-on-radixark` (newest last):
+
+| Commit | What |
+|---|---|
+| `d40a1c4e` | docs: plan, memory, seam manifest |
+| `505641ca` | docs: Phase 0 verification results |
+| `e170c021` | **C1** — orbit namespace root + NOTICE |
+| `8e904156` | **C2** — orbit/quant + orbit/low_precision |
+
+Next: **C3**. Remaining: C3–C10, then Phase 2.
+
+One deviation from the table below: subpackage `__init__.py` files ship with
+their own content commit rather than all landing in C1, because several of them
+eagerly import their submodules and would otherwise leave C1 un-importable.
+
+**Blocker #2 is retracted.** radixark already defines `dequantize_int4` and
+`quantize_to_int4` in `models/kimi_vl/utils.py`, functionally identical to the
+upstream versions (only comments differ, plus a lint-only `del` of two unused
+params). Upstream later moved these into `models/conversion/quantization_utils.py`
+and left `kimi_vl/utils.py` as a re-export shim, so
+`megatron.bridge.models.kimi_vl.utils` is a **stable import path on both
+bases**. Orbit imports from there. Nothing is vendored — an earlier attempt to
+vendor a copy was reverted under guiding rule 2.
+
 ## Phase 1 — the commit series
 
 Ten commits, dependency-ordered so each one is reviewable in isolation. Commit
@@ -38,15 +73,15 @@ waived for this work.
 | # | Title | Contents |
 |---|---|---|
 | C1 | `[misc] chore: add orbit namespace, NOTICE, and migration docs` | `orbit/__init__.py` + the 9 subpackage `__init__.py`; `NOTICE`; `docs/orbit/{MIGRATION_MEMORY,MIGRATION_PLAN,UPSTREAM_SEAMS}.md` |
-| C2 | `[quant] feat: add orbit low-precision core and quant utilities` | `orbit/quant/**`, `orbit/low_precision/**`. Includes the **vendored** `dequantize_int4` / `quantize_to_int4` (blocker #2) |
+| C2 | `[quant] feat: add orbit low-precision core and quant utilities` | `orbit/quant/**`, `orbit/low_precision/**`. Nothing vendored — blocker #2 retracted, see Progress |
 | C3 | `[peft] feat: add orbit PEFT extensions for quantized bases` | `orbit/peft_ext/**`, with the `_base_returns_tuple` branches removed (blocker #1) |
 | C4 | `[peft] feat: add orbit OFT method, layers, and Triton kernels` | `orbit/oft/**` except `te_oft/`; **omit** the 3 dead `ref_*.py` |
 | C5 | `[peft] feat: add orbit TE LayerNormLinear OFT path` | `orbit/oft/te_oft/`; already matches TE v2.14 per Phase 0, so a straight copy — only change is replacing the `exit(1)` ImportError handler with a raise |
-| C6 | `[ckpt] feat: add orbit conversion mixins and quantized model bridges` | `orbit/conversion/**` (**omit** `nccl_byte_view.py`), `orbit/model_bridges/**` |
+| C6 | `[ckpt] feat: add orbit conversion mixins and quantized model bridges` | `orbit/conversion/**` (**omit** `nccl_byte_view.py`), `orbit/model_bridges/**`. Repoint 2 int4-helper imports at `megatron.bridge.models.kimi_vl.utils`: `conversion/compressed_tensors_int4.py:152` (+ docstring ref :36) and `model_bridges/deepseek_v3_int4_bridge.py:41` |
 | C7 | `[training] feat: add orbit ModelOpt checkpoint helpers and PEFT reports` | `orbit/training/**` |
 | C8 | `[training, ckpt] feat: add four optional orbit seams` | The only radixark files touched — 4 hunks across 3 files. See `UPSTREAM_SEAMS.md` |
 | C9 | `[recipe] feat: add orbit finetune entrypoints and conversion scripts` | `scripts/orbit/**`, with the `default_peft_config` import fixed (blocker #3) |
-| C10 | `[test] test: add orbit unit tests` | `tests/unit_tests/orbit/**` |
+| C10 | `[test] test: add orbit unit tests` | `tests/unit_tests/orbit/**`. Repoint 3 int4-helper imports at `megatron.bridge.models.kimi_vl.utils`: `test_compressed_tensors_int4.py:6`, `test_int4_requantize.py:6`, `test_quant_adapters.py:108` |
 
 Dropped deliberately (user decision): 3 dead `ref_*.py` (~4,474 lines),
 `orbit/conversion/nccl_byte_view.py`, and the 4 `docs/reports/` status reports.
@@ -61,8 +96,26 @@ git checkout feature/generic-int4-adapter -- <paths for this commit>
 ```
 
 then apply the blocker fixes, stage, and commit. `git diff --stat
-radixark/bridge..HEAD` at the end must show only orbit paths plus the three
-seam files.
+radixark/bridge..HEAD` at the end must show only orbit paths plus the 3 seam
+files (4 hunks).
+
+**Dedup check — do this for every commit, before committing.** Guiding rule 2
+means a commit is not just a copy. For each file being added, check whether
+radixark already provides the same capability, and if so import it instead:
+
+```
+# does radixark define these symbols already?
+git grep -n "def <symbol>" radixark/bridge -- src
+# for a same-named file, compare the two sides:
+git show radixark/bridge:<path>  vs  git show feature/generic-int4-adapter:<path>
+```
+
+Blocker #2 is the precedent and shows why this is not optional: orbit appeared
+to need an upstream module radixark lacks, and the first instinct was to vendor
+it. In fact radixark already had both functions under a different path, and
+spherelab's own tree had quietly turned that path into a re-export shim. A
+vendored duplicate would have been dead weight that drifts on every future
+re-fetch. Prefer the import path that resolves on *both* bases.
 
 ## Phase 2 — extractability gates
 

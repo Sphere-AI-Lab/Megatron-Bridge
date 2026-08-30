@@ -12,8 +12,21 @@ Port the Sphere AI Lab "orbit" work (quantized-base PEFT + OFT: INT4 / FP8 /
 NVFP4) onto the radixark fork of Megatron-Bridge.
 
 Overriding constraint from the user: **orbit must stay extractable.** The
-future workflow is "fetch upstream radixark, then re-apply our changes." So
-orbit adapts to radixark; radixark does not get bent to fit orbit.
+future workflow is "fetch upstream radixark, then re-apply our changes."
+
+Two consequences, and it matters that they are distinct:
+
+- **Containment.** Orbit code lives only in its own namespaces, so it rarely
+  conflicts with radixark textually at all. The four seam hunks are the only
+  upstream edits.
+- **Deduplication.** Where radixark already provides a capability, orbit uses
+  radixark's version instead of carrying its own. Do not vendor, fork, or
+  reimplement something radixark already has — a duplicate is what actually
+  breaks extractability later. Where orbit and radixark differ on a *shared*
+  extension point, orbit adapts to radixark's shape rather than the reverse.
+
+So this is mostly not a conflict-resolution exercise; it is a containment plus
+dedup exercise. Blocker #2 below is a worked example of the dedup rule.
 
 ## 2. Local repos and remotes
 
@@ -104,11 +117,24 @@ Each of these was confirmed by reading both trees.
    wraps Megatron parallel linears, which always return `(out, bias)`. Do not
    add the attribute to radixark's `AdapterWrapper`.
 
-2. **`models/conversion/quantization_utils.py` absent in radixark.**
-   Added upstream in `39b79eb7` (PR #3778), after radixark's base. 582 lines.
-   Orbit needs only `dequantize_int4` and `quantize_to_int4`.
-   **Fix:** vendor just those two into `orbit/quant/`. Do not add the upstream
-   file to radixark — that would be a non-extractable upstream edit.
+2. **~~`models/conversion/quantization_utils.py` absent in radixark.~~
+   RETRACTED — not a blocker.**
+   The module really is absent (added upstream in `39b79eb7` / PR #3778, after
+   radixark's base), but orbit only needs `dequantize_int4` and
+   `quantize_to_int4`, and **radixark already has both** at
+   `models/kimi_vl/utils.py:19,89`. They are functionally identical to the
+   upstream versions — the only diffs are comments and a lint-only
+   `del weight_shape, group_size` of two params that neither version uses.
+   Upstream later moved these into `quantization_utils.py` and left
+   `kimi_vl/utils.py` as a re-export shim, so
+   `megatron.bridge.models.kimi_vl.utils` resolves on **both** bases.
+   **Fix:** import from `megatron.bridge.models.kimi_vl.utils`. Do not vendor a
+   copy (an earlier attempt to do so was reverted), and do not add the upstream
+   file to radixark.
+   Note these are *not* interchangeable with orbit's own
+   `low_precision.dequantize_int4`, which is a CUDA-only Triton kernel; the
+   radixark/upstream one is pure PyTorch and runs on CPU. Five orbit call sites
+   need the CPU version.
 
 3. **`default_peft_config` moved upstream.**
    radixark: `recipes/utils/finetune_utils.py:30`.
