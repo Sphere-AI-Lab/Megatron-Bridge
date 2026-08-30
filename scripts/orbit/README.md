@@ -143,6 +143,138 @@ python scripts/orbit/conversion/convert_int4_checkpoint_direct.py     --hf-model
 python scripts/orbit/conversion/compare_model_metadata.py     --hf-model-path $MODELS/<hf_model> --megatron-path ./checkpoints/<name>
 ```
 
+### Qwen3-30B-A3B NVFP4 QOFT bring-up
+
+The following converts a ModelOpt NVFP4 export and runs one QOFT training iteration. It was
+validated on a single NVIDIA B200 with TP=EP=PP=1 and sequence length 256. Use a
+Blackwell-class GPU such as B200 for native NVFP4 execution.
+
+On Radixark/Miles integration branches, make the `miles` package importable before conversion
+or training. Skip this export when `miles` is already installed in the active environment:
+
+```bash
+export MILES_ROOT=/path/to/miles
+export PYTHONPATH="$PWD/src:$PWD/3rdparty/Megatron-LM:$MILES_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+Convert the Hugging Face NVFP4 checkpoint to Megatron's distributed-checkpoint format:
+
+```bash
+MODELS=${HF_MODEL_ROOT:-$HOME/hf_models}
+CHECKPOINTS=${MEGATRON_CKPT_ROOT:-$PWD/checkpoints}
+HF_MODEL=$MODELS/Qwen3-30B-A3B-NVFP4
+MEGATRON_CKPT=$CHECKPOINTS/Qwen3-30B-A3B-NVFP4-mcore
+
+uv run python scripts/orbit/conversion/convert_nvfp4_checkpoint_direct.py \
+    --hf-model-path "$HF_MODEL" \
+    --megatron-path "$MEGATRON_CKPT"
+```
+
+Then run a one-iteration QOFT check before increasing the sequence length, batch size, GPU
+count, or training duration:
+
+```bash
+WANDB_MODE=disabled uv run python -m torch.distributed.run \
+    --nproc_per_node=1 \
+    scripts/orbit/finetune_qoft.py \
+    --quant nvfp4 \
+    --hf-model-path "$HF_MODEL" \
+    --pretrained-checkpoint "$MEGATRON_CKPT" \
+    --peft oft \
+    --tp 1 \
+    --ep 1 \
+    --pp 1 \
+    --no-sp \
+    --train-iters 1 \
+    --global-batch-size 1 \
+    --micro-batch-size 1 \
+    --seq-length 256 \
+    --log-interval 1 \
+    --skip-eval \
+    --debug-nan \
+    --debug-nan-steps 1 \
+    --output-dir ./outputs/qwen3-30b-a3b-nvfp4-qoft-bringup
+```
+
+A successful check reaches iteration `1/1` with a finite, nonzero loss and gradient norm,
+zero skipped iterations, and zero NaN iterations.
+
+Container runtimes must expose the NVIDIA driver library to Triton. If startup reports that
+`libcuda.so` cannot be found, point Triton and the compiler/linker at a directory containing
+both `libcuda.so` and `libcuda.so.1` (a node-local shim is sufficient):
+
+```bash
+export TRITON_LIBCUDA_PATH=/path/to/libcuda-directory
+export LIBRARY_PATH="$TRITON_LIBCUDA_PATH${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$TRITON_LIBCUDA_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+Leave `NVTE_FUSED_ATTN` unset when using the default `auto` attention backend. A contradictory
+override such as `NVTE_FUSED_ATTN=0` is rejected during model construction; select an explicit
+`--attention-backend` instead when a non-default backend is required.
+
+### Qwen3-30B-A3B FP8 QOFT bring-up
+
+The FP8 path uses the same Qwen3 MoE architecture and QOFT entrypoint. This one-iteration
+check was validated on a single NVIDIA B200 with TP=EP=PP=1 and sequence length 256, but FP8
+does not require a Blackwell-class GPU.
+
+Use the `MILES_ROOT` and `PYTHONPATH` setup from the NVFP4 example above when `miles` is not
+already installed, then convert the Hugging Face FP8 checkpoint:
+
+```bash
+MODELS=${HF_MODEL_ROOT:-$HOME/hf_models}
+CHECKPOINTS=${MEGATRON_CKPT_ROOT:-$PWD/checkpoints}
+HF_MODEL=$MODELS/Qwen3-30B-A3B-FP8
+MEGATRON_CKPT=$CHECKPOINTS/Qwen3-30B-A3B-FP8-mcore
+
+uv run python scripts/orbit/conversion/convert_fp8_checkpoint_direct.py \
+    --hf-model-path "$HF_MODEL" \
+    --megatron-path "$MEGATRON_CKPT"
+```
+
+The direct converter currently writes ModelOpt metadata using the MCore distributed format,
+while the generic checkpoint probe looks for `modelopt_state/common.pt`. If the generated
+checkpoint has distributed ModelOpt metadata instead, move that directory aside before
+training. This is reversible; the dedicated FP8 loader still restores the quantized weights
+and scales directly from the main checkpoint:
+
+```bash
+MODELOPT_STATE=$MEGATRON_CKPT/iter_0000000/modelopt_state
+if [[ -d "$MODELOPT_STATE" && ! -f "$MODELOPT_STATE/common.pt" ]]; then
+    test ! -e "${MODELOPT_STATE}.mcore-unused"
+    mv "$MODELOPT_STATE" "${MODELOPT_STATE}.mcore-unused"
+fi
+```
+
+Run the same bounded QOFT check:
+
+```bash
+WANDB_MODE=disabled uv run python -m torch.distributed.run \
+    --nproc_per_node=1 \
+    scripts/orbit/finetune_qoft.py \
+    --quant fp8 \
+    --hf-model-path "$HF_MODEL" \
+    --pretrained-checkpoint "$MEGATRON_CKPT" \
+    --peft oft \
+    --tp 1 \
+    --ep 1 \
+    --pp 1 \
+    --no-sp \
+    --train-iters 1 \
+    --global-batch-size 1 \
+    --micro-batch-size 1 \
+    --seq-length 256 \
+    --log-interval 1 \
+    --skip-eval \
+    --debug-nan \
+    --debug-nan-steps 1 \
+    --output-dir ./outputs/qwen3-30b-a3b-fp8-qoft-bringup
+```
+
+A successful check reaches iteration `1/1` with a finite, nonzero loss and gradient norm,
+zero skipped iterations, and zero NaN iterations.
+
 **Tiny-model validation** — before committing to a multi-hundred-GB conversion, cut a
 byte-identical few-layer slice with upstream's toy tool and run the same chain on it
 (minutes instead of hours; this exact recipe validated Kimi-K2.7 INT4 end-to-end):
