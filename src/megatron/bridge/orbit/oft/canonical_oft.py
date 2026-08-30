@@ -22,7 +22,7 @@ fused projections; the orbit launcher always uses CanonicalOFT for OFT runs.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -568,6 +568,64 @@ class GroupedOFTRotation(nn.Module):
         flat = oft_r_parallel.reshape(E * num_blocks, n_elements)
         R = self._template._cayley_batch(flat, self.block_size)
         return R.reshape(E, num_blocks, self.block_size, self.block_size)
+
+    def sharded_state_dict(self, prefix: str = "", sharded_offsets: Tuple = (), metadata: Optional[Dict] = None):
+        """Create the sharded state dict for the stacked per-expert ``oft_r``.
+
+        ``oft_r`` is one ``(num_local_experts, num_blocks, n_elements)`` parameter:
+        each EP rank holds a *different*, non-overlapping slice of experts along
+        axis 0, not a replica of the same data. Without this override, mcore's
+        plain-``nn.Module`` fallback (``sharded_state_dict_default``) marks the
+        whole tensor replicated and records its *local* shape as the global
+        shape: on save, every EP rank but the elected primary silently drops its
+        experts' ``oft_r``; on load, one rank's slice gets broadcast back to
+        every rank instead of each rank recovering its own data.
+
+        Mirrors how ``megatron.core.transformer.moe.experts`` computes the
+        EP-axis offset for its own per-expert weights
+        (``num_global_experts = ep_size * num_local_experts``,
+        ``local_expert_offset = ep_rank * num_local_experts``), by reusing
+        ``make_tp_sharded_tensor_for_checkpoint`` with the expert-parallel group
+        in place of a TP group — the helper only cares which group's rank/size
+        to shard the given axis across, not what the group represents. That
+        existing per-expert mechanism lives at the MoE container level and only
+        augments keys literally named ``weight{i}``/``bias{i}``, so it never
+        reaches ``oft_r``.
+
+        Column-parallel fc1 (the only place ``GroupedOFTRotation`` is used) is
+        not ``input_is_parallel``, so the other two axes stay TP-replicated
+        here, matching ``OFTRotationModule.sharded_state_dict``'s
+        ``tp_axis_map={}`` branch for the same case.
+
+        Unverified at runtime: no EP>1 hardware is available here. The
+        pre-existing expert ``replica_id`` rewrite at ``oft_layers.py:655`` for
+        the non-grouped path is untouched by this change.
+        """
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        key = f"{prefix}oft_r"
+
+        if self.is_expert:
+            from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+
+            sharded_tensor = make_tp_sharded_tensor_for_checkpoint(
+                state_dict["oft_r"],
+                key,
+                tp_axis=0,
+                prepend_offsets=sharded_offsets,
+                tp_group=parallel_state.get_expert_model_parallel_group(),
+                dp_cp_group=metadata["dp_cp_group"],
+            )
+        else:
+            from megatron.core.utils import make_sharded_tensor_for_checkpoint
+
+            sharded_tensor = make_sharded_tensor_for_checkpoint(
+                state_dict["oft_r"],
+                key,
+                prepend_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata["dp_cp_group"],
+            )
+        return {key: sharded_tensor}
 
     def forward(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
         """Apply this expert's rotation to ``x``. Eager-loop fallback only —
