@@ -15,8 +15,6 @@ CANONICAL_OFT_SLICE_NAMES = ("q", "k", "v", "gate", "up")
 
 _CANONICAL_SPLIT_ADAPTER_TOKENS = tuple(f".adapter_{s}." for s in CANONICAL_OFT_SLICE_NAMES)
 
-_DSV4_OFT_SUFFIXES = ("w1_oft_r", "w2_oft_r", "w3_oft_r")
-
 
 def _is_peft_adapter_lowered(lowered: str) -> bool:
     return (
@@ -24,7 +22,6 @@ def _is_peft_adapter_lowered(lowered: str) -> bool:
         or ".adapter." in lowered
         or any(token in lowered for token in _CANONICAL_SPLIT_ADAPTER_TOKENS)
         or lowered.endswith(".oft_r")
-        or lowered.endswith(_DSV4_OFT_SUFFIXES)
         or lowered.endswith(".adapters")
     )
 
