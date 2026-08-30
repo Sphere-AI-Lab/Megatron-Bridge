@@ -58,6 +58,54 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _split_wrapper_sharded_state_dict(
+    module: nn.Module,
+    prefix: str = "",
+    sharded_offsets: tuple = (),
+    metadata: Optional[dict] = None,
+):
+    """Build a sharded state dict by delegating to each child module.
+
+    The split wrappers replace their target instead of subclassing ``AdapterWrapper``,
+    so mcore's plain-``nn.Module`` fallback would snapshot the whole subtree at once and
+    mark it replicated, discarding ``to_wrap``'s TP sharding and ``oft_r``'s axis map.
+
+    Key names are unchanged, but sharding metadata is not: ``oft_r`` becomes TP-sharded
+    on axis 0 where the fallback marked it replicated, so checkpoints written before this
+    fix are not interchangeable with later ones at TP>1. At TP=1 nothing changes.
+    """
+    from megatron.core.transformer.utils import sharded_state_dict_default
+
+    # sharded_state_dict_default drops tp_group when it dispatches to a module's own
+    # sharded_state_dict, and make_sharded_tensors_for_checkpoint only substitutes the
+    # default group when dp_cp_group is also None. Left as None, every TP rank would
+    # report replica_id 0. Re-derive it from the wrapped TP layer instead.
+    tp_group = getattr(module, "tp_group", None)
+    if tp_group is None:
+        tp_group = getattr(getattr(module, "to_wrap", None), "tp_group", None)
+    if tp_group is None:
+        if getattr(module, "is_expert", False):
+            tp_group = parallel_state.get_expert_tensor_parallel_group()
+        else:
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+
+    sharded_state_dict = {}
+    for name, child in module.named_children():
+        child_tp_group = getattr(child, "tp_group", None)
+        sharded_state_dict.update(
+            sharded_state_dict_default(
+                child,
+                f"{prefix}{name}.",
+                sharded_offsets,
+                metadata,
+                tp_group=tp_group if child_tp_group is None else child_tp_group,
+            )
+        )
+    return sharded_state_dict
+
+
 _QUANTIZED_SHARED_FALLBACK_WARNED: set[tuple[str, str]] = set()
 
 
@@ -317,6 +365,9 @@ class OFTLinearSplitFC1UpGate(nn.Module):
         self.adapter_gate = _make_R()
         self.adapter_up = _make_R()
         self._adapter_enabled = True
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        return _split_wrapper_sharded_state_dict(self, prefix, sharded_offsets, metadata)
 
     def _split_output_weight(self, W: torch.Tensor):
         out_features = W.shape[0]
@@ -654,6 +705,9 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
         self.adapter_up = _make_R()
         self._adapter_enabled = True
         self._te_grouped_half_modules: dict[tuple[Any, ...], nn.Module] = {}
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        return _split_wrapper_sharded_state_dict(self, prefix, sharded_offsets, metadata)
 
     @staticmethod
     def _normalize_tokens_per_expert(tokens_per_expert: Any) -> list[int]:
@@ -1135,6 +1189,9 @@ class OFTLinearSplitQKV(nn.Module):
         self.adapter_k = _make_R()
         self.adapter_v = _make_R()
         self._adapter_enabled = True
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        return _split_wrapper_sharded_state_dict(self, prefix, sharded_offsets, metadata)
 
     def _packed_qkv_layout(self, packed_dim: int) -> tuple[int, int, int]:
         """Infer the local packed-QKV layout from the tensor's packed width.
