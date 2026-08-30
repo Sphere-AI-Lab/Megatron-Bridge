@@ -50,6 +50,8 @@ from megatron.bridge.orbit.low_precision.nvfp4 import (
     extract_nvfp4_weight_bundle,
     is_nvfp4_source,
     is_nvfp4_weight_mapping,
+    nvfp4_quantizer_entry_names,
+    nvfp4_weight_entry_names,
     register_nvfp4_buffers_after_load_dense,
     scale_to_amax,
     transform_sharded_state_dict_for_nvfp4_dense,
@@ -222,13 +224,18 @@ def transform_sharded_state_dict_for_nvfp4(
         # can find packed/scale/scalar entries under one consistent path
         # (matches int4_utils.py and fp8_utils.py).
         prefix = m.group(1)
+        # On-disk names come from the shared definition in
+        # orbit.low_precision.nvfp4, which the converter also uses, so the
+        # two sides cannot describe different layouts.
+        ckpt_names = nvfp4_weight_entry_names(prefix, str(expert_global_idx), swiglu=is_fc1)
+        ckpt_quant_names = nvfp4_quantizer_entry_names(prefix, str(expert_global_idx))
 
         if is_fc1:
             # SwiGLU: gate (_w) and up (_v) halves at half-out, half-in (FP4 packed).
             half_in = local_in // 2
             global_half_in = global_in // 2
             for half_suffix in ("_w", "_v"):
-                ckpt_key = f"{prefix}.weight{expert_global_idx}{half_suffix}"
+                ckpt_key = ckpt_names["weight_w" if half_suffix == "_w" else "weight_v"]
                 new_st = ShardedTensor(
                     key=ckpt_key,
                     data=torch.empty((local_out // 2, half_in), dtype=torch.uint8, device="cpu"),
@@ -246,7 +253,7 @@ def transform_sharded_state_dict_for_nvfp4(
             # fc2: non-fused, single packed weight at full-out, half-in.
             half_in = local_in // 2
             global_half_in = global_in // 2
-            ckpt_key = f"{prefix}.weight{expert_global_idx}"
+            ckpt_key = ckpt_names["weight"]
             new_st = ShardedTensor(
                 key=ckpt_key,
                 data=torch.empty((local_out, half_in), dtype=torch.uint8, device="cpu"),
@@ -267,7 +274,7 @@ def transform_sharded_state_dict_for_nvfp4(
         scale_cols = local_in // NVFP4_GROUP_SIZE
         global_scale_cols = global_in // NVFP4_GROUP_SIZE
         scale_st = ShardedTensor(
-            key=f"{prefix}.weight_quantizer._scale{expert_global_idx}",
+            key=ckpt_quant_names["scale"],
             data=torch.empty((local_out, scale_cols), dtype=torch.float8_e4m3fn, device="cpu"),
             dtype=torch.float8_e4m3fn,
             local_shape=(local_out, scale_cols),
@@ -282,7 +289,7 @@ def transform_sharded_state_dict_for_nvfp4(
 
         for scalar_suffix in ("_double_scale", "_amax"):
             scalar_st = ShardedTensor(
-                key=f"{prefix}.weight_quantizer.{scalar_suffix}{expert_global_idx}",
+                key=ckpt_quant_names["double_scale" if scalar_suffix == "_double_scale" else "amax"],
                 data=torch.empty((), dtype=torch.float32, device="cpu"),
                 dtype=torch.float32,
                 local_shape=(),
