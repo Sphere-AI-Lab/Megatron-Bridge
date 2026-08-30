@@ -22,6 +22,7 @@ helpers. ``scripts/orbit/finetune_qoft.py`` is the only intended consumer.
 """
 
 import logging
+import os
 import re
 from collections import defaultdict
 from typing import Any, Iterable
@@ -648,6 +649,8 @@ class NanTraceCallback(Callback):
         self._forward_hit = False
         self._backward_hit = False
         self._hook_handles = []
+        self._max_activation = 0.0
+        self._max_activation_where = "n/a"
 
     def _should_trace(self, step: int) -> bool:
         return step < self.trace_steps
@@ -673,7 +676,24 @@ class NanTraceCallback(Callback):
 
     def _make_forward_hook(self, name: str):
         def _hook(module, inputs, output):
-            if self._current_step is None or self._forward_hit or not self._should_trace(self._current_step):
+            if self._current_step is None or not self._should_trace(self._current_step):
+                return
+
+            # A non-finite check cannot see finite-but-enormous activations,
+            # which produce exploding gradients just as effectively. Track the
+            # largest magnitude any traced module emits.
+            for tensor_name, tensor in _iter_tensor_paths(output, "output"):
+                if not tensor.is_floating_point() or tensor.numel() == 0:
+                    continue
+                finite = tensor.detach()[torch.isfinite(tensor.detach())]
+                if finite.numel() == 0:
+                    continue
+                magnitude = float(finite.abs().max().item())
+                if magnitude > self._max_activation:
+                    self._max_activation = magnitude
+                    self._max_activation_where = f"{name} {tensor_name} shape={tuple(tensor.shape)}"
+
+            if self._forward_hit:
                 return
 
             issue = _describe_nonfinite_tensors(inputs, "input")
@@ -733,6 +753,8 @@ class NanTraceCallback(Callback):
         self._current_step = step
         self._forward_hit = False
         self._backward_hit = False
+        self._max_activation = 0.0
+        self._max_activation_where = "n/a"
 
         if not self._should_trace(step):
             return
@@ -772,6 +794,36 @@ class NanTraceCallback(Callback):
             f"[nan-debug] step {step} end loss={loss_text} grad_norm={grad_norm_text} "
             f"skipped={context.skipped_iter} lr={lr_text}"
         )
+        rank_id = dist.get_rank() if dist.is_initialized() else 0
+        print(
+            f"[nan-debug][rank{rank_id}] largest finite activation this step: "
+            f"{self._max_activation:.6g} at {self._max_activation_where}"
+        )
+
+        # Attribute the global grad norm: top trainable parameters by local
+        # gradient norm (reads main_grad, falls back to .grad). Printed on
+        # every rank — the global norm is a cross-rank reduction, so a sane
+        # rank 0 does not clear the other ranks.
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        grad_norms: list[tuple[float, str]] = []
+        total_sq = 0.0
+        model_chunks = context.model if isinstance(context.model, list) else [context.model]
+        for chunk in model_chunks:
+            for name, param in chunk.named_parameters():
+                if not param.requires_grad:
+                    continue
+                grad = getattr(param, "main_grad", None)
+                if grad is None:
+                    grad = param.grad
+                if grad is None:
+                    continue
+                norm_value = float(grad.detach().float().norm().item())
+                total_sq += norm_value * norm_value
+                grad_norms.append((norm_value, name))
+        grad_norms.sort(reverse=True)
+        print(f"[nan-debug][rank{rank}] local param-grad total-norm {total_sq**0.5:.6g} over {len(grad_norms)} params")
+        for norm_value, name in grad_norms[:6]:
+            print(f"[nan-debug][rank{rank}]   grad-norm {norm_value:.6g}  {name}")
 
         param_issue = _first_nonfinite_named_parameter(context.model, include_grad=False)
         if param_issue is not None:
@@ -853,6 +905,54 @@ def _materialize_meta_sharded_tensors_to_cpu(state_dict, sharded_tensor_cls) -> 
                 value.data = torch.empty(value.local_shape, dtype=value.dtype, device="cpu")
 
 
+def _has_full_storage(tensor: torch.Tensor) -> bool:
+    """Whether a tensor's storage actually backs all of its elements.
+
+    Quantized-base placeholders are deliberately storage-emptied while their
+    shape metadata is kept, so ``numel()`` overstates what is really allocated.
+    Writing to such a tensor is an illegal memory access.
+    """
+    if tensor.numel() == 0:
+        return False
+    try:
+        storage_elements = tensor.untyped_storage().nbytes() // tensor.element_size()
+    except (RuntimeError, NotImplementedError):
+        return False
+    return storage_elements >= tensor.numel()
+
+
+def report_meta_tensors_before_materialization(module, meta_param_names) -> int:
+    """Name every tensor still on the meta device before ``to_empty`` runs.
+
+    ``to_empty_if_meta_device`` materializes meta tensors as *uninitialized*
+    memory. Only ``oft_r`` is re-zeroed afterwards (see
+    :func:`reinitialize_meta_materialized_oft_parameters`), so any other tensor
+    left on meta silently becomes garbage: rank-varying, finite-but-enormous
+    values that pass a forward pass and then detonate in the backward. Anything
+    reported here that is not an adapter parameter is a checkpoint-coverage
+    defect, not a numerical one.
+
+    Returns the number of non-adapter tensors that were still on meta.
+    """
+    non_adapter = sorted(name for name in meta_param_names if not name.endswith("oft_r"))
+    meta_buffers = sorted(name for name, buf in module.named_buffers() if buf.device.type == "meta")
+
+    if meta_param_names or meta_buffers:
+        print_rank_0(
+            f"[qoft] meta tensors before materialization: {len(meta_param_names)} parameters "
+            f"({len(non_adapter)} non-adapter), {len(meta_buffers)} buffers"
+        )
+    for name in non_adapter[:12]:
+        print_rank_0(f"[qoft]   UNINITIALIZED after to_empty (parameter): {name}")
+    if len(non_adapter) > 12:
+        print_rank_0(f"[qoft]   ... and {len(non_adapter) - 12} more non-adapter parameters")
+    for name in meta_buffers[:12]:
+        print_rank_0(f"[qoft]   UNINITIALIZED after to_empty (buffer): {name}")
+    if len(meta_buffers) > 12:
+        print_rank_0(f"[qoft]   ... and {len(meta_buffers) - 12} more buffers")
+    return len(non_adapter)
+
+
 def reinitialize_meta_materialized_oft_parameters(module, meta_param_names) -> int:
     """Restore OFT rotation parameters that meta materialization left uninitialized.
 
@@ -866,13 +966,34 @@ def reinitialize_meta_materialized_oft_parameters(module, meta_param_names) -> i
     are never clobbered.
     """
     reset = 0
+    placeholders = 0
+    emptied = 0
     with torch.no_grad():
         for name, param in module.named_parameters():
-            if name in meta_param_names and name.split(".")[-1] == "oft_r":
+            if name not in meta_param_names:
+                continue
+            if name.split(".")[-1] == "oft_r":
                 param.zero_()
                 reset += 1
-    if reset:
-        print_rank_0(f"[qoft] re-zeroed {reset} meta-materialized OFT rotation parameters")
+            elif _has_full_storage(param):
+                # Quantized-base placeholders (the per-expert bf16 ``weight{N}``
+                # Parameters whose real data lives in the packed buffers) are
+                # materialized as uninitialized memory when they carry real
+                # storage. The runtime reads the packed buffers, not these, but
+                # leaving garbage in live Parameters makes runs rank-dependent.
+                # Placeholders that were storage-emptied before materialization
+                # keep a zero-byte storage: writing to those is an illegal
+                # access, so they are counted and left alone.
+                param.zero_()
+                placeholders += 1
+            else:
+                emptied += 1
+    if reset or placeholders or emptied:
+        print_rank_0(
+            f"[qoft] meta-materialized tensors: zeroed {reset} OFT rotation parameters and "
+            f"{placeholders} quantized-base placeholders; {emptied} placeholders keep zero-byte "
+            "storage (no data, nothing to zero)"
+        )
     return reset
 
 
@@ -1000,6 +1121,7 @@ def install_int4_checkpoint_load_patches(
 
         if torch.cuda.is_available():
             meta_param_names = {name for name, param in model_module.named_parameters() if param.device.type == "meta"}
+            report_meta_tensors_before_materialization(model_module, meta_param_names)
             to_empty_if_meta_device(model_module, device=torch.device("cuda", torch.cuda.current_device()))
             reinitialize_meta_materialized_oft_parameters(model_module, meta_param_names)
             if after_load_hook is not None:
@@ -1093,3 +1215,283 @@ def install_fp8_checkpoint_load_patches() -> None:
     _ckpt_mod._generate_model_state_dict = _fp8_generate_model_state_dict
     _ckpt_mod._load_model_state_dict = _fp8_load_model_state_dict
     _ckpt_mod._qoft_fp8_checkpoint_patches_installed = True
+
+
+# --------------------------------------------------------------------------- #
+# NVFP4 (quantized base) checkpoint-load patches
+# --------------------------------------------------------------------------- #
+
+# Runtime dict keys of NVFP4 entries produced by the pre-load transforms: the
+# grouped-expert weight halves / packed fc2 weights plus their per-expert
+# quantizer entries. Dense NVFP4 entries carry no fixed module-name list and
+# are recognized through their ``weight_quantizer`` siblings instead.
+_EXPERT_NVFP4_ENTRY_RE = re.compile(
+    r"^.*\.experts\.linear_fc[12]\.(?:weight\d+(?:_w|_v)?|weight_quantizer\._(?:scale|double_scale|amax)\d+)$"
+)
+# Model-side keys legitimately absent from the assign-load state dict: emptied
+# bf16 expert placeholders, freshly registered packed/scale buffers, and any
+# quantizer buffer kept by the dense dequantization step.
+_EXPECTED_NVFP4_MISSING_KEY_RE = re.compile(
+    r".*\.(?:experts\.linear_fc[12]\.(?:weight\d*(?:_w|_v)?(?:_packed)?|weight_(?:scale|double_scale|amax)\d+)"
+    r"|weight_quantizer\.[A-Za-z_]+\d*)$"
+)
+# Explicit per-layer checkpoint keys (decoder.layers.N....) as opposed to the
+# homogeneous-layer encoding that folds the layer index into sharded offsets.
+_EXPLICIT_LAYER_KEY_RE = re.compile(r"\.layers\.\d+\.")
+# Packed per-expert weight buffers installed by register_nvfp4_buffers_after_load.
+_PACKED_EXPERT_BUFFER_RE = re.compile(r"^weight\d+(?:_w|_v)?_packed$")
+
+
+def _is_expected_nvfp4_missing_key(key: str, handled_dense_weight_keys: frozenset[str]) -> bool:
+    if key.endswith("._extra_state"):
+        return True
+    if key.endswith(".oft_r"):
+        # OFT adapters are freshly initialized for finetuning, never loaded
+        # from the converted base checkpoint.
+        return True
+    if _EXPECTED_NVFP4_MISSING_KEY_RE.match(key) is not None:
+        return True
+    return key in handled_dense_weight_keys
+
+
+def _assert_nvfp4_request_keys_in_checkpoint(
+    model_state: dict[str, Any],
+    checkpoint_keys: frozenset[str],
+    arch_label: str,
+    sharded_tensor_cls,
+) -> None:
+    """Preflight: every transformed tensor request must exist in the checkpoint index.
+
+    Turns a contract drift between the trainer-side transforms and the
+    converter output into one readable error instead of a distributed-planner
+    ``KeyError`` that dumps the full checkpoint index.
+    """
+    requested = set()
+    for value in model_state.values():
+        entries = value if isinstance(value, list) else [value]
+        for entry in entries:
+            if isinstance(entry, sharded_tensor_cls) and "._extra_state" not in str(entry.key):
+                requested.add(str(entry.key))
+    missing = sorted(requested - checkpoint_keys)
+    if missing:
+        preview = ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else "")
+        raise RuntimeError(
+            f"{arch_label} NVFP4 preflight: {len(missing)} requested tensor entries are not in the "
+            f"checkpoint index of {len(checkpoint_keys)} entries: {preview}. The trainer-side "
+            "request contract has diverged from the converter output; fix the transform/converter "
+            "pair (megatron.bridge.orbit.quant.nvfp4_utils / conversion scripts), not the checkpoint."
+        )
+
+
+def install_nvfp4_checkpoint_load_patches(
+    *,
+    pretrained_checkpoint: str,
+    arch_label: str,
+    validate_nonfinite: bool = False,
+    after_load_hook=None,
+) -> None:
+    """Patch Megatron checkpoint loading to read NVFP4 entries directly.
+
+    Mirrors ``install_int4_checkpoint_load_patches`` and orbit's RL-side
+    ``low_precision_bootstrap``: the base model keeps its plain bf16 module
+    structure (built on the meta device, no ModelOpt at runtime); the pre-load
+    transforms rewrite grouped-expert and dense weight requests into the NVFP4
+    entry families the converter stores; the post-load step registers packed
+    expert buffers (consumed by the OFT grouped kernels) and dequantizes dense
+    weights back to bf16 Parameters.
+
+    The patches:
+
+    1. ``_generate_model_state_dict``: apply the dense + expert NVFP4
+       transforms from ``orbit.quant.nvfp4_utils`` /
+       ``orbit.low_precision.nvfp4`` — the one place the checkpoint contract
+       lives — then preflight the transformed request keys against the
+       checkpoint index.
+    2. ``mcore_to_pyt_state_dict``: materialize meta-device sharded tensors on
+       CPU right before PyTorch's checkpoint planner sees them.
+    3. ``_load_model_state_dict``: dequantize dense weights, register NVFP4
+       expert buffers, assign-load the rest, validate remaining keys, and
+       materialize leftover meta tensors onto the local CUDA device.
+    4. ``_maybe_restore_modelopt_state_for_sharded_load``: disabled. The
+       converter's checkpoint carries a ``modelopt_state/`` directory and the
+       orbit seam in bridge checkpointing restores it unconditionally before
+       the load schema is built; that rebuilds the expert modules into
+       ModelOpt's per-expert layout whose sharded keys do not exist in the
+       checkpoint. The QOFT NVFP4 runtime never uses ModelOpt.
+
+    A zero-local-shard guard on ``apply_swiglu_sharded_factory`` keeps EP
+    resharding safe when a rank holds no experts for a layer.
+    """
+    import megatron.core.dist_checkpointing.strategies.torch as _torch_strat
+    import megatron.core.transformer.moe.experts as _moe_experts
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor as MCoreShardedTensor
+
+    import megatron.bridge.orbit.training.modelopt_checkpoint as _modelopt_ckpt_mod
+    import megatron.bridge.training.checkpointing as _ckpt_mod
+    from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
+    from megatron.bridge.orbit.low_precision.nvfp4 import (
+        register_nvfp4_buffers_after_load_dense,
+        transform_sharded_state_dict_for_nvfp4_dense,
+    )
+    from megatron.bridge.orbit.quant.nvfp4_utils import (
+        register_nvfp4_buffers_after_load,
+        transform_sharded_state_dict_for_nvfp4,
+    )
+
+    if getattr(_ckpt_mod, "_qoft_nvfp4_checkpoint_patches_installed", False):
+        return
+
+    original_generate_model_sd = _ckpt_mod._generate_model_state_dict
+    original_apply_swiglu_sharded_factory = _moe_experts.apply_swiglu_sharded_factory
+    original_mcore_to_pyt = _torch_strat.mcore_to_pyt_state_dict
+
+    checkpoint_keys_cache: dict[str, frozenset[str]] = {}
+
+    def _resolve_distributed_checkpoint_dir() -> str:
+        # The CLI takes the checkpoint root; the torch-dist checkpoint itself
+        # lives in the iteration subdirectory (e.g. iter_0000000/), mirroring
+        # how bridge checkpointing resolves the load path.
+        import os
+
+        from megatron.core import dist_checkpointing
+
+        if dist_checkpointing.check_is_distributed_checkpoint(pretrained_checkpoint):
+            return pretrained_checkpoint
+        if os.path.isdir(pretrained_checkpoint):
+            iteration_dirs = sorted(
+                entry
+                for entry in os.listdir(pretrained_checkpoint)
+                if entry.startswith("iter_") and os.path.isdir(os.path.join(pretrained_checkpoint, entry))
+            )
+            for entry in reversed(iteration_dirs):
+                candidate = os.path.join(pretrained_checkpoint, entry)
+                if dist_checkpointing.check_is_distributed_checkpoint(candidate):
+                    return candidate
+        return pretrained_checkpoint
+
+    def _checkpoint_tensor_keys() -> frozenset[str]:
+        if "keys" not in checkpoint_keys_cache:
+            from megatron.core import dist_checkpointing
+
+            checkpoint_keys_cache["keys"] = frozenset(
+                str(key) for key in dist_checkpointing.load_tensors_metadata(_resolve_distributed_checkpoint_dir())
+            )
+        return checkpoint_keys_cache["keys"]
+
+    def _safe_apply_swiglu_sharded_factory(original_sh_ten, *args, **kwargs):
+        # Signature-agnostic zero-shard guard, same as the INT4 installer.
+        local_shape = getattr(original_sh_ten, "local_shape", None)
+        if local_shape is not None and len(local_shape) > 0 and local_shape[0] == 0:
+            return original_sh_ten
+        return original_apply_swiglu_sharded_factory(original_sh_ten, *args, **kwargs)
+
+    def _noop_restore_modelopt_state_for_sharded_load(model, checkpoint_path, common_state_dict) -> bool:
+        return False
+
+    def _checkpoint_uses_explicit_layer_keys() -> bool:
+        if "explicit_layers" not in checkpoint_keys_cache:
+            checkpoint_keys_cache["explicit_layers"] = any(
+                _EXPLICIT_LAYER_KEY_RE.search(key) for key in _checkpoint_tensor_keys()
+            )
+        return checkpoint_keys_cache["explicit_layers"]
+
+    def _nvfp4_generate_model_state_dict(model, model_sd_kwargs=None, ckpt_format="torch_dist", **kwargs):
+        if _checkpoint_uses_explicit_layer_keys():
+            # The converter saved per-layer keys (decoder.layers.N....); make the
+            # model request the same schema instead of the homogeneous-layer
+            # encoding (mirrors the INT4 scope="all" installer and orbit's
+            # force_explicit_layer_schema detection).
+            model_sd_kwargs = dict(model_sd_kwargs or {})
+            metadata = dict(model_sd_kwargs.get("metadata") or {})
+            metadata["non_homogeneous_layers"] = True
+            model_sd_kwargs["metadata"] = metadata
+
+        state_dict = original_generate_model_sd(model, model_sd_kwargs, ckpt_format, **kwargs)
+        if ckpt_format != "torch_dist":
+            return state_dict
+        checkpoint_keys = _checkpoint_tensor_keys()
+        for model_key in list(state_dict.keys()):
+            if not model_key.startswith("model"):
+                continue
+            model_state = state_dict[model_key]
+            # The converter stores per-expert _extra_state objects under names
+            # the grouped runtime modules cannot request (and TE extra state is
+            # not needed for plain-bf16 + packed-buffer compute), so drop the
+            # requests entirely — same choice as the INT4 scope="all" path and
+            # orbit's filter_missing_extra_state_keys.
+            model_state = _drop_extra_state_entries(model_state)
+            model_state = transform_sharded_state_dict_for_nvfp4_dense(model_state, checkpoint_keys)
+            model_state = transform_sharded_state_dict_for_nvfp4(model_state)
+            _assert_nvfp4_request_keys_in_checkpoint(model_state, checkpoint_keys, arch_label, MCoreShardedTensor)
+            state_dict[model_key] = model_state
+        return state_dict
+
+    def _meta_safe_mcore_to_pyt(state_dict, is_loading=False, **kwargs):
+        if is_loading:
+            _materialize_meta_sharded_tensors_to_cpu(state_dict, MCoreShardedTensor)
+        return original_mcore_to_pyt(state_dict, is_loading, **kwargs)
+
+    def _nvfp4_load_model_state_dict(model_module, state_dict, strict=True):
+        register_nvfp4_buffers_after_load_dense(model_module, state_dict)
+        register_nvfp4_buffers_after_load(model_module, state_dict)
+
+        if os.environ.get("QOFT_DEBUG_ZERO_EXPERT_BUFFERS", "0").lower() in ("1", "true", "yes"):
+            # Diagnostic: destroy every packed expert weight. If the training
+            # loss is unchanged, the grouped-expert path is not contributing to
+            # the forward at all and any loss agreement across runs is vacuous.
+            zeroed = 0
+            with torch.no_grad():
+                for module in model_module.modules():
+                    for buffer_name, buffer in module.named_buffers(recurse=False):
+                        if _PACKED_EXPERT_BUFFER_RE.match(buffer_name) is not None:
+                            buffer.zero_()
+                            zeroed += 1
+            print_rank_0(f"[qoft-debug] zeroed {zeroed} packed expert weight buffers")
+
+        string_keys = [key for key in state_dict if isinstance(key, str)]
+        quantized_dense_modules = {
+            key[: -len(".weight_quantizer._scale")] for key in string_keys if key.endswith(".weight_quantizer._scale")
+        }
+        handled_dense_weight_keys = frozenset(f"{module}.weight" for module in quantized_dense_modules)
+        for key in string_keys:
+            if (
+                _EXPERT_NVFP4_ENTRY_RE.match(key) is not None
+                or ".weight_quantizer._" in key
+                or key in handled_dense_weight_keys
+            ):
+                del state_dict[key]
+
+        load_return = model_module.load_state_dict(state_dict, strict=False, assign=True)
+        missing = [
+            key
+            for key in load_return.missing_keys
+            if not _is_expected_nvfp4_missing_key(key, handled_dense_weight_keys)
+        ]
+        unexpected = [key for key in load_return.unexpected_keys if not key.endswith("._extra_state")]
+
+        if missing or unexpected:
+            details = []
+            if missing:
+                details.append("missing=" + ", ".join(missing[:20]) + (" ..." if len(missing) > 20 else ""))
+            if unexpected:
+                details.append("unexpected=" + ", ".join(unexpected[:20]) + (" ..." if len(unexpected) > 20 else ""))
+            raise RuntimeError(
+                f"Unexpected non-NVFP4 state_dict mismatch during {arch_label} NVFP4 load: " + " | ".join(details)
+            )
+
+        if torch.cuda.is_available():
+            meta_param_names = {name for name, param in model_module.named_parameters() if param.device.type == "meta"}
+            report_meta_tensors_before_materialization(model_module, meta_param_names)
+            to_empty_if_meta_device(model_module, device=torch.device("cuda", torch.cuda.current_device()))
+            reinitialize_meta_materialized_oft_parameters(model_module, meta_param_names)
+            if after_load_hook is not None:
+                after_load_hook(model_module)
+        if validate_nonfinite:
+            validate_loaded_model_tensors(model_module)
+
+    _moe_experts.apply_swiglu_sharded_factory = _safe_apply_swiglu_sharded_factory
+    _ckpt_mod._generate_model_state_dict = _nvfp4_generate_model_state_dict
+    _torch_strat.mcore_to_pyt_state_dict = _meta_safe_mcore_to_pyt
+    _ckpt_mod._load_model_state_dict = _nvfp4_load_model_state_dict
+    _modelopt_ckpt_mod._maybe_restore_modelopt_state_for_sharded_load = _noop_restore_modelopt_state_for_sharded_load
+    _ckpt_mod._qoft_nvfp4_checkpoint_patches_installed = True

@@ -58,6 +58,7 @@ from models._qoft_common import (  # noqa: E402
     ensure_fp8_scale_inv_buffers,
     install_fp8_checkpoint_load_patches,
     install_int4_checkpoint_load_patches,
+    install_nvfp4_checkpoint_load_patches,
     log_model_storage_summary,
     normalize_hf_dataset_source,
     parse_target_modules,
@@ -376,14 +377,13 @@ def _apply_big_model_block(config, args, spec: dict) -> None:
     config.model.cross_entropy_loss_fusion = True
     config.model.cross_entropy_fusion_impl = "te"
 
-    if args.quant != "nvfp4":
-        config.mixed_precision = MixedPrecisionConfig(
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            pipeline_dtype=torch.bfloat16,
-            autocast_enabled=False,
-            grad_reduce_in_fp32=True,
-        )
+    config.mixed_precision = MixedPrecisionConfig(
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        autocast_enabled=False,
+        grad_reduce_in_fp32=True,
+    )
     config.model.moe_router_padding_for_fp8 = False
 
     config.optimizer.use_precision_aware_optimizer = False
@@ -425,10 +425,16 @@ def _apply_quant_mode(config, args, spec: dict) -> None:
             config.scheduler.lr_decay_iters = args.train_iters
         return
 
-    # nvfp4: rebuild modelopt-quantized layers from the saved modelopt state.
-    config.model.restore_modelopt_state = True
+    # nvfp4: plain bf16 module structure + packed NVFP4 buffers at runtime
+    # (orbit's low_precision_bootstrap mechanism). The load patches installed
+    # by the entrypoint rewrite checkpoint requests into the converter's NVFP4
+    # entry families, register packed expert buffers for the OFT grouped
+    # kernels, and dequantize dense weights to bf16. ModelOpt is not used at
+    # runtime: restoring its state would rebuild the expert modules into a
+    # per-expert sharded layout whose keys do not exist in the checkpoint.
     config.model.gradient_accumulation_fusion = False
-    config.mixed_precision = get_mixed_precision_config("bf16_with_nvfp4_mixed")
+    if not spec["big_block"]:
+        config.mixed_precision = get_mixed_precision_config("bf16_mixed")
     config.checkpoint.async_strategy = "mcore"
     if spec["key"] == "qwen3_moe":
         config.scheduler.lr_decay_iters = args.train_iters
@@ -576,9 +582,12 @@ def main() -> None:
         )
     elif args.quant == "fp8":
         install_fp8_checkpoint_load_patches()
-    # nvfp4 needs no patches: restore_modelopt_state rebuilds the quantized
-    # layers, and the grouped-MoE-safe ModelOpt compress patches apply
-    # automatically inside bridge.training.post_training.checkpointing.
+    elif args.quant == "nvfp4":
+        install_nvfp4_checkpoint_load_patches(
+            pretrained_checkpoint=args.pretrained_checkpoint,
+            arch_label=spec["label"],
+            validate_nonfinite=spec["validate_nonfinite"],
+        )
 
     # Opt-in adapter diagnostics: QOFT_ADAPTER_INIT_CHECK=1 reports the OFT
     # rotation parameters at train start (see AdapterInitCallback).

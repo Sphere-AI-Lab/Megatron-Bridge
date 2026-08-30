@@ -586,4 +586,16 @@ changed once real hardware, mcore, and TE were available.
   which is off-limits) — and the expert `replica_id` formula
   (`oft_layers.py:655`) — pre-existing with the original authors' own TODO,
   needs real EP>1 hardware to fix correctly, which this box does not have.
+- **`feature/relocate-conversion-scripts` is a sibling branch, not radixark
+  work — it continues `feature/generic-int4-adapter` past our migration
+  source commit (`53b6e652`).** It had 6 commits (`52b54eb6..5a6fc619`) of
+  real GPU bring-up fixes never ported here, now pulled forward by content.
+  Two were genuine correctness bugs: NVFP4 MoE checkpoint loading used the
+  *global* expert index for quantizer-scale runtime dict keys instead of the
+  *local* one (broke every EP rank but rank 0), and the NVFP4 QOFT path
+  relied on `restore_modelopt_state=True`, found to rebuild experts into a
+  per-expert sharded layout whose keys don't exist in the checkpoint —
+  replaced with orbit's own `install_nvfp4_checkpoint_load_patches`, matching
+  INT4/FP8. Worth checking that branch again for further divergence before
+  the next upstream re-fetch — it may keep moving independently of this fork.
 

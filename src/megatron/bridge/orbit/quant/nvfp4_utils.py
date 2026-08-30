@@ -208,6 +208,13 @@ def transform_sharded_state_dict_for_nvfp4(
         # local weight0 -> global weight96). Use the prepend axis's global_offset
         # entry when present, otherwise the literal digit from the runtime key.
         expert_global_idx = sh_ten.global_offset[prepend - 1] if prepend > 0 else int(m.group(2))
+        # Runtime dict keys must stay in the LOCAL index space: the post-load
+        # register step groups entries by the index parsed from the dict key,
+        # and the grouped kernels read buffers by local gemm index. Only the
+        # on-disk ``key`` fields use the global index. Mixing the two spaces
+        # left every EP rank except rank 0 with weight halves and quantizer
+        # scales in different groups (experts registered without scales).
+        expert_local_idx = int(m.group(2))
 
         # ``prefix`` is extracted from the canonical-matched regex, so it is
         # already canonicalized. Use it uniformly for both the runtime dict
@@ -271,7 +278,7 @@ def transform_sharded_state_dict_for_nvfp4(
             prepend_axis_num=0,
             allow_shape_mismatch=True,
         )
-        new_sd[f"{prefix}.weight_quantizer._scale{expert_global_idx}"] = scale_st
+        new_sd[f"{prefix}.weight_quantizer._scale{expert_local_idx}"] = scale_st
 
         for scalar_suffix in ("_double_scale", "_amax"):
             scalar_st = ShardedTensor(
@@ -288,7 +295,7 @@ def transform_sharded_state_dict_for_nvfp4(
                 prepend_axis_num=0,
                 allow_shape_mismatch=True,
             )
-            new_sd[f"{prefix}.weight_quantizer.{scalar_suffix}{expert_global_idx}"] = scalar_st
+            new_sd[f"{prefix}.weight_quantizer.{scalar_suffix}{expert_local_idx}"] = scalar_st
 
     return new_sd
 
