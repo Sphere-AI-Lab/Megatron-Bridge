@@ -262,3 +262,74 @@ accurate. Commit C5 needs no adaptation work — copy the file as-is.
 
 Everything above is static analysis. No Python has been executed; no GPU
 verification has been done (that is Phase 3, handed to the user).
+
+## 9. Findings from executing Phase 1 (C3–C10)
+
+### Orbit is QLoRA-style PEFT, not QAT
+
+Confirmed in code, and it reframes the risk ranking:
+
+- INT4 base lands as **buffers, not Parameters**
+  (`model_bridges/deepseek_v3_int4_bridge.py:177-179` registers
+  `_packed`/`_scale`/`_shape` with `persistent=True`), so the base cannot take
+  gradients and never materializes a bf16 master copy.
+- Dequant is transient per forward; `w_compute` is `del`'d in a `finally`.
+- The memory win is the `saved_tensors_hooks(pack, unpack)` in
+  `peft_ext/int4_lora_forward.py:79-100`: autograd saves the *packed* triplet
+  and re-dequantizes in `unpack` during backward, so no bf16 base copy is held
+  across the fwd/bwd boundary.
+- No base-weight fake-quant anywhere. The one STE,
+  `_fp8_activation_qdq_per_token_group_ste`, applies to *activations* in the OFT
+  FP8 path.
+
+**Consequence: blocker #6 is the top Phase 3 priority**, above the conversion
+and finetune smoke tests. If the base is frozen buffers, the adapter *is* 100%
+of the training result, so radixark's `AdapterWrapper.sharded_state_dict`
+lacking spherelab's `_plain_module_sharded_state_dict` fallback could silently
+drop delta-only adapter weights — a run that reports success but writes an empty
+adapter. Blocker #7 (`share_expert_adapters` default flip) likewise changes the
+trainable parameter count for MoE, not just behaviour.
+
+### Seam notes
+
+- **Seam 3 is a gap-fill, not an invention.** radixark already applies the same
+  restore-before-schema-generation pattern at
+  `_load_model_weights_from_checkpoint` (`checkpointing.py:1717`), but
+  `_load_checkpoint_from_path` — the training resume path — has no modelopt
+  restore at all. Orbit calls the same `restore_modelopt_state` radixark
+  imports, adding only a `has_modelopt_state` guard.
+- **Seam 2 may be redundant — unverified.**
+  `_save_sharded_modelopt_state_with_async_strategy` is a fork of *ModelOpt's*
+  `save_sharded_modelopt_state` that exists only to thread `async_strategy=`
+  into `dist_checkpointing.save`. `nvidia-modelopt` is not installed locally, so
+  whether ModelOpt's own version already accepts that argument could not be
+  checked. If it does, delete orbit's fork and seam 2 with it.
+
+### Known, deliberately not fixed
+
+- **Intra-orbit duplicate:** `_module_bias_enabled` and
+  `_get_active_bias_tensor` exist in both `oft/oft_layers.py:302,323` and
+  `peft_ext/int4_lora_forward.py:17,31`, logic-identical (verified by AST
+  compare; only docstrings differ). Left alone: consolidating would either force
+  `peft_ext` to import the triton-heavy `oft_layers`, or require a new shared
+  leaf module and layout drift from the source branch. The dedup rule targets
+  orbit-vs-radixark, and neither copy duplicates radixark.
+- `conversion/model_metadata_compare.py` reads a checkpoint's `.metadata` with
+  `pickle.load`. Standard for torch-dist checkpoints and pre-existing, but it
+  does mean pointing the comparison tooling at an untrusted checkpoint dir is
+  code execution.
+- `scripts/orbit/finetune_qoft.py` reaches its siblings via
+  `sys.path.insert(0, dirname(__file__))` then `from models._qoft_common import
+  ...`, where `models` is the `scripts/orbit/models/` namespace package (no
+  `__init__.py`). Fragile but functional, and only this one script does it.
+
+### Lint
+
+radixark's own `training/setup.py` carries 4 pre-existing ruff findings (1
+unsorted import block, 3 unused imports) — verified identical at
+`radixark/bridge` with the repo config, and left untouched so the seam files
+stay trivially re-appliable. Orbit's own paths are `ruff check` and
+`ruff format --check` clean, using file-level `noqa` rather than invented
+docstrings on the 17 operational scripts and on the vendored TE file (whose
+import list must stay diffable against TE v2.14).
+

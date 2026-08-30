@@ -39,6 +39,8 @@ Both came back clean — full results in `MIGRATION_MEMORY.md` §8:
 
 ## Progress
 
+**Phase 1 complete. Phase 2 gates all pass. Remaining: Phase 3 (user, on GPU).**
+
 Landed on `feature/orbit-on-radixark` (newest last):
 
 | Commit | What |
@@ -50,8 +52,32 @@ Landed on `feature/orbit-on-radixark` (newest last):
 | `89362b78` | docs: correct the migration rule to containment plus dedup |
 | `f30b856c` | **C3** — orbit/peft_ext (+ 2 oft leaf files) |
 | `3e17ba98` | fix: make the C2 modules lint-clean |
+| `194e7014` | docs: record C3 in the progress log |
+| `d3fddef2` | **C4** — orbit/oft + triton_oft |
+| `f5f1d7e9` | **C5** — orbit/oft/te_oft |
+| `0cb9db84` | **C6** — orbit/conversion + orbit/model_bridges |
+| `2fa30ac6` | **C7** — orbit/training |
+| `d1a042a5` | **C8** — the 4 upstream seams |
+| `06cd49d9` | **C9** — scripts/orbit |
+| `ea4544ad` | **C10** — tests/unit_tests/orbit |
 
-Next: **C4**. Remaining: C4–C10, then Phase 2.
+### Phase 2 results
+
+1. **PASS** — `git diff --name-status radixark/bridge..HEAD` lists only
+   orbit-namespaced paths, plus `NOTICE` (A) and exactly 3 radixark files (M).
+2. **PASS** — 4 seam hunks in source, all tagged `orbit-seam(...)`, tags match
+   `UPSTREAM_SEAMS.md`: 1 × `hook-order`, 3 × `modelopt`.
+3. **PASS**, and provably so. Reconstructing the tree in a scratch index —
+   drop the 4 orbit dirs and `NOTICE`, restore the 3 seam files from
+   `radixark/bridge` — yields tree `d39426cc`, **identical to
+   `radixark/bridge^{tree}`**. Extractability is exact, not approximate.
+4. **PASS** — `pyproject.toml`, `uv.lock`, `ruff.toml` and
+   `.pre-commit-config.yaml` are all untouched. Orbit adds no dependency
+   radixark does not already assume: its undeclared third-party roots are
+   `modelopt` and `safetensors` (radixark itself imports both, 9 files each),
+   `transformer_engine_torch` and `triton` (ship with TE and torch), and
+   `sglang`, which is a genuinely optional backend behind a
+   `try/except Exception` that returns `None`.
 
 Deviations from the commit table below, all recorded rather than silent:
 
