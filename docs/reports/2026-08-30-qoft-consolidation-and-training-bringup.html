@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>QOFT consolidation and quantized-base training bring-up</title>
-<script type="application/json" id="report-meta">{"title": "QOFT consolidation and quantized-base training bring-up", "kind": "development", "date": "2026-08-30", "tags": ["orbit", "qoft", "peft", "int4", "fp8", "nvfp4", "consolidation", "slurm"], "subtitle": "", "generated": "2026-08-30T04:28:36+00:00", "meta": {"date": "2026-08-30", "commit": "e5a1dbeb40d1", "branch": "feature/relocate-conversion-scripts (= feature/generic-int4-adapter)", "host": "slurm-login-567db7474-fv2mx", "python": "3.10.12", "tip": "e5a1dbeb", "repo": "Sphere-AI-Lab/Megatron-Bridge", "cluster": "slurm (slinky, H200/B200)", "reporting_period": "2026-08-29 to 2026-08-30 (waves 1-3)"}, "profile": "development-log", "status": "draft", "source": {"path": "docs/reports/_src/2026-08-30-qoft-consolidation-and-training-bringup.md", "sha256": "7d22b61876253534e1d4894ed1eeda9d90ce80207dd23c818a63b27687ba2350", "assets": []}}</script>
+<script type="application/json" id="report-meta">{"title": "QOFT consolidation and quantized-base training bring-up", "kind": "development", "date": "2026-08-30", "tags": ["orbit", "qoft", "peft", "int4", "fp8", "nvfp4", "consolidation", "slurm"], "subtitle": "", "generated": "2026-08-30T14:03:15+00:00", "meta": {"date": "2026-08-30", "commit": "9b6395d7d0b4", "branch": "feature/relocate-conversion-scripts (= feature/generic-int4-adapter)", "tree": "clean", "host": "slurm-login-567db7474-92mxh", "python": "3.10.12", "tip": "1aa4b3eb", "repo": "Sphere-AI-Lab/Megatron-Bridge", "cluster": "slurm (slinky, H200/B200)", "reporting_period": "2026-08-29 to 2026-08-30 (waves 1-4)"}, "profile": "development-log", "status": "draft", "source": {"path": "docs/reports/_src/2026-08-30-qoft-consolidation-and-training-bringup.md", "sha256": "ba43e73490a179cad6c705966df9f5578c5bbd27e1bfafe99511544a9ad5e738", "assets": []}}</script>
 <style>
 
 </style>
@@ -13,21 +13,23 @@
 <button class="theme-toggle" type="button" aria-label="Toggle color theme">Theme</button>
 <div class="page">
 <div class="doc-layout">
-<details class="toc" open><summary>Contents</summary><ol><li class="lvl-2"><a href="#status">Status</a></li><li class="lvl-2"><a href="#wave-1-2026-08-29-consolidation">Wave 1 (2026-08-29): consolidation</a></li><li class="lvl-2"><a href="#wave-2-2026-08-30-one-checkpoint-contract-first-loss">Wave 2 (2026-08-30): one checkpoint contract, first loss</a></li><li class="lvl-3"><a href="#root-cause-of-the-nvfp4-load-failure">Root cause of the NVFP4 load failure</a></li><li class="lvl-3"><a href="#design-decision-single-source-of-truth">Design decision: single source of truth</a></li><li class="lvl-3"><a href="#the-three-commits-reviewable-without-repository-access">The three commits, reviewable without repository access</a></li><li class="lvl-3"><a href="#the-run-ladder">The run ladder</a></li><li class="lvl-3"><a href="#evidence-package-the-remaining-backward-defect">Evidence package: the remaining backward defect</a></li><li class="lvl-2"><a href="#wave-3-2026-08-30-ablation-campaign-what-the-blowup-is-not">Wave 3 (2026-08-30): ablation campaign — what the blowup is NOT</a></li><li class="lvl-3"><a href="#the-ablation-that-localizes-it">The ablation that localizes it</a></li><li class="lvl-3"><a href="#closed-by-measurement">Closed by measurement</a></li><li class="lvl-3"><a href="#the-meta-device-placeholder-finding-and-its-correction">The meta-device placeholder finding, and its correction</a></li><li class="lvl-3"><a href="#version-dependent-magnitudes">Version-dependent magnitudes</a></li><li class="lvl-3"><a href="#the-step-1-nan-is-a-separate-phenomenon">The step-1 NaN is a separate phenomenon</a></li><li class="lvl-3"><a href="#structural-finding-the-quantized-expert-path-requires-oft">Structural finding: the quantized expert path requires OFT</a></li><li class="lvl-3"><a href="#controls-that-could-not-be-run">Controls that could not be run</a></li><li class="lvl-3"><a href="#also-captured-this-wave">Also captured this wave</a></li><li class="lvl-2"><a href="#defects-fixed-in-wave-1">Defects fixed in wave 1</a></li><li class="lvl-2"><a href="#open-moonlight-int4-nan-wave-1-re-framed-by-wave-2">Open: Moonlight INT4 NaN (wave 1, re-framed by wave 2)</a></li><li class="lvl-2"><a href="#open-deepep-and-the-cuda-wheel-skew-wave-1">Open: DeepEP and the CUDA wheel skew (wave 1)</a></li><li class="lvl-2"><a href="#open-kimi-training-path-forward-signature-wave-2-round-1">Open: Kimi training-path forward signature (wave 2, round 1)</a></li><li class="lvl-2"><a href="#environment-work-wave-1">Environment work (wave 1)</a></li><li class="lvl-2"><a href="#actions">Actions</a></li><li class="lvl-2"><a href="#reproduction">Reproduction</a></li></ol></details>
+<details class="toc" open><summary>Contents</summary><ol><li class="lvl-2"><a href="#status">Status</a></li><li class="lvl-2"><a href="#wave-1-2026-08-29-consolidation">Wave 1 (2026-08-29): consolidation</a></li><li class="lvl-2"><a href="#wave-2-2026-08-30-one-checkpoint-contract-first-loss">Wave 2 (2026-08-30): one checkpoint contract, first loss</a></li><li class="lvl-3"><a href="#root-cause-of-the-nvfp4-load-failure">Root cause of the NVFP4 load failure</a></li><li class="lvl-3"><a href="#design-decision-single-source-of-truth">Design decision: single source of truth</a></li><li class="lvl-3"><a href="#the-three-commits-reviewable-without-repository-access">The three commits, reviewable without repository access</a></li><li class="lvl-3"><a href="#the-run-ladder">The run ladder</a></li><li class="lvl-3"><a href="#evidence-package-the-remaining-backward-defect">Evidence package: the remaining backward defect</a></li><li class="lvl-2"><a href="#wave-3-2026-08-30-ablation-campaign-what-the-blowup-is-not">Wave 3 (2026-08-30): ablation campaign — what the blowup is NOT</a></li><li class="lvl-3"><a href="#the-ablation-that-localizes-it">The ablation that localizes it</a></li><li class="lvl-3"><a href="#closed-by-measurement">Closed by measurement</a></li><li class="lvl-3"><a href="#the-meta-device-placeholder-finding-and-its-correction">The meta-device placeholder finding, and its correction</a></li><li class="lvl-3"><a href="#version-dependent-magnitudes">Version-dependent magnitudes</a></li><li class="lvl-3"><a href="#the-step-1-nan-is-a-separate-phenomenon">The step-1 NaN is a separate phenomenon</a></li><li class="lvl-3"><a href="#structural-finding-the-quantized-expert-path-requires-oft">Structural finding: the quantized expert path requires OFT</a></li><li class="lvl-3"><a href="#controls-that-could-not-be-run">Controls that could not be run</a></li><li class="lvl-2"><a href="#wave-4-2026-08-30-the-key-format-gets-one-definition-and-the-hardware-question">Wave 4 (2026-08-30): the key format gets one definition, and the hardware question</a></li><li class="lvl-3"><a href="#blackwell-versus-hopper">Blackwell versus Hopper</a></li><li class="lvl-3"><a href="#the-checkpoint-key-format-now-has-one-definition">The checkpoint key format now has one definition</a></li><li class="lvl-3"><a href="#also-captured-this-wave">Also captured this wave</a></li><li class="lvl-2"><a href="#defects-fixed-in-wave-1">Defects fixed in wave 1</a></li><li class="lvl-2"><a href="#open-moonlight-int4-nan-wave-1-re-framed-by-wave-2">Open: Moonlight INT4 NaN (wave 1, re-framed by wave 2)</a></li><li class="lvl-2"><a href="#open-deepep-and-the-cuda-wheel-skew-wave-1">Open: DeepEP and the CUDA wheel skew (wave 1)</a></li><li class="lvl-2"><a href="#open-kimi-training-path-forward-signature-wave-2-round-1">Open: Kimi training-path forward signature (wave 2, round 1)</a></li><li class="lvl-2"><a href="#environment-work-wave-1">Environment work (wave 1)</a></li><li class="lvl-2"><a href="#actions">Actions</a></li><li class="lvl-2"><a href="#reproduction">Reproduction</a></li></ol></details>
 <main>
 <header class="doc-header">
 <div class="doc-state"><span class="doc-profile">Development log</span><span class="doc-status status-draft">Draft</span></div><div class="doc-kind">development</div><h1 class="doc-title">QOFT consolidation and quantized-base training bring-up</h1>
 <div class="doc-tags"><span>orbit</span><span>qoft</span><span>peft</span><span>int4</span><span>fp8</span><span>nvfp4</span><span>consolidation</span><span>slurm</span></div>
-<dl class="meta"><div><dt>date</dt><dd>2026-08-30</dd></div><div><dt>commit</dt><dd>e5a1dbeb40d1</dd></div><div><dt>branch</dt><dd>feature/relocate-conversion-scripts (= feature/generic-int4-adapter)</dd></div><div><dt>host</dt><dd>slurm-login-567db7474-fv2mx</dd></div><div><dt>python</dt><dd>3.10.12</dd></div><div><dt>tip</dt><dd>e5a1dbeb</dd></div><div><dt>repo</dt><dd>Sphere-AI-Lab/Megatron-Bridge</dd></div><div><dt>cluster</dt><dd>slurm (slinky, H200/B200)</dd></div><div><dt>reporting_period</dt><dd>2026-08-29 to 2026-08-30 (waves 1-3)</dd></div></dl>
+<dl class="meta"><div><dt>date</dt><dd>2026-08-30</dd></div><div><dt>commit</dt><dd>9b6395d7d0b4</dd></div><div><dt>branch</dt><dd>feature/relocate-conversion-scripts (= feature/generic-int4-adapter)</dd></div><div><dt>tree</dt><dd class="flag-clean">clean</dd></div><div><dt>host</dt><dd>slurm-login-567db7474-92mxh</dd></div><div><dt>python</dt><dd>3.10.12</dd></div><div><dt>tip</dt><dd>1aa4b3eb</dd></div><div><dt>repo</dt><dd>Sphere-AI-Lab/Megatron-Bridge</dd></div><div><dt>cluster</dt><dd>slurm (slinky, H200/B200)</dd></div><div><dt>reporting_period</dt><dd>2026-08-29 to 2026-08-30 (waves 1-4)</dd></div></dl>
 </header>
 <section class="report-summary" aria-label="Outcome">
 <p class="summary-label">Outcome</p>
 <p class="summary-title">The consolidated QOFT entrypoint now loads the NVFP4 Qwen3 checkpoint end-to-end and produces the campaign's first loss (4.79); two independent defects remain, and a 24-run ablation has closed six candidate causes for them — including both hypotheses this report previously advanced.</p>
-<p class="summary-detail">Wave 1 consolidated five per-model entrypoints into one. Wave 2 unified the NVFP4 checkpoint contract into a single source of truth shared by the trainer and the RL loader, fixing the load end-to-end. Wave 3 established by measurement what the remaining failure is not: not cross-rank dispatch (EP=1 fails earlier), not the dequantized weights (verified against the BF16 release at 9.4% error, 0.9955 correlation), not adapter initialization, not oversized activations (max 708, identical on every rank), not uninitialized gradient buffers (zero before the backward), and not the meta-device placeholders (they carry zero-byte storage — a correction to this report's own earlier claim). What remains is a row-aligned NaN entering the expert backward at step 1 but not step 0, which persists even in the configuration whose gradients are healthy, plus a separate ~2000x gradient excess confined to the dense-quantized attention adapters.</p>
+<p class="summary-detail">Wave 1 consolidated five per-model entrypoints into one. Wave 2 unified the NVFP4 checkpoint contract into a single source of truth shared by the trainer and the RL loader, fixing the load end-to-end. Wave 3 established by measurement what the remaining failure is not: not cross-rank dispatch (EP=1 fails earlier), not the dequantized weights (verified against the BF16 release at 9.4% error, 0.9955 correlation), not adapter initialization, not oversized activations (max 708, identical on every rank), not uninitialized gradient buffers (zero before the backward), and not the meta-device placeholders (they carry zero-byte storage — a correction to this report's own earlier claim). What remains is a row-aligned NaN entering the expert backward at step 1 but not step 0, which persists even in the configuration whose gradients are healthy, plus a separate ~2000x gradient excess confined to the dense-quantized attention adapters. Wave 4 gave the checkpoint key format a single definition shared by converter and trainer for both NVFP4 and FP8, verified behaviour-neutral, and stood up a Blackwell (B200) environment since every run so far was on H200, which has no FP4 tensor cores.</p>
 </section>
 <h2 id="status">Status<a class="anchor" href="#status" aria-hidden="true">#</a></h2>
 <p><span data-status="done">done: consolidation written and pushed</span> ·
-<p><span data-status="done">done: NVFP4 load contract unified + verified</span> ·
+<p><span data-status="done">done: checkpoint key format defined once (NVFP4 + FP8)</span> ·
+<span data-status="done">done: B200 environment built, sm_100 verified on card</span> ·
+<span data-status="done">done: NVFP4 load contract unified + verified</span> ·
 <span data-status="done">done: first loss produced (4.79, tp1/ep4)</span> ·
 <span data-status="done">done: 6 candidate causes eliminated by measurement</span> ·
 <span data-status="open">open: step-1 row-aligned NaN in the expert backward</span> ·
@@ -53,9 +55,11 @@ detail in the 2026-08-29 sections below and the prior git history of this report
 the model requested per-expert keys (<code>mlp.experts.experts.96.linear_fc1.weight_w</code>) while the
 converter stored fused-indexed families (<code>mlp.experts.linear_fc1.weight96_w/_v</code> +
 <code>weight_quantizer._scale96</code>). Diagnosis:</p>
-<ol><li><strong>The converter's names are canonical.</strong> <code>convert_nvfp4_checkpoint_direct.py</code> builds a plain<p>Megatron meta model (single rank), applies ModelOpt NVFP4 to that skeleton, and uses its
-sharded state dict as the on-disk schema — matching, name for name, the contract documented in
-<code>orbit/quant/nvfp4_utils.py</code>.</p></li><li><strong>The trainer's shape was an accident.</strong> The fork's <code>orbit-seam(modelopt)</code> in<p><code>bridge/training/checkpointing.py</code> restores a checkpoint's <code>modelopt_state/</code> directory
+<ol><li><strong>The converter's names are canonical.</strong> <code>convert_nvfp4_checkpoint_direct.py</code> emits keys that<p>match, name for name, the contract documented in <code>orbit/quant/nvfp4_utils.py</code>. (Wave 4 corrects
+how: the ModelOpt-reshaped model's sharded state dict is only an intermediate template for
+<code>prepare_empty_model_state</code> and matches the checkpoint on almost nothing; the on-disk names come
+from <code>build_megatron_nvfp4_weight_entries</code> / <code>build_fused_nvfp4_weight_entries</code>, which live in
+the same contract module the reader uses.)</p></li><li><strong>The trainer's shape was an accident.</strong> The fork's <code>orbit-seam(modelopt)</code> in<p><code>bridge/training/checkpointing.py</code> restores a checkpoint's <code>modelopt_state/</code> directory
 <strong>unconditionally</strong> (no config gate) before building the load schema. The restored per-expert
 module layout emits keys that exist nowhere on disk. <code>restore_modelopt_state=True</code> in the
 entrypoint was a red herring — the seam fires on checkpoint content alone.</p></li><li><strong>The intended loader existed but had no caller.</strong> <code>transform_sharded_state_dict_for_nvfp4</code> +<p><code>register_nvfp4_buffers_after_load</code> (grouped experts) and the <code>_dense</code> pair implement exactly
@@ -75,7 +79,7 @@ to match the trainer's accidental layout (chains the format to ModelOpt internal
 proven RL consumer), and a standalone declarative schema (a second source of truth).</p></p>
 </aside>
 <p>Implementation (commits <code>52b54eb6</code> wiring, <code>70bf69ed</code> library fix, <code>6d61cc04</code> diagnostics, all
-pushed to <code>origin/feature/relocate-conversion-scripts</code>; wave 3 adds <code>e5a1dbeb</code>. The next section
+pushed to <code>origin/feature/relocate-conversion-scripts</code>; wave 3 adds <code>e5a1dbeb</code>, wave 4 adds <code>155c15a2</code>, <code>92b37e9a</code>, <code>ce4cd3d6</code> and <code>1aa4b3eb</code>. The next section
 summarizes their content so this report is reviewable without repository access):</p>
 <ul><li><code>install_nvfp4_checkpoint_load_patches()</code> in <code>_qoft_common.py</code>, shaped identically to the INT4<p>installer: plain bf16 meta build, dense+expert transforms applied in <code>_generate_model_state_dict</code>,
 packed expert buffers + dense bf16 dequantization in <code>_load_model_state_dict</code>, the ModelOpt
@@ -278,6 +282,63 @@ comparing against a BF16 OFT run once one of the three blockers above is cleared
 anomalous, the version-dependence says to look for an uninitialized read in the dense adapter's
 backward, not in the forward or the weights.</p></p>
 </aside>
+<h2 id="wave-4-2026-08-30-the-key-format-gets-one-definition-and-the-hardware-question">Wave 4 (2026-08-30): the key format gets one definition, and the hardware question<a class="anchor" href="#wave-4-2026-08-30-the-key-format-gets-one-definition-and-the-hardware-question" aria-hidden="true">#</a></h2>
+<h3 id="blackwell-versus-hopper">Blackwell versus Hopper<a class="anchor" href="#blackwell-versus-hopper" aria-hidden="true">#</a></h3>
+<p>Every run in waves 1–3 was on <strong>H200 — compute capability 9.0, no FP4 tensor cores at all</strong>. That
+does not invalidate the results, because this path never asks the hardware for FP4 math: dense
+weights are dequantized to bf16 at load and grouped experts are dequantized per expert before a
+plain <code>F.linear</code>. Wave 2 also removed the <code>bf16_with_nvfp4_mixed</code> preset, which <em>would</em> have
+requested TE FP4 GEMMs and was never viable on Hopper.</p>
+<p>It does mean the format has never been validated on hardware that supports it natively. Condor has
+B200 (capability 10.0), and an environment now exists there:
+<code>/fast/zqiu/miles-tmp/envs/mbridge_b200</code>, Python 3.12 with <strong>torch 2.11.0+cu130</strong> verified on the
+card — <code>sm_100</code> present in the compiled arch list, capability <code>(10, 0)</code>, and a real 4096² bf16
+matmul returning finite values. modelopt 0.44.0, transformers 5.12.1 and energon 7.4.1 match the
+slurm stack; Transformer Engine 2.17.0 still needs its build to finish (<code>nccl.h</code> was the missing
+header — the existing orbit scripts <code>module load nccl</code> for exactly this).</p>
+<aside class="risk">
+<p class="block-label">Four cluster constraints worth knowing before repeating this</p>
+<p><strong>Inodes, not space.</strong> <code>/fast</code> ran out of file-count quota
+<p>(10,597,879 of 10,605,330) while 5 TB of space sat free; no Python environment can be created
+under that condition, and every conda failure was that wall in disguise, ending in
+<code>Errno 122</code>.<br>
+<strong>Lustre has no flock.</strong> uv cannot hold its cache locks on <code>/fast</code>
+(<code>os error 38</code>); the cache must live in home. This only surfaces on the first package
+needing an sdist build, so a wheels-only install looks fine and then fails later.<br>
+<strong>Login nodes cap thread creation.</strong> <code>mksquashfs</code> cannot run there, which
+kills container builds; heavy work belongs in an allocation.<br>
+<strong>B200 is contended.</strong> Two interactive allocations were evicted (SIGTERM) after
+15–27 minutes. Long work should be a batch job that tolerates eviction, not an interactive
+session.</p></p>
+</aside>
+<h3 id="the-checkpoint-key-format-now-has-one-definition">The checkpoint key format now has one definition<a class="anchor" href="#the-checkpoint-key-format-now-has-one-definition" aria-hidden="true">#</a></h3>
+<p>Wave 2 made the trainer read the converter's format. It did not stop the two sides from <em>describing</em>
+that format independently, and a measurement showed the description of the gap in this report's own
+wave-2 section was wrong: the converter never derived its on-disk names from the ModelOpt-reshaped
+model. That template is only an intermediate passed to <code>prepare_empty_model_state</code>; it matches the
+real checkpoint on almost nothing (12,288 missing, 55,776 extra). The actual names always came from
+<code>build_megatron_nvfp4_weight_entries</code> / <code>build_fused_nvfp4_weight_entries</code> — functions in the <em>same</em>
+contract module the reader uses.</p>
+<p>The real drift surface was smaller and more mundane: <strong>each side spelled the key format out by
+hand.</strong></p>
+<div class="codeblock"><div class="lang">text</div><pre><code>writer  low_precision/nvfp4.py   f"{prefix}.weight_quantizer._scale{expert_idx}"
+reader  quant/nvfp4_utils.py     f"{prefix}.weight_quantizer._scale{expert_global_idx}"</code></pre></div>
+<p><code>nvfp4_quantizer_entry_names()</code> and <code>nvfp4_weight_entry_names()</code> now state the format once and both
+sides call them (<code>155c15a2</code>). FP8 had the same problem worse — thirteen hand-written sites plus two
+regexes encoding the convention backwards, all inside one file — so <code>FP8_SCALE_INV_SUFFIX</code>,
+<code>FP8_SWIGLU_HALF_SUFFIXES</code> and <code>fp8_entry_names()</code> do the same there, with the regexes built from
+the same constants (<code>1aa4b3eb</code>). FP8 needed no writer-side unification: the HF FP8 checkpoint ships
+<code>weight_scale_inv</code> beside each weight, so the converter passes those through rather than
+synthesizing names.</p>
+<p>Both refactors are <strong>behaviour-neutral by measurement, not by inspection</strong>. A harness builds the
+reader's template and diffs it against the real 56,115-entry <code>qwen3-nvfp4-mcore</code> index; the numbers
+are identical before and after (contract vs checkpoint 5 missing / 432 extra). The FP8 change is
+verified by the unit tests added in <code>92b37e9a</code> — 5 passed, unchanged. <strong>No checkpoint needs
+regenerating.</strong></p>
+<p>The residual difference reconciles exactly: the 5 "missing" are homogeneous-layer keys the harness requests
+because it omits the <code>non_homogeneous_layers</code> metadata the installer detects, and they correspond to
+240 of the extras (5 families × 48 layers); the remaining 192 extras are <code>input_quantizer._amax</code>
+activation scales the file carries and this runtime never reads, because it computes in bf16.</p>
 <h3 id="also-captured-this-wave">Also captured this wave<a class="anchor" href="#also-captured-this-wave" aria-hidden="true">#</a></h3>
 <ul><li><strong>tp≥2 open item</strong>: mcore sharding validation rejects the transform's scalar quantizer entries<p>(<code>Invalid access pattern for ShardedTensor(key='…weight_quantizer._double_scale32', …
 local_shape=(), global_shape=())</code>) at tp2 — the <code>_replica_id_with_current_tp_rank</code> semantics
@@ -348,7 +409,7 @@ required for the quantized path on this environment but breaks any path whose at
 wave 2 NVFP4 ladder: jobs 5185–5199 (exec <code>20260829T235425Z-r2281915244</code>, labels
 <code>qoft-qwen3-nvfp4-train-r2</code> … <code>-r10-rankattr</code>). Mirrored on the workstation under the same
 suffix.</p>
-<footer class="doc-footer">Generated 2026-08-30 04:28 UTC by htmlreport</footer>
+<footer class="doc-footer">Generated 2026-08-30 14:03 UTC by htmlreport</footer>
 </main>
 </div>
 </div>
