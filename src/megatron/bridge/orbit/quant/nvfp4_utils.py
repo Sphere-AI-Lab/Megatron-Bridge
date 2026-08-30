@@ -29,8 +29,19 @@ from typing import Any, Dict
 
 import torch
 
+# Reuse INT4's shared helpers: the replica-id helper marks TP-replicated scalar
+# entries so the dist-ckpt loader sees one primary writer per TP rank rather
+# than every rank claiming to be the same primary; the payload + storage-view
+# helpers are byte-identical between INT4 and NVFP4 paths.
+from megatron.bridge.orbit.low_precision.int4 import (
+    _empty_storage_view,
+    _loaded_tensor_payload,
+    _replica_id_with_current_tp_rank,
+)
+
 # Re-exports for back-compat with code that imports from peft.nvfp4_utils.
 from megatron.bridge.orbit.low_precision.nvfp4 import (
+    NVFP4_GROUP_SIZE,
     apply_modelopt_nvfp4_to_meta_model,
     build_fused_nvfp4_weight_entries,
     build_megatron_nvfp4_weight_entries,
@@ -43,16 +54,7 @@ from megatron.bridge.orbit.low_precision.nvfp4 import (
     scale_to_amax,
     transform_sharded_state_dict_for_nvfp4_dense,
 )
-# Reuse INT4's shared helpers: the replica-id helper marks TP-replicated scalar
-# entries so the dist-ckpt loader sees one primary writer per TP rank rather
-# than every rank claiming to be the same primary; the payload + storage-view
-# helpers are byte-identical between INT4 and NVFP4 paths.
-from megatron.bridge.orbit.low_precision.int4 import (
-    _empty_storage_view,
-    _loaded_tensor_payload,
-    _replica_id_with_current_tp_rank,
-)
-from megatron.bridge.orbit.low_precision.nvfp4 import NVFP4_GROUP_SIZE
+
 
 __all__ = [
     "apply_modelopt_nvfp4_to_meta_model",
@@ -118,11 +120,7 @@ def transform_sharded_state_dict_for_nvfp4(
         skey = str(key)
 
         # Materialize meta-device tensors on CPU so the DCP planner can handle them.
-        if (
-            isinstance(value, ShardedTensor)
-            and value.data is not None
-            and value.data.device.type == "meta"
-        ):
+        if isinstance(value, ShardedTensor) and value.data is not None and value.data.device.type == "meta":
             value.data = torch.empty(value.local_shape, dtype=value.dtype, device="cpu")
 
         canonical = _canonicalize_expert_key_for_checkpoint(skey)
@@ -209,9 +207,14 @@ def transform_sharded_state_dict_for_nvfp4(
         # global expert index (e.g. EP rank 1 of 4 with 96 local experts maps
         # local weight0 -> global weight96). Use the prepend axis's global_offset
         # entry when present, otherwise the literal digit from the runtime key.
-        expert_global_idx = (
-            sh_ten.global_offset[prepend - 1] if prepend > 0 else int(m.group(2))
-        )
+        expert_global_idx = sh_ten.global_offset[prepend - 1] if prepend > 0 else int(m.group(2))
+        # Runtime dict keys must stay in the LOCAL index space: the post-load
+        # register step groups entries by the index parsed from the dict key,
+        # and the grouped kernels read buffers by local gemm index. Only the
+        # on-disk ``key`` fields use the global index. Mixing the two spaces
+        # left every EP rank except rank 0 with weight halves and quantizer
+        # scales in different groups (experts registered without scales).
+        expert_local_idx = int(m.group(2))
 
         # ``prefix`` is extracted from the canonical-matched regex, so it is
         # already canonicalized. Use it uniformly for both the runtime dict
@@ -228,9 +231,7 @@ def transform_sharded_state_dict_for_nvfp4(
                 ckpt_key = f"{prefix}.weight{expert_global_idx}{half_suffix}"
                 new_st = ShardedTensor(
                     key=ckpt_key,
-                    data=torch.empty(
-                        (local_out // 2, half_in), dtype=torch.uint8, device="cpu"
-                    ),
+                    data=torch.empty((local_out // 2, half_in), dtype=torch.uint8, device="cpu"),
                     dtype=torch.uint8,
                     local_shape=(local_out // 2, half_in),
                     global_shape=(global_out // 2, global_half_in),
@@ -248,9 +249,7 @@ def transform_sharded_state_dict_for_nvfp4(
             ckpt_key = f"{prefix}.weight{expert_global_idx}"
             new_st = ShardedTensor(
                 key=ckpt_key,
-                data=torch.empty(
-                    (local_out, half_in), dtype=torch.uint8, device="cpu"
-                ),
+                data=torch.empty((local_out, half_in), dtype=torch.uint8, device="cpu"),
                 dtype=torch.uint8,
                 local_shape=(local_out, half_in),
                 global_shape=(global_out, global_half_in),
@@ -269,9 +268,7 @@ def transform_sharded_state_dict_for_nvfp4(
         global_scale_cols = global_in // NVFP4_GROUP_SIZE
         scale_st = ShardedTensor(
             key=f"{prefix}.weight_quantizer._scale{expert_global_idx}",
-            data=torch.empty(
-                (local_out, scale_cols), dtype=torch.float8_e4m3fn, device="cpu"
-            ),
+            data=torch.empty((local_out, scale_cols), dtype=torch.float8_e4m3fn, device="cpu"),
             dtype=torch.float8_e4m3fn,
             local_shape=(local_out, scale_cols),
             global_shape=(global_out, global_scale_cols),
@@ -281,7 +278,7 @@ def transform_sharded_state_dict_for_nvfp4(
             prepend_axis_num=0,
             allow_shape_mismatch=True,
         )
-        new_sd[f"{prefix}.weight_quantizer._scale{expert_global_idx}"] = scale_st
+        new_sd[f"{prefix}.weight_quantizer._scale{expert_local_idx}"] = scale_st
 
         for scalar_suffix in ("_double_scale", "_amax"):
             scalar_st = ShardedTensor(
@@ -298,9 +295,7 @@ def transform_sharded_state_dict_for_nvfp4(
                 prepend_axis_num=0,
                 allow_shape_mismatch=True,
             )
-            new_sd[
-                f"{prefix}.weight_quantizer.{scalar_suffix}{expert_global_idx}"
-            ] = scalar_st
+            new_sd[f"{prefix}.weight_quantizer.{scalar_suffix}{expert_local_idx}"] = scalar_st
 
     return new_sd
 
@@ -371,9 +366,7 @@ def register_nvfp4_buffers_after_load(
             ("amax", f"weight_amax{idx}"),
         ):
             if src_name in parts:
-                module.register_buffer(
-                    dest_name, _loaded_tensor_payload(parts[src_name]), persistent=True
-                )
+                module.register_buffer(dest_name, _loaded_tensor_payload(parts[src_name]), persistent=True)
 
         # Empty the bf16 weight{idx} Parameter (placeholder; runtime uses buffers).
         weight_name = f"weight{idx}"
@@ -395,6 +388,4 @@ def register_nvfp4_buffers_after_load(
         if base_w is not None and hasattr(base_w, "data"):
             base_w.data = _empty_storage_view(base_w.data)
 
-    print(
-        f"[NVFP4 expert register] Registered NVFP4 buffers for {registered} expert weights"
-    )
+    print(f"[NVFP4 expert register] Registered NVFP4 buffers for {registered} expert weights")
