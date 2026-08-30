@@ -122,7 +122,8 @@ Each of these was confirmed by reading both trees.
    `megatron.core.tensor_parallel.layers` and
    `megatron.core.extensions.transformer_engine`. It is idempotent (guards on
    `__name__ == "_patched_init_affine"`). This is the one genuine
-   extractability wart; must be re-verified against mcore `5c7968af`.
+   extractability wart. Both patch targets were **verified present** in mcore
+   `235952df` — see §8.
 
 5. **Two seam imports are unguarded**, on the checkpoint-resume path:
    `checkpointing.py:3008` and `post_training/checkpointing.py:162`. Deleting
@@ -157,11 +158,13 @@ Each of these was confirmed by reading both trees.
 
 ## 6. Decisions taken (from the user)
 
-- **mcore:** use radixark's pin `5c7968af`. Orbit must work against it.
-- **TE:** use radixark's pin `f031cf87`. Therefore
-  `orbit/oft/te_oft/te_oft_layernorm_linear.py` (a copy of TE's
-  `LayerNormLinear`, currently pinned to "TE 2.13.0+28777046, updated for
-  2.14.0") must be **adapted to f031cf87**, not gated off.
+- **mcore:** use the user's checkout `/home/kerryliu/Megatron-LM-RadixArk`
+  @ `235952df` (radixark's `miles-main`), **not** the `5c7968af` pyproject pin.
+  Orbit must work against it — verified clean, §8.
+- **TE:** use the user's checkout `/home/kerryliu/TransformerEngine`
+  @ `f031cf87` (= tag v2.14), which matches radixark's pin. The user ruled out
+  gating off the TE-OFT path, so `orbit/oft/te_oft/te_oft_layernorm_linear.py`
+  had to work against f031cf87 — and §8 shows it already does, unchanged.
 - **Seams:** stay as close to radixark as possible; minimal, clearly marked,
   and made optional so radixark runs without orbit.
 - **Delivery:** curated commit series + a seam manifest.
@@ -185,18 +188,51 @@ What we still keep, because it helps us rather than because a policy says so:
 - Keep orbit inside its own namespaces. Not style: this is the entire point of
   the migration (see §1).
 
-## 8. Open verification gap
+## 8. Dependency verification — CLOSED
 
-The `3rdparty/Megatron-LM` submodule is **not checked out** in either repo
-(0 files), so orbit's ~29 `megatron.core` dependencies were never verified
-against radixark's pin `5c7968af`. A blobless bare clone was started at
-`/tmp/mlm.git`. Highest-risk symbols to check first:
+The `3rdparty/Megatron-LM` submodule is not checked out in either repo, so
+verification used the two standalone clones the user provided under `$HOME`.
+**These are the authoritative versions** — use them, not the pyproject pins.
 
-- `megatron.core.quantization.quant_config` (whole module — newest, most likely absent)
-- `megatron.core.tensor_parallel.layers._initialize_affine_weight_cpu` (monkeypatch target)
-- `megatron.core.extensions.transformer_engine._initialize_affine_weight_cpu` (monkeypatch target)
-- `megatron.core.extensions.transformer_engine._get_fp8_autocast_for_quant_params`
-- `megatron.core.transformer.torch_norm`, `transformer.moe.router`,
-  `process_groups_config`, `dist_checkpointing.strategies`
+| Dep | Path | Commit | Notes |
+| --- | --- | --- | --- |
+| Megatron-Core | `/home/kerryliu/Megatron-LM-RadixArk` | `235952df` | branch `miles-main`, 2026-08-20, remote `github.com/radixark/Megatron-LM`. **1065 commits ahead** of the `5c7968af` pyproject pin (which is an ancestor). Spherelab's pin `731b7914` is not in this clone. |
+| TransformerEngine | `/home/kerryliu/TransformerEngine` | `f031cf87` | **= tag `v2.14`**, 2026-04-06. Matches radixark's pin. |
 
-Nothing has been executed. No Python has been run. All findings are static.
+### mcore result: clean
+
+- All 5 high-risk symbols present:
+  `megatron/core/quantization/quant_config.py` exists;
+  `_initialize_affine_weight_cpu` at `tensor_parallel/layers.py:157` and
+  imported at `extensions/transformer_engine.py:43`;
+  `_get_fp8_autocast_for_quant_params` at `extensions/transformer_engine.py:355`;
+  `_get_custom_recipe` at `fp8_utils.py:330`.
+- All 32 `megatron.core` modules orbit imports resolve.
+- All 56 module/symbol pairs resolve. The 3 initially flagged were
+  submodule-import false positives (`from megatron.core import
+  dist_checkpointing`, `...strategies import torch as torch_dist_strategy`,
+  `from megatron.core.distributed import distributed_data_parallel`) — all
+  confirmed present as a package dir or module file.
+
+Risk is far lower than originally feared: this mcore is contemporary with
+spherelab's, not the 4-month-old pin. Blocker #4 (the monkeypatch) is
+therefore safe as written, though it remains the one extractability wart.
+
+### TE result: clean, and C5 is a no-op
+
+- All 39 TE internal imports in `orbit/oft/te_oft/te_oft_layernorm_linear.py`
+  resolve against v2.14. (`cpp_extensions.general_gemm` lives in
+  `cpp_extensions/gemm.py` and is star-re-exported via its `__all__`.)
+- `_OFTLayerNormLinear.forward` signature matches TE v2.14's
+  `_LayerNormLinear.forward` exactly, including the `non_tensor_args: Tuple`
+  packing style, plus the one OFT addition (`adapter_fn`).
+- The 41-field `non_tensor_args` tuple is **field-for-field identical** at both
+  the unpack site (orbit:164 / TE:98) and the pack site (orbit:672 / TE:1546).
+  Only difference is `self.` → `mod.`, because orbit's is a free function
+  taking the module.
+
+**Conclusion:** the vendored file's header ("updated for TE 2.14.0") is
+accurate. Commit C5 needs no adaptation work — copy the file as-is.
+
+Everything above is static analysis. No Python has been executed; no GPU
+verification has been done (that is Phase 3, handed to the user).

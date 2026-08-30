@@ -7,26 +7,26 @@ Read `MIGRATION_MEMORY.md` first — it holds the verified facts this plan rests
 on. This file is only the execution order.
 
 Guiding rule: **radixark is upstream.** When orbit and radixark disagree, orbit
-changes. Never edit a radixark file to suit orbit unless it is one of the three
-declared seams.
+changes. Never edit a radixark file to suit orbit unless it is one of the four
+declared seam hunks (3 files).
 
-## Phase 0 — close the verification gap (no commits)
+## Phase 0 — verification gap — DONE
 
-Blocking. Do this before writing any code.
+Verified against the user's authoritative standalone checkouts, **not** the
+submodule pins: `/home/kerryliu/Megatron-LM-RadixArk` @ `235952df` and
+`/home/kerryliu/TransformerEngine` @ `f031cf87` (= tag v2.14).
 
-1. Check out mcore at radixark's pin:
-   `git submodule update --init 3rdparty/Megatron-LM` (yields `5c7968af`).
-2. Verify the high-risk `megatron.core` surface listed in
-   `MIGRATION_MEMORY.md` §8. Static grep only, no execution.
-3. Check out TransformerEngine at `f031cf87` and diff its
-   `pytorch/module/layernorm_linear.py` against
-   `orbit/oft/te_oft/te_oft_layernorm_linear.py` (which is a copy of TE
-   2.13/2.14). This scopes commit C5.
-4. Record results back into `MIGRATION_MEMORY.md` §8.
+Both came back clean — full results in `MIGRATION_MEMORY.md` §8:
 
-If `megatron.core.quantization.quant_config` is absent at `5c7968af`, stop and
-decide: vendor a shim into `orbit/quant/`, or gate the NVFP4 path. Do not bump
-the submodule pin — that contradicts the mcore decision.
+- mcore: all 32 modules and all 56 symbol pairs orbit imports resolve,
+  including both `_initialize_affine_weight_cpu` monkeypatch targets.
+- The `quant_config` contingency did **not** fire —
+  `megatron/core/quantization/quant_config.py` is present, so no shim and no
+  NVFP4 gating is needed.
+- TE: all 39 internal imports resolve, and orbit's vendored
+  `te_oft_layernorm_linear.py` is field-for-field identical to v2.14's
+  `_LayerNormLinear` (41-field `non_tensor_args` tuple matches at both the
+  pack and unpack sites). **C5 needs no adaptation.**
 
 ## Phase 1 — the commit series
 
@@ -41,7 +41,7 @@ waived for this work.
 | C2 | `[quant] feat: add orbit low-precision core and quant utilities` | `orbit/quant/**`, `orbit/low_precision/**`. Includes the **vendored** `dequantize_int4` / `quantize_to_int4` (blocker #2) |
 | C3 | `[peft] feat: add orbit PEFT extensions for quantized bases` | `orbit/peft_ext/**`, with the `_base_returns_tuple` branches removed (blocker #1) |
 | C4 | `[peft] feat: add orbit OFT method, layers, and Triton kernels` | `orbit/oft/**` except `te_oft/`; **omit** the 3 dead `ref_*.py` |
-| C5 | `[peft] feat: adapt orbit TE LayerNormLinear OFT path to TE f031cf87` | `orbit/oft/te_oft/`; scoped by Phase 0 step 3; replace the `exit(1)` ImportError handler with a raise |
+| C5 | `[peft] feat: add orbit TE LayerNormLinear OFT path` | `orbit/oft/te_oft/`; already matches TE v2.14 per Phase 0, so a straight copy — only change is replacing the `exit(1)` ImportError handler with a raise |
 | C6 | `[ckpt] feat: add orbit conversion mixins and quantized model bridges` | `orbit/conversion/**` (**omit** `nccl_byte_view.py`), `orbit/model_bridges/**` |
 | C7 | `[training] feat: add orbit ModelOpt checkpoint helpers and PEFT reports` | `orbit/training/**` |
 | C8 | `[training, ckpt] feat: add four optional orbit seams` | The only radixark files touched — 4 hunks across 3 files. See `UPSTREAM_SEAMS.md` |
@@ -83,6 +83,9 @@ The migration is not done until all four hold:
    to be required, flag it rather than sneaking it in.
 
 ## Phase 3 — verification (user, on GPU)
+
+Run against `/home/kerryliu/Megatron-LM-RadixArk` @ `235952df` and
+`/home/kerryliu/TransformerEngine` @ `f031cf87`, not the submodule pins.
 
 Nothing in Phases 0–2 executes Python. Hand off with this order, cheapest first:
 
