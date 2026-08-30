@@ -295,13 +295,36 @@ Confirmed in code, and it reframes the risk ranking:
   `_fp8_activation_qdq_per_token_group_ste`, applies to *activations* in the OFT
   FP8 path.
 
-**Consequence: blocker #6 is the top Phase 3 priority**, above the conversion
-and finetune smoke tests. If the base is frozen buffers, the adapter *is* 100%
-of the training result, so radixark's `AdapterWrapper.sharded_state_dict`
-lacking spherelab's `_plain_module_sharded_state_dict` fallback could silently
-drop delta-only adapter weights — a run that reports success but writes an empty
-adapter. Blocker #7 (`share_expert_adapters` default flip) likewise changes the
-trainable parameter count for MoE, not just behaviour.
+**Consequence: adapter-only saving is the highest-consequence unknown.** If the
+base is frozen buffers, the adapter *is* 100% of the training result, so any
+save path that drops adapter weights yields a run that reports success and
+writes nothing useful.
+
+But the specific mechanism blocker #6 names does **not** apply to orbit, and an
+earlier draft of this section overstated it. radixark's
+`AdapterWrapper.sharded_state_dict` (`peft/adapter_wrapper.py:192-222`) calls
+`self.to_wrap.sharded_state_dict(...)` and `self.adapter.sharded_state_dict(...)`
+unconditionally, where spherelab had a `_plain_module_sharded_state_dict`
+fallback — but every orbit `AdapterWrapper` path supplies the method:
+
+- orbit never uses `LinearAdapter` or `patch_linear_module` (grep: no hits);
+- `OFTRotationModule` defines its own `sharded_state_dict`
+  (`oft/oft_layers.py:616`) despite subclassing plain `nn.Module`;
+- `Int4LoRA` reuses upstream's `ParallelLinearAdapter`, which has it;
+- `to_wrap` is always a Megatron parallel linear, which has it.
+
+**The real exposure is narrower and elsewhere.** `CanonicalOFT.transform` can
+return `OFTLinearSplitQKV`, `OFTLinearSplitFC1UpGate`, or
+`OFTLinearGroupedSplitFC1UpGate` (`canonical_oft.py:1507-1538`). These are plain
+`nn.Module` *replacements* for the target module, not `AdapterWrapper`
+subclasses, so radixark's method never runs for them — and `canonical_oft.py`
+defines no `sharded_state_dict` at all. Whether their `oft_r` parameters reach
+the checkpoint therefore depends on how mcore's sharded-state-dict traversal
+treats a plain `nn.Module` child. That is a runtime question; settle it by
+training a CanonicalOFT split-QKV/split-FC1 config for a few steps, saving, and
+grepping the checkpoint for `oft_r` keys. Blocker #7
+(`share_expert_adapters` default flip) likewise changes the trainable parameter
+count for MoE, not just behaviour.
 
 ### Seam notes
 
