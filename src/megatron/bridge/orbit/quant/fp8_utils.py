@@ -28,12 +28,53 @@ import torch
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 FP8_WEIGHT_BLOCK_SIZE = 128
 
+# --------------------------------------------------------------------------- #
+# The FP8 checkpoint key format
+# --------------------------------------------------------------------------- #
+
+# FP8 stores each weight next to a block-scale sibling, and a SwiGLU linear_fc1
+# additionally stores its gate and up halves separately. Both the transform that
+# requests these entries and the post-load step that consumes them must agree on
+# the spelling; defining the suffixes once is what keeps them from drifting.
+FP8_SCALE_INV_SUFFIX = "_scale_inv"
+FP8_SWIGLU_HALF_SUFFIXES = ("_w", "_v")
+
+
+def fp8_entry_names(weight_key: str, *, swiglu: bool = False) -> dict[str, str]:
+    """Canonical on-disk names for one FP8 weight and its block-scale sibling.
+
+    This is the single definition of the FP8 checkpoint key format. Anything
+    that spells these keys out by hand is a drift waiting to happen: a
+    disagreement between the names stored and the names requested surfaces as an
+    opaque distributed-checkpoint KeyError that reads like a corrupt file.
+
+    Args:
+        weight_key: Fully qualified weight key, e.g.
+            ``decoder.layers.0.mlp.experts.linear_fc1.weight3``.
+        swiglu: Whether the weight is a fused SwiGLU gate+up projection, whose
+            halves are stored separately.
+
+    Returns:
+        Mapping of role (``weight`` or ``weight_w``/``weight_v``, plus
+        ``scale_inv``) to its canonical checkpoint key.
+    """
+    names = {"scale_inv": f"{weight_key}{FP8_SCALE_INV_SUFFIX}"}
+    if swiglu:
+        names["weight_w"] = f"{weight_key}{FP8_SWIGLU_HALF_SUFFIXES[0]}"
+        names["weight_v"] = f"{weight_key}{FP8_SWIGLU_HALF_SUFFIXES[1]}"
+    else:
+        names["weight"] = weight_key
+    return names
+
+
 _GROUPED_EXPERT_WEIGHT_RE = re.compile(r"^(.*\.experts\.linear_fc[12])\.weight(\d+)$")
 _GROUPED_EXPERT_BASE_WEIGHT_RE = re.compile(r"^.*\.experts\.linear_fc[12]\.weight$")
-_GROUPED_EXPERT_SCALE_INV_RE = re.compile(r"^(.*\.experts\.linear_fc[12])\.weight(\d+)_scale_inv$")
+_GROUPED_EXPERT_SCALE_INV_RE = re.compile(rf"^(.*\.experts\.linear_fc[12])\.weight(\d+){FP8_SCALE_INV_SUFFIX}$")
 _GROUPED_EXPERT_SPLIT_WEIGHT_RE = re.compile(r"^(.*\.experts\.linear_fc1)\.weight(\d+)_([wv])$")
 _DIRECT_FP8_LINEAR_WEIGHT_RE = re.compile(r"^(.*\.(?:linear_qkv|linear_proj|linear_fc1|linear_fc2))\.weight$")
-_DIRECT_FP8_SCALE_INV_RE = re.compile(r"^(.*\.(?:linear_qkv|linear_proj|linear_fc1|linear_fc2))\.weight_scale_inv$")
+_DIRECT_FP8_SCALE_INV_RE = re.compile(
+    rf"^(.*\.(?:linear_qkv|linear_proj|linear_fc1|linear_fc2))\.weight{FP8_SCALE_INV_SUFFIX}$"
+)
 _DIRECT_FP8_SPLIT_WEIGHT_RE = re.compile(r"^(.*\.linear_fc1)\.weight_([wv])$")
 
 
@@ -251,7 +292,7 @@ def transform_sharded_state_dict_for_fp8(
         if isinstance(value, ShardedTensorFactory) and ".linear_fc1." in canonical_key:
             same_key_splits = all(sub.key == value.key for sub in sub_sh_tens[:2])
             for suffix, sub_sh_ten in zip(("w", "v"), sub_sh_tens[:2]):
-                split_key = f"{canonical_key}_{suffix}"
+                split_key = f"{canonical_key}_{suffix}"  # suffix from FP8_SWIGLU_HALF_SUFFIXES
                 new_sd[split_key] = _direct_split_sharded_tensor(
                     f"{ckpt_key}_{suffix}",
                     sub_sh_ten,
@@ -260,13 +301,13 @@ def transform_sharded_state_dict_for_fp8(
                 )
             _add_scale_entry(
                 new_sd,
-                f"{canonical_key}_scale_inv",
+                fp8_entry_names(canonical_key)["scale_inv"],
                 sh_ten,
                 weight_local_shape,
                 weight_global_shape,
                 weight_global_offset,
                 weight_axis_fragmentations,
-                checkpoint_key=f"{ckpt_key}_scale_inv",
+                checkpoint_key=fp8_entry_names(ckpt_key)["scale_inv"],
             )
             processed_keys.add(canonical_key)
             continue
@@ -285,13 +326,13 @@ def transform_sharded_state_dict_for_fp8(
 
         _add_scale_entry(
             new_sd,
-            f"{canonical_key}_scale_inv",
+            fp8_entry_names(canonical_key)["scale_inv"],
             sh_ten,
             weight_local_shape,
             weight_global_shape,
             weight_global_offset,
             weight_axis_fragmentations,
-            checkpoint_key=f"{ckpt_key}_scale_inv",
+            checkpoint_key=fp8_entry_names(ckpt_key)["scale_inv"],
         )
         processed_keys.add(canonical_key)
 
@@ -317,7 +358,7 @@ def transform_sharded_state_dict_for_fp8(
                 split_factor = fused_local_out // split_local_out
                 same_key_splits = all(sub.key == value.key for sub in sub_sh_tens[:2])
                 for suffix, sub_sh_ten in zip(("w", "v"), sub_sh_tens[:2]):
-                    split_key = f"{canonical_key}_{suffix}"
+                    split_key = f"{canonical_key}_{suffix}"  # suffix from FP8_SWIGLU_HALF_SUFFIXES
                     new_sd[split_key] = _direct_split_sharded_tensor(
                         split_key,
                         sub_sh_ten,
@@ -350,7 +391,7 @@ def transform_sharded_state_dict_for_fp8(
                 )
                 _add_scale_entry(
                     new_sd,
-                    f"{canonical_key}_scale_inv",
+                    fp8_entry_names(canonical_key)["scale_inv"],
                     sh_ten,
                     fused_local_shape,
                     fused_global_shape,
@@ -367,7 +408,7 @@ def transform_sharded_state_dict_for_fp8(
         weight_global_shape = tuple(sh_ten.global_shape[prepend:])
         weight_global_offset = tuple(sh_ten.global_offset[prepend:])
         new_sd[canonical_key] = ShardedTensor(
-            key=f"{canonical_key}_w",
+            key=fp8_entry_names(canonical_key, swiglu=True)["weight_w"],
             data=torch.empty(weight_local_shape, dtype=sh_ten.dtype, device="cpu"),
             dtype=sh_ten.dtype,
             local_shape=weight_local_shape,
@@ -379,7 +420,7 @@ def transform_sharded_state_dict_for_fp8(
         )
         _add_scale_entry(
             new_sd,
-            f"{canonical_key}_scale_inv",
+            fp8_entry_names(canonical_key)["scale_inv"],
             sh_ten,
             weight_local_shape,
             weight_global_shape,
@@ -442,7 +483,11 @@ def register_fp8_scale_inv_buffers_after_load(
         for attr in module_path.split("."):
             module = getattr(module, attr)
 
-        buffer_name = f"weight{match.group(2)}_scale_inv" if match is not None else "weight_scale_inv"
+        buffer_name = (
+            fp8_entry_names(f"weight{match.group(2)}")["scale_inv"]
+            if match is not None
+            else fp8_entry_names("weight")["scale_inv"]
+        )
         payload = _loaded_tensor_payload(value).to(dtype=torch.float32)
         weight_name = f"weight{match.group(2)}" if match is not None else "weight"
         weight = getattr(module, weight_name, None)
@@ -461,15 +506,15 @@ def register_fp8_scale_inv_buffers_after_load(
         if not {"w", "v"}.issubset(parts):
             continue
         loaded_state_dict[f"{module_path}.weight{weight_idx}"] = torch.cat([parts["w"], parts["v"]], dim=0)
-        loaded_state_dict.pop(f"{module_path}.weight{weight_idx}_w", None)
-        loaded_state_dict.pop(f"{module_path}.weight{weight_idx}_v", None)
+        loaded_state_dict.pop(fp8_entry_names(f"{module_path}.weight{weight_idx}", swiglu=True)["weight_w"], None)
+        loaded_state_dict.pop(fp8_entry_names(f"{module_path}.weight{weight_idx}", swiglu=True)["weight_v"], None)
 
     for module_path, parts in dense_split_weights.items():
         if not {"w", "v"}.issubset(parts):
             continue
         loaded_state_dict[f"{module_path}.weight"] = torch.cat([parts["w"], parts["v"]], dim=0)
-        loaded_state_dict.pop(f"{module_path}.weight_w", None)
-        loaded_state_dict.pop(f"{module_path}.weight_v", None)
+        loaded_state_dict.pop(fp8_entry_names(f"{module_path}.weight", swiglu=True)["weight_w"], None)
+        loaded_state_dict.pop(fp8_entry_names(f"{module_path}.weight", swiglu=True)["weight_v"], None)
 
     return registered
 

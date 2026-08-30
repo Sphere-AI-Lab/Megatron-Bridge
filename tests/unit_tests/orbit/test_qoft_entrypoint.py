@@ -65,7 +65,7 @@ def test_build_config_accepts_dense_qwen3_fp8(tmp_path: Path) -> None:
     )
     arch_spec = entrypoint.resolve_arch(str(hf_model_path))
     entrypoint._fill_arch_defaults(args, arch_spec)
-    config = entrypoint.build_config(args, arch_spec)
+    entrypoint.build_config(args, arch_spec)
 
     assert arch_spec["key"] == "qwen3_dense"
     assert args.tp == 1
@@ -86,9 +86,7 @@ def test_fp8_explicit_checkpoint_requests_per_layer_state_dict() -> None:
         checkpoint_keys,
     )
 
-    assert result == {
-        "metadata": {"dp_cp_group": "preserved", "non_homogeneous_layers": True}
-    }
+    assert result == {"metadata": {"dp_cp_group": "preserved", "non_homogeneous_layers": True}}
     assert original_kwargs == {"metadata": {"dp_cp_group": "preserved"}}
 
 
