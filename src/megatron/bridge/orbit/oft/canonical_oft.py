@@ -47,7 +47,7 @@ from megatron.bridge.orbit.peft_ext.meta_init import to_empty_if_meta_device
 from megatron.bridge.orbit.peft_ext.peft_mixin import OrbitPEFTMixin
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
-from megatron.bridge.peft.utils import is_expert_linear
+from megatron.bridge.peft.utils import is_expert_linear, is_grouped_expert_linear
 from megatron.bridge.utils.import_utils import safe_import_from
 
 
@@ -1402,8 +1402,16 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
 
     Parallel to ``CanonicalLoRA``: independent rotations are attached to each of
     Q/K/V (for the fused ``linear_qkv``) and to each of gate/up (for the fused
-    ``linear_fc1``). Non-fused targets (``linear_proj``, ``linear_fc2``, expert
-    linears) use plain ``OFTLinear`` with a single rotation.
+    ``linear_fc1``). ``linear_proj`` and dense ``linear_fc2`` use plain
+    ``OFTLinear`` with a single rotation.
+
+    Grouped MoE experts: ``experts.linear_fc1`` gets *per-expert* gate/up
+    rotations (``OFTLinearGroupedSplitFC1UpGate`` over ``GroupedOFTRotation``),
+    while ``experts.linear_fc2`` uses a single rotation shared by every local
+    expert. This asymmetry is a known limitation, present since the original
+    implementation: fc1's ``oft_r`` is replicated, whereas fc2 is RowParallel so
+    its blocks are TP-sharded, which makes per-expert 3D ``oft_r`` there
+    materially harder.
 
     Args:
         target_modules: HF-style split names. Must NOT contain ``linear_qkv`` or
@@ -1545,7 +1553,7 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
             is_expert=is_expert,
         )
 
-        if matched_pattern.endswith("linear_fc1") and full_name.endswith(".mlp.experts.linear_fc1"):
+        if matched_pattern.endswith("linear_fc1") and is_grouped_expert_linear(full_name):
             logger.info("CanonicalOFT: OFTLinearGroupedSplitFC1UpGate at %s", full_name)
             return OFTLinearGroupedSplitFC1UpGate(module, **kwargs)
 

@@ -395,6 +395,76 @@ path ever misbehaves.
 **Standing rule from the user:** do not add fallbacks. If one seems necessary,
 surface it for review first.
 
+### Qwen dense/MoE OFT+LoRA path review — findings
+
+Traced `CanonicalOFT` (the default) end to end for Qwen3 dense and Qwen3-30B-A3B.
+
+**Dense path looks correct.** Verified statically:
+
+- The split-QKV GQA arithmetic (`canonical_oft.py:1182`) is right. Qwen3-30B-A3B
+  (32 heads / 4 KV / head_dim 128) at TP=4 → `packed_units=10`,
+  `units_per_group=10` → one local group of 8Q+K+V = 1280 rows. Qwen3-8B
+  (32/8/128) checks out at TP=1/2/4/8.
+- `_split_qkv_weight` and `_interleave_qkv` are exact inverses over Megatron's
+  per-query-group interleaved layout.
+- `to_wrap.bias` is already in that interleaved order, so `out + bias`
+  (`canonical_oft.py:1319`) lines up; `skip_bias_add` defers correctly.
+- `oft_r` is zero-init in both rotation classes → `R = I` at step 0, so the
+  adapted model starts equal to the base. Confirmed on GPU: `Cayley(0) == I` exactly.
+
+**MoE findings — all inherited. #1 is a design limitation; #2 and #3 are genuine
+checkpoint concerns, left unfixed because they need MoE-capable hardware:**
+
+1. **fc1/fc2 per-expert asymmetry — a known limitation, NOT a bug.** The grouped
+   branch exists only for `linear_fc1`; `experts.linear_fc2` falls through to plain
+   `OFTLinear`, whose forward applies one rotation to the whole concatenated token
+   stream (`oft_layers.py:894`). So fc1 gets per-expert rotations and fc2 gets a
+   single shared one.
+
+   Git archaeology settles the intent: commit `85c84cbc` (the initial Sphere
+   commit) introduced `OFTLinearGroupedSplitFC1UpGate` *and* the
+   "expert linears ... use plain `OFTLinear` with a single rotation" docstring
+   **together**. There was no partial migration — this was deliberate scope. The
+   plausible reason: fc1's `oft_r` is replicated, whereas fc2 is RowParallel so its
+   blocks are TP-sharded, making a per-expert 3D `oft_r` there materially harder.
+
+   An earlier draft of this section called it unfinished work. That was wrong, and
+   the supporting reasoning was weak: the loose docstring is consistent with either
+   reading; `__getitem__` / `_PerExpertOFTRotationView` / `sgemm_oft_r_by_expert`
+   are required by the fc1 grouped path itself, so their existence proves nothing
+   about fc2; and the `CanonicalLoRA` analogy is imperfect because LoRA adds
+   `ΔW = BA` to the *weight* (per-expert is the only sensible reading) while OFT
+   rotates the *input* (`y = W(Rx)`).
+
+   What remains true: it is undocumented as a limitation and conflicts with the
+   "canonical = one OFT per matrix" principle. Treat it as a design question for
+   the OFT owner, not a defect.
+
+2. **Grouped fc1 adapters checkpoint as replicated.** `GroupedOFTRotation` has no
+   `sharded_state_dict` yet owns the 3D `oft_r` `(E, num_blocks, n_elements)`
+   (`canonical_oft.py:500`), so per-expert rotations are written with no EP/TP
+   sharding metadata. Same root cause as blocker #6.
+
+3. **The expert `replica_id` rewrite is suspect** (`oft_layers.py:650-660`,
+   carrying the original authors' own TODO). It writes an EP-derived value into
+   `replica_id`'s *TP-rank* slot, and `(ep+1)*(edp+1)-1` is not injective —
+   `(ep=1,edp=0)` and `(ep=0,edp=1)` both give 1, so two ranks claim the same
+   replica while other indices are never emitted. Fires for MoE fc2 adapters.
+
+**Latent traps (not Qwen-breaking):**
+
+- `_should_treat_linear_fc1_as_unfused` (`canonical_oft.py:176`) only tests the
+  `vision_model.` prefix. There is no `gated_linear_unit` precondition, so a
+  non-gated model would have fc1 split in half as if it were gate/up. Harmless
+  for Qwen3 (SwiGLU). No guard added — the case is unreachable for orbit targets.
+
+**Changed in this pass:** the hardcoded `full_name.endswith(".mlp.experts.linear_fc1")`
+was replaced with radixark's `is_grouped_expert_linear` (dedup rule). Proven
+behaviour-preserving: `wildcard_match` compiles an anchored `^...$` regex, so
+`matched_pattern.endswith("linear_fc1")` implies `full_name` ends with
+`linear_fc1`, making the predicates' `linear_fc2` divergence unreachable. The
+stale `CanonicalOFT` docstring was corrected to describe the real fc1/fc2 split.
+
 ### Seam notes
 
 - **Seam 3 is a gap-fill, not an invention.** radixark already applies the same
