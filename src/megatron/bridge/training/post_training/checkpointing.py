@@ -103,3 +103,11 @@ def load_modelopt_state(model: list[MegatronModule], checkpoint_path: str) -> No
     modelopt_checkpoint_path = _get_modelopt_checkpoint_path(checkpoint_path)
     unwrapped_model = unwrap_model(model)
     restore_sharded_modelopt_state(unwrapped_model, modelopt_checkpoint_path)
+
+    # orbit-seam(modelopt): compress packed low-precision checkpoints once
+    # ModelOpt state is restored.
+    from megatron.bridge.orbit.training.modelopt_packed_restore import (
+        _maybe_compress_restored_modelopt_model,
+    )
+
+    _maybe_compress_restored_modelopt_model(unwrapped_model, modelopt_checkpoint_path)
