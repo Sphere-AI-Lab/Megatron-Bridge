@@ -3,8 +3,8 @@
 """Packed low-precision ModelOpt checkpoint restore (orbit fork).
 
 Extracted from ``megatron.bridge.training.post_training.checkpointing``; the
-upstream module keeps a one-line hook in ``load_modelopt_state``. See
-``megatron/bridge/orbit/UPSTREAM_SEAMS.md``.
+shared module keeps a marked hook in ``load_modelopt_state``. See
+``docs/orbit/UPSTREAM_SEAMS.md``.
 """
 
 import torch

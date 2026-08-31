@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Unit tests for scale-reusing INT4 re-quantization."""
 
 import pytest
@@ -5,6 +19,9 @@ import torch
 
 from megatron.bridge.models.kimi_vl.utils import dequantize_int4, quantize_to_int4
 from megatron.bridge.orbit.low_precision.int4 import requantize_int4_with_scales
+
+
+pytestmark = pytest.mark.unit
 
 
 def _triplet_with_full_range(out_f=16, in_f=256, group=32):

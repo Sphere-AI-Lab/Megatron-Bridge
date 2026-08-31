@@ -1,8 +1,8 @@
 # `scripts/orbit/` — Orbit launcher scripts
 
-Launchers and utilities for Orbit's PEFT (OFT / LoRA) finetuning and quantized-checkpoint
-workflows. The `run_*.sh` scripts are thin wrappers around the Python entrypoints in this
-tree (`finetune_peft.py`, `models/`, `conversion/`); the core logic lives in
+Launchers and utilities for Orbit's PEFT and quantized-checkpoint workflows. The two
+`run_*_finetune.sh` scripts are thin wrappers around the generic Python entrypoints in this
+tree (`finetune_peft.py` and `finetune_qoft.py`); the core logic lives in
 `src/megatron/bridge/orbit/`.
 
 **Run every script from the repository root**, not from this directory:
@@ -11,10 +11,9 @@ tree (`finetune_peft.py`, `models/`, `conversion/`); the core logic lives in
 bash scripts/orbit/run_peft_finetune.sh
 ```
 
-All scripts are configured through **environment variables**, not flags (the two conversion
-utilities and `stage_nvfp4_checkpoint_pair.sh` take positional/flag arguments instead). Each
-script's header comment is the authoritative list of variables it honours; this README is a map,
-not a replacement.
+The launchers are configured through **environment variables**, not flags. Conversion utilities
+and `stage_nvfp4_checkpoint_pair.sh` use command-line arguments. Each script's header comment is
+the authoritative list of controls; this README is the workflow map.
 
 ---
 
@@ -23,8 +22,8 @@ not a replacement.
 | Want to… | Use |
 |---|---|
 | Finetune with OFT or LoRA on a normal (BF16 / FP8 / NVFP4) checkpoint | **`run_peft_finetune.sh`** |
-| Finetune on an **INT4** checkpoint | a model-specific `run_qoft_finetune_*_int4.sh` |
-| Finetune a very large MoE (Kimi-K2.5, Moonlight) | a model-specific `run_qoft_*` script |
+| Finetune with OFT while keeping FP8, INT4, or NVFP4 base weights quantized | **`run_qoft_finetune.sh`** |
+| Load and initialize a quantized checkpoint without training | `SKIP_TRAIN=1 run_qoft_finetune.sh` |
 | Convert / quantize a checkpoint first | see [Preparing a checkpoint](#preparing-a-checkpoint) |
 
 ### `run_peft_finetune.sh` — the generic launcher
@@ -56,43 +55,55 @@ PEFT=oft QUANT=nvfp4 HF_MODEL=Qwen/Qwen3-14B NUM_GPUS=8 TP=1 \
 | `OUTPUT_DIR` | run directory | derived from model/peft/quant |
 | `EXTRA_ARGS` | appended verbatim to the `python` command | — |
 
-`QUANT=int4` is **not** available here. The INT4 path installs a checkpoint monkey-patch stack
-(key rewriting, INT4 buffer registration) rather than setting config flags, so it still needs the
-model-specific scripts below.
+`QUANT=int4` is **not** available here. INT4 keeps the base weights quantized through a dedicated
+checkpoint-load path; use `run_qoft_finetune.sh` instead.
 
 > **Constraint:** ModelOpt's `QuantSequentialMLP` forbids `TP>1` **and** `EP>1` at the same time
 > for quantized MoE. `run_peft_finetune.sh` rejects that combination for `nvfp4` up front with an
-> explanatory error. INT4 is exempt — it does not route through `QuantSequentialMLP`, which is why
-> the INT4 scripts can use `TP=2 EP=4`.
+> explanatory error. The QOFT path has its own packed-weight runtime and architecture-specific
+> topology checks.
 
----
+## `run_qoft_finetune.sh` — quantized-base OFT
 
-## Model-specific finetuning launchers
+This is the single launcher for Qwen3 dense/MoE, Kimi-K2.5, and Moonlight. It detects the
+architecture from `HF_MODEL_PATH`, selects the matching recipe, keeps the base weights in FP8,
+INT4, or NVFP4, and trains only OFT parameters. Quantized LoRA is intentionally not advertised:
+it needs a separately owned implementation and tests before it can be supported.
 
-Reach for these when `run_peft_finetune.sh` cannot express the run: INT4, or a model that needs a
-custom pipeline layout / callbacks. Each pairs with an entrypoint under `scripts/orbit/models/`.
+```bash
+QUANT=int4 \
+HF_MODEL_PATH=$HF_MODEL_ROOT/Kimi-K2.5 \
+MEGATRON_CKPT=$MEGATRON_CKPT_ROOT/Kimi-K2.5-INT4 \
+NUM_GPUS=8 TP=2 EP=4 PP=1 SP=1 \
+TRAIN_ITERS=2000 SEQ_LENGTH=16384 \
+bash scripts/orbit/run_qoft_finetune.sh
+```
 
-| Script | Model | Base weights | Default GPUs / parallelism |
-|---|---|---|---|
-| `run_qoft_finetune_kimi_k25_int4.sh` | Kimi-K2.5 | INT4 | 8 · TP=2 EP=4 PP=1 |
-| `run_qoft_finetune_kimi_k25_nvfp4.sh` | Kimi-K2.5 | NVFP4 | 8 · TP=1 EP=8 |
-| `run_qoft_finetune_moonlight_16b_int4.sh` | Moonlight-16B-A3B | INT4 | 1 · TP=1 EP=1 PP=1 |
-| `run_qoft_finetune_qwen3_moe_fp8.sh` | Qwen3-30B-A3B | FP8 | 4 · TP=2 EP=2 |
-| `run_qoft_finetune_qwen3_moe_int4.sh` | Qwen3-30B-A3B | INT4 W4A16 | 4 · TP=2 EP=2 PP=1 |
+The Python entrypoint uses small bring-up defaults: usually 10 iterations and sequence length
+2048 (Moonlight uses 100 iterations). Production runs should set `TRAIN_ITERS`, `SEQ_LENGTH`,
+batch sizes, and parallelism explicitly. The former Kimi launchers used 2,000 iterations and
+sequence length 16,384; those values were operational presets, not architecture requirements.
 
-The last two differ only in precision (BF16 vs FP8) despite their names suggesting different
-models — `run_peft_finetune.sh` with `QUANT=none` / `QUANT=fp8` now covers the same ground.
+Common variables are `NUM_GPUS`, `TP`, `EP`, `PP`, `SP`, `TRAIN_ITERS`,
+`GLOBAL_BATCH_SIZE`, `MICRO_BATCH_SIZE`, `SEQ_LENGTH`, `OUTPUT_DIR`, `BLOCK_SIZE`, and
+`TARGET_MODULES`. The launcher also exposes checkpoint saving, profiling, NaN tracing, INT4
+group/chunk settings, and all remaining Python options listed in its header.
 
-Common variables across these: `MEGATRON_CKPT`, `HF_MODEL_PATH`, `NUM_GPUS`, `TP`/`EP`/`PP`,
-`TRAIN_ITERS`, `OUTPUT_DIR`, `BLOCK_SIZE` (OFT block size, default 32). Several also accept
-`EPS`, `COFT`, `BLOCK_SHARE`, `SEQ_LENGTH`, `GLOBAL_BATCH_SIZE`, `MICRO_BATCH_SIZE`.
-Check the script header for the exact set.
+Moonlight INT4 retains the validated layouts from its former launcher: one GPU with TP=EP=PP=1,
+two GPUs with TP=1/EP=2/PP=1, or four GPUs with TP=2/EP=2/PP=1. The four-GPU layout requires
+`SP=1`.
 
 ### Smoke test
 
-`run_qoft_load_kimi_k25_int4.sh` runs the expensive setup path **without training**: meta-device
-build, INT4 checkpoint load, expert-key rewrite into INT4 triplets, buffer registration, OFT
-wrapper init. Use it to validate a checkpoint before committing to a full run.
+Set `SKIP_TRAIN=1` to run the expensive setup path **without training**: meta-device build,
+checkpoint load, packed-buffer registration, and OFT initialization. Use it to validate a
+checkpoint before committing to a full run:
+
+```bash
+QUANT=int4 HF_MODEL_PATH=$HF_MODEL_ROOT/Kimi-K2.5 \
+MEGATRON_CKPT=$MEGATRON_CKPT_ROOT/Kimi-K2.5-INT4 SKIP_TRAIN=1 \
+bash scripts/orbit/run_qoft_finetune.sh
+```
 
 ---
 
@@ -124,13 +135,9 @@ checkpoint (single GPU). `MODELS` stands for your HF model root, e.g.
 ```bash
 # FP8 (e.g. Qwen/Qwen3-30B-A3B-FP8). Streaming direct writer:
 python scripts/orbit/conversion/convert_fp8_checkpoint_direct.py     --hf-model-path $MODELS/Qwen3-30B-A3B-FP8     --megatron-path ./checkpoints/Qwen3-30B-A3B-FP8-mcore
-# Full variant (instantiates the BF16 model; needs model-sized RAM):
-python scripts/orbit/conversion/convert_fp8_checkpoint.py     --hf-model-path $MODELS/Qwen3-30B-A3B-FP8     --megatron-path ./checkpoints/Qwen3-30B-A3B-FP8-mcore-full
 
 # NVFP4 (a ModelOpt NVFP4 export, e.g. nvidia/Qwen3-30B-A3B-NVFP4):
 python scripts/orbit/conversion/convert_nvfp4_checkpoint_direct.py     --hf-model-path $MODELS/Qwen3-30B-A3B-NVFP4     --megatron-path ./checkpoints/Qwen3-30B-A3B-NVFP4-mcore
-# Inspect the ModelOpt quantizer/meta keys of such a bundle:
-python scripts/orbit/conversion/dump_nvfp4_meta_keys.py     --hf-model-path $MODELS/Qwen3-30B-A3B-NVFP4
 
 # INT4 from a BF16 model (e.g. Moonlight-16B-A3B): quantize, then convert.
 bash scripts/orbit/quantize_to_int4.sh $MODELS/Moonlight-16B-A3B $MODELS/Moonlight-16B-A3B-INT4
@@ -180,7 +187,6 @@ WANDB_MODE=disabled uv run python -m torch.distributed.run \
     --quant nvfp4 \
     --hf-model-path "$HF_MODEL" \
     --pretrained-checkpoint "$MEGATRON_CKPT" \
-    --peft oft \
     --tp 1 \
     --ep 1 \
     --pp 1 \
@@ -256,7 +262,6 @@ WANDB_MODE=disabled uv run python -m torch.distributed.run \
     --quant fp8 \
     --hf-model-path "$HF_MODEL" \
     --pretrained-checkpoint "$MEGATRON_CKPT" \
-    --peft oft \
     --tp 1 \
     --ep 1 \
     --pp 1 \
@@ -304,17 +309,18 @@ export MEGATRON_BRIDGE_PYMMAP_READER=1           # lazy no-populate source reads
 | `stage_nvfp4_checkpoint_pair.sh` | `--hf-model --megatron-dist --env-file`, `--hf-only` | Copy an HF NVFP4 model + its Megatron dist checkpoint to node-local storage |
 
 Staging matters on clusters where the shared filesystem is slow: load from node-local disk
-instead. The script writes resolved paths to an env file you then source.
+instead. The script writes resolved paths to an env file you then source. Staging destinations
+must be dedicated children of `--stage-root`. A refresh uses `rsync --delete`; the script records
+ownership and refuses to refresh a non-empty destination it did not create for the same source.
 
 ---
 
 ## Conventions
 
-- **CUDA setup.** Each script tries `module load cuda/13.2` and `module load nccl` (both
+- **CUDA setup.** Each launcher tries `module load cuda/13.2` and `module load nccl` (both
   best-effort), then sets `CUDA_HOME`, `PATH`, and `LD_LIBRARY_PATH`. Override with
   `CUDA_MODULE`, `NCCL_MODULE`, `CUDA_HOME`, `CUDNN_HOME`.
-- **Weights & Biases.** Set `WANDB_API_KEY` in your environment or run `wandb login` first. Some
-  scripts also read `${HOME}/.wandb_key` when the variable is unset.
+- **Weights & Biases.** Set `WANDB_API_KEY` in your environment or run `wandb login` first.
   **Never commit an API key into a script**, even commented out — one was published to GitHub
   this way and had to be rotated.
 - **Defaults are cluster-shaped.** `HF_MODEL_ROOT` defaults to `${HOME}/hf_models` and
@@ -324,6 +330,6 @@ instead. The script writes resolved paths to an env file you then source.
 
 ## Adding a script
 
-Prefer extending `run_peft_finetune.sh` (a new `QUANT` preset, a new flag) over copying a script.
-The launchers here are heavily duplicated — the two Kimi scripts are 89% identical across 550
-lines — and every copy is another place a fix has to land.
+Extend `run_peft_finetune.sh` for ordinary PEFT or `run_qoft_finetune.sh` for quantized-base OFT
+instead of copying a model-specific launcher. Architecture behavior belongs in the generic Python
+entrypoint so fixes and validation stay centralized.

@@ -18,11 +18,6 @@ import time
 from functools import partial
 from typing import Any, Callable, NamedTuple, Optional
 
-from megatron.bridge.models.common import ModelBuilder, ModelConfig
-from megatron.bridge.models.gpt.gpt_builder import GPTModelConfig
-from megatron.bridge.models.mamba.mamba_builder import MambaModelConfig
-from megatron.bridge.models.model_provider import ModelProviderMixin
-from megatron.bridge.models.transformer_config import TransformerConfig
 import torch
 from megatron.core.config import set_experimental_flag
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
@@ -35,14 +30,18 @@ from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer import MegatronModule
 
 from megatron.bridge.data.loaders import setup_data_iterators
-from megatron.bridge.training.callbacks import CallbackContext, CallbackManager, should_fire
-from megatron.bridge.models import GPTModelProvider, T5ModelProvider
+from megatron.bridge.models.common import ModelConfig
+from megatron.bridge.models.gpt.gpt_builder import GPTModelConfig
+from megatron.bridge.models.mamba.mamba_builder import MambaModelConfig
+from megatron.bridge.models.model_provider import ModelProviderMixin
+from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.bridge.training import fault_tolerance
+from megatron.bridge.training.callbacks import CallbackContext, CallbackManager, should_fire
 from megatron.bridge.training.checkpointing import (
-    _load_checkpoint_from_path,
-    checkpoint_exists,
     CheckpointLoadContext,
     CheckpointManager,
+    _load_checkpoint_from_path,
+    checkpoint_exists,
     create_checkpoint_manager,
 )
 from megatron.bridge.training.config import ConfigContainer
@@ -220,33 +219,7 @@ def setup(
     # per-layer quantizer keys the checkpoint provides and load validation
     # raises KeyError. Pure reorder -- no orbit import.
 
-    if getattr(cfg.model, "restore_modelopt_state", False):
-        from megatron.bridge.training.post_training.checkpointing import load_modelopt_state
-
-        def modelopt_pre_wrap_hook(model):
-            from megatron.bridge.training.post_training.checkpointing import has_modelopt_state
-
-            # Check which checkpoint path has modelopt state
-            if cfg.checkpoint.pretrained_checkpoint and has_modelopt_state(cfg.checkpoint.pretrained_checkpoint):
-                checkpoint_path = cfg.checkpoint.pretrained_checkpoint
-            elif cfg.checkpoint.load and has_modelopt_state(cfg.checkpoint.load):
-                checkpoint_path = cfg.checkpoint.load
-            else:
-                raise RuntimeError(
-                    f"No modelopt_state found in pretrained_checkpoint={cfg.checkpoint.pretrained_checkpoint} "
-                    f"or load={cfg.checkpoint.load}"
-                )
-
-            load_modelopt_state(model, checkpoint_path)
-            return model
-
-        _register_pre_wrap_hook(cfg.model, modelopt_pre_wrap_hook)
-
-    # Register PEFT pre-wrap hook if PEFT is configured
-    if cfg.peft is not None:
-        peft_hook = _create_peft_pre_wrap_hook(cfg, state)
-        _register_pre_wrap_hook(cfg.model, peft_hook)
-        print_rank_0("Registered PEFT pre-wrap hook")
+    _register_modelopt_and_peft_pre_wrap_hooks(cfg, state)
 
     # Enable CUDA allocator history tracing before any model tensors are allocated,
     # so snapshots dumped later in training contain a full timeline + stack context.
@@ -275,8 +248,7 @@ def setup(
     # find them.
     _ckpt_ctx = getattr(checkpoint_manager, "checkpointing_context", {})
     has_local_checkpoint = (
-        "local_checkpoint_manager" in _ckpt_ctx
-        and _ckpt_ctx["local_checkpoint_manager"].find_latest() != -1
+        "local_checkpoint_manager" in _ckpt_ctx and _ckpt_ctx["local_checkpoint_manager"].find_latest() != -1
     )
 
     # For PEFT, the pretrained checkpoint is loaded in the pre-wrap hook
@@ -298,13 +270,15 @@ def setup(
 
     if should_load_checkpoint:
         timers("load-checkpoint", log_level=0).start(barrier=True)
-        checkpoint_manager.load(CheckpointLoadContext(
-            state=state,
-            model=model,
-            optimizer=optimizer,
-            opt_param_scheduler=scheduler,
-            skip_load_to_model_and_opt=cfg.dist.use_torch_fsdp2,
-        ))
+        checkpoint_manager.load(
+            CheckpointLoadContext(
+                state=state,
+                model=model,
+                optimizer=optimizer,
+                opt_param_scheduler=scheduler,
+                skip_load_to_model_and_opt=cfg.dist.use_torch_fsdp2,
+            )
+        )
         timers("load-checkpoint").stop(barrier=True)
         timers.log(["load-checkpoint"])
 
@@ -385,6 +359,35 @@ def _register_pre_wrap_hook(model_cfg: ModelConfig | ModelProviderMixin, hook):
         model_cfg.pre_wrap_hooks.append(hook)
     else:
         model_cfg.register_pre_wrap_hook(hook)
+
+
+def _register_modelopt_and_peft_pre_wrap_hooks(cfg: ConfigContainer, state: GlobalState) -> None:
+    """Register ModelOpt before PEFT so quantizer modules exist during PEFT load."""
+    if getattr(cfg.model, "restore_modelopt_state", False):
+        from megatron.bridge.training.post_training.checkpointing import load_modelopt_state
+
+        def modelopt_pre_wrap_hook(model):
+            from megatron.bridge.training.post_training.checkpointing import has_modelopt_state
+
+            if cfg.checkpoint.pretrained_checkpoint and has_modelopt_state(cfg.checkpoint.pretrained_checkpoint):
+                checkpoint_path = cfg.checkpoint.pretrained_checkpoint
+            elif cfg.checkpoint.load and has_modelopt_state(cfg.checkpoint.load):
+                checkpoint_path = cfg.checkpoint.load
+            else:
+                raise RuntimeError(
+                    f"No modelopt_state found in pretrained_checkpoint={cfg.checkpoint.pretrained_checkpoint} "
+                    f"or load={cfg.checkpoint.load}"
+                )
+
+            load_modelopt_state(model, checkpoint_path)
+            return model
+
+        _register_pre_wrap_hook(cfg.model, modelopt_pre_wrap_hook)
+
+    if cfg.peft is not None:
+        peft_hook = _create_peft_pre_wrap_hook(cfg, state)
+        _register_pre_wrap_hook(cfg.model, peft_hook)
+        print_rank_0("Registered PEFT pre-wrap hook")
 
 
 def _build_distributed_model(cfg: ConfigContainer, pg_collection: ProcessGroupCollection) -> list[MegatronModule]:

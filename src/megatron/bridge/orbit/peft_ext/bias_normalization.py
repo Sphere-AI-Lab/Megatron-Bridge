@@ -2,8 +2,9 @@
 
 """Bias-placeholder normalization for PEFT wrapping (orbit fork).
 
-Extracted from ``megatron.bridge.peft.utils``; ``megatron.bridge.peft.base``
-imports :func:`normalize_disabled_bias_placeholders` as its only seam.
+Extracted from ``megatron.bridge.peft.utils`` and invoked by
+:class:`megatron.bridge.orbit.peft_ext.peft_mixin.OrbitPEFTMixin` before the
+upstream PEFT transformation walks and freezes the model.
 """
 
 from typing import Optional

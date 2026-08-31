@@ -25,7 +25,7 @@ Conversion flow:
        so the standard bridge can do QKV merge + TP split.
     2. After all weights are loaded, ``_requantize_experts_int4`` walks the
        model and re-quantises expert weights BF16 -> INT4.  The BF16 Parameter
-       data is emptied and ``weight_packed`` / ``weight_scale`` / ``weight_shape``
+       data is zeroed and ``weight_packed`` / ``weight_scale`` / ``weight_shape``
        are registered as persistent buffers.
     3. ``save_megatron_model`` saves everything — dist_checkpointing preserves
        int32 buffers and bf16 buffers.
@@ -187,28 +187,3 @@ class DeepSeekV3INT4Bridge(CompressedTensorsINT4DequantMixin, DeepSeekV3Bridge):
 
         int4_bytes = packed.numel() * packed.element_size() + scale.numel() * scale.element_size()
         return bf16_bytes - int4_bytes
-
-    @staticmethod
-    @torch.no_grad()
-    def deregister_quantized_weights(model: nn.Module):
-        """Remove empty weight Parameters that were replaced by INT4 buffers.
-
-        Must be called before ``sharded_state_dict()`` / checkpoint save.
-        After this, the model is no longer usable for forward — only for saving.
-        """
-        to_delete = []  # collect (module, param_name) to delete after iteration
-        for name, module in model.named_modules():
-            num_gemms = getattr(module, "num_gemms", 0)
-            if num_gemms > 0:
-                for idx in range(num_gemms):
-                    w_name = f"weight{idx}"
-                    if hasattr(module, f"{w_name}_packed"):
-                        to_delete.append((module, w_name))
-            elif hasattr(module, "weight_packed"):
-                to_delete.append((module, "weight"))
-
-        for module, w_name in to_delete:
-            if w_name in module._parameters:
-                del module._parameters[w_name]
-
-        logger.info("Deregistered %d empty weight Parameters before save", len(to_delete))

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 """Triton-accelerated block-diagonal OFT rotation kernels with autograd support.
 
 Provides fwd/bwd triton kernels and an autograd Function for OFT rotation:

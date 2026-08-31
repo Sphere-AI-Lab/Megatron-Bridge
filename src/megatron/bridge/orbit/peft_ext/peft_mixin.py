@@ -3,7 +3,7 @@
 """Shared behavior for orbit PEFT methods, added by subclassing rather than by
 editing upstream ``megatron.bridge.peft``.
 
-Any orbit PEFT class (OFT, CanonicalOFT, their merge variants, Int4LoRA) mixes
+Any orbit PEFT class (OFT, CanonicalOFT, and their merge variants) mixes
 this in *before* :class:`megatron.bridge.peft.base.PEFT` in its MRO to get:
 
 - bias-placeholder normalization on quantized base models before freezing,
@@ -44,8 +44,7 @@ class OrbitPEFTMixin:
         try:
             from megatron.bridge.orbit.training.peft_reports import _write_peft_parameter_reports
 
-            chunks = model if isinstance(model, list) else [model]
-            report_paths = _write_peft_parameter_reports(chunks[0], report_dir="/tmp")
+            report_paths = _write_peft_parameter_reports(model, report_dir="/tmp")
             print_rank_0(f"  Trainable parameter report: {report_paths['trainable']}")
             print_rank_0(f"  Frozen parameter report: {report_paths['frozen']}")
             print_rank_0(f"  PEFT summary report: {report_paths['summary']}")

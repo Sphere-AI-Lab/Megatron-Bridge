@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Generic PEFT finetuning launcher.
 #
 # Replaces run_lora_finetune.sh / run_oft_finetune.sh (which differed only in
@@ -23,8 +37,8 @@
 #   OUTPUT_DIR     - run directory                       (default: chosen by the entrypoint)
 #   EXTRA_ARGS     - appended verbatim to the python command
 #
-# INT4 is not covered here: that path installs a checkpoint monkey-patch stack.
-# Use scripts/orbit/models/*/finetune_qoft_int4.py for INT4.
+# INT4 is not covered here: its direct-checkpoint runtime needs the Orbit
+# load-patch stack. Use run_qoft_finetune.sh with QUANT=int4.
 
 set -euo pipefail
 

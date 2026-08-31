@@ -2,8 +2,8 @@
 
 """ModelOpt checkpoint save/restore extensions (orbit fork).
 
-Extracted from ``megatron.bridge.training.checkpointing``; the upstream module
-keeps two marked call-site seams. See ``megatron/bridge/orbit/UPSTREAM_SEAMS.md``.
+Extracted from ``megatron.bridge.training.checkpointing``; the shared module
+keeps two marked call-site seams. See ``docs/orbit/UPSTREAM_SEAMS.md``.
 """
 
 import os

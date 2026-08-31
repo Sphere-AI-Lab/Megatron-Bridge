@@ -263,8 +263,8 @@ class OrbitOFTExportMixin:
         """Locate the OFTRotationModule adapter for a given base prefix.
 
         ``get_module_and_param_from_name`` returns ``(parent_module, target_attr)``
-        where *target_attr* is the OFTLinear (or TEOFTLayerNormColumnParallelLinear)
-        wrapper that holds the ``.adapter`` attribute.
+        where *target_attr* is an OFT wrapper that holds the ``.adapter``
+        attribute.
 
         For CanonicalOFT split wrappers (``OFTLinearSplitQKV`` /
         ``OFTLinearSplitFC1UpGate``) the rotation modules live at

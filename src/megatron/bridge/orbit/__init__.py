@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Orbit AI Lab additions to Megatron-Bridge.
+"""Sphere AI Lab additions to Megatron-Bridge.
 
 Fork contract: every file that also exists upstream is byte-identical to
 upstream — orbit integrates exclusively through public extension points

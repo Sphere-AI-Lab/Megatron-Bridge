@@ -16,8 +16,8 @@
 """
 Direct-write INT4 checkpoint converter for large DeepSeek/Kimi-style models.
 
-Unlike ``convert_int4_checkpoint.py``, this path never instantiates a full BF16
-Megatron model. It builds a single-rank Megatron model on the meta device only
+Unlike the retired full-model conversion path, this converter never instantiates
+a full BF16 Megatron model. It builds a single-rank model on the meta device only
 for name resolution and checkpoint metadata, then streams HF tensors directly
 into a prebuilt Megatron distributed checkpoint state dict.
 

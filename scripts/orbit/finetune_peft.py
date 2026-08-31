@@ -14,8 +14,8 @@
 
 """Generic PEFT finetuning entrypoint, driven by an HF model path.
 
-Replaces the per-model ``finetune_{oft,qoft,qoft_fp8,qoft_nvfp4}.py`` scripts for
-every model whose recipe is "``_peft_common()`` plus an HF path". The upstream
+Replaces per-model PEFT scripts for every model whose recipe is
+"``_peft_common()`` plus an HF path". The upstream
 per-model recipes (``qwen3_14b_peft_config``, ``gpt_oss_20b_peft_config``, ...)
 are ~92 lines each that differ only in the HF path string and a couple of tuning
 numbers, and ``_peft_common`` documents the contract directly: the caller MUST
@@ -26,11 +26,10 @@ set ``cfg.model`` and ``cfg.tokenizer.tokenizer_model``. That is what this does.
         --pretrained-checkpoint ./checkpoints/Qwen3-14B-NVFP4 \
         --peft oft --quant nvfp4 --tp 1 --pp 1
 
-Scope: ``--quant`` in {none, fp8, mxfp8, nvfp4}. INT4 is deliberately NOT handled
-here — the INT4 path additionally installs a checkpoint monkey-patch stack (see
-``scripts/orbit/models/qwen3_moe/finetune_qoft_int4.py`` and the kimi/moonlight
-entrypoints), which is real machinery rather than a config flag. Use those
-entrypoints for INT4 until that stack is extracted into the orbit package.
+Scope: ``--quant`` in {none, fp8, mxfp8, nvfp4}. INT4 is deliberately not
+handled here because its direct-checkpoint runtime needs the Orbit load-patch
+stack and an OFT-only contract. Use ``scripts/orbit/finetune_qoft.py --quant
+int4`` for that path.
 """
 
 # ruff: noqa: D101, D103  # operational scripts: helpers here are entrypoint plumbing, not API

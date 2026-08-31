@@ -395,10 +395,9 @@ def _has_nvfp4_weight_bundle_keys(
 def scale_to_amax(scale: torch.Tensor) -> torch.Tensor:
     """Convert ModelOpt NVFP4 scaling factor back to the stored amax value.
 
-    The post-``mtq.compress`` buffer dtype is ``float32`` (verified by
-    ``scripts/orbit/conversion/dump_nvfp4_meta_keys.py --probe-compress``). Casting
-    to bfloat16 here would drop ~8 mantissa bits from a scalar that the quant
-    kernel multiplies through every 16-element block on dequant.
+    The post-``mtq.compress`` buffer dtype is ``float32``. Casting to bfloat16
+    here would drop ~8 mantissa bits from a scalar that the quant kernel
+    multiplies through every 16-element block on dequant.
     """
     return (scale.float() * NVFP4_AMAX_SCALE).to(torch.float32)
 
@@ -412,9 +411,8 @@ def populate_nvfp4_quantizer_buffers(
 ) -> None:
     """Copy HF NVFP4 bundle scales onto a module's modelopt quantizer buffers.
 
-    After ``mtq.quantize`` + ``mtq.compress`` (verified via ``dump_nvfp4_meta_keys.py
-    --probe-roundtrip``), modelopt's ``TensorQuantizer`` expects exactly these
-    per-module buffers for NVFP4:
+    After ``mtq.quantize`` + ``mtq.compress``, modelopt's ``TensorQuantizer``
+    expects exactly these per-module buffers for NVFP4:
 
       * ``weight_quantizer._scale``        (``float8_e4m3fn``, ``(out, in/16)``)
       * ``weight_quantizer._double_scale`` (``float32`` scalar)

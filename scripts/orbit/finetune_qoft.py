@@ -13,12 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generic quantized-base PEFT (QOFT / QLoRA) finetuning entrypoint.
+"""Generic quantized-base QOFT finetuning entrypoint.
 
-The base model weights stay in their quantized format permanently (analogous
-to QLoRA keeping weights in NF4); only the PEFT parameters are BF16 and
-receive gradient updates. Requires a converted Megatron checkpoint from
-``scripts/orbit/conversion/`` (see scripts/orbit/README.md).
+The base model weights stay in their quantized format permanently; only the
+OFT parameters are BF16 and receive gradient updates. Requires a converted
+Megatron checkpoint from ``scripts/orbit/conversion/`` (see scripts/orbit/README.md).
 
 Replaces the per-model ``models/*/finetune_qoft*.py`` entrypoints. The
 architecture is detected from the HF config and each architecture keeps the
@@ -236,7 +235,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--pretrained-checkpoint", required=True, help="Converted Megatron checkpoint (see scripts/orbit/conversion/)"
     )
-    p.add_argument("--peft", choices=["oft", "lora"], default="oft")
     p.add_argument("--output-dir", default=None)
 
     par = p.add_argument_group("parallelism (defaults per architecture)")
@@ -267,11 +265,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=None,
         help="Comma/whitespace separated module names to wrap (default per architecture)",
     )
-
-    lora = p.add_argument_group("LoRA")
-    lora.add_argument("--dim", type=int, default=32)
-    lora.add_argument("--alpha", type=int, default=32)
-    lora.add_argument("--dropout", type=float, default=0.0)
 
     i4 = p.add_argument_group("INT4")
     i4.add_argument("--group-size", type=int, default=128)
@@ -312,9 +305,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _fill_arch_defaults(args, spec: dict) -> None:
+def _fill_arch_defaults(args, spec: dict, *, world_size: int | None = None) -> None:
     defaults = dict(spec["defaults"])
     defaults.update(spec["quant_defaults"].get(args.quant, {}))
+    if spec["key"] == "moonlight" and args.quant == "int4" and world_size is not None:
+        topology_defaults = {
+            1: {"tp": 1, "ep": 1, "sp": False},
+            2: {"tp": 1, "ep": 2, "sp": False},
+            4: {"tp": 2, "ep": 2, "sp": True},
+        }
+        defaults.update(topology_defaults.get(world_size, {}))
     for name, value in defaults.items():
         if getattr(args, name) is None:
             setattr(args, name, value)
@@ -322,16 +322,8 @@ def _fill_arch_defaults(args, spec: dict) -> None:
         args.target_modules = spec["target_modules"][args.quant]
 
 
-def build_peft(args):
-    """Build the PEFT object (OFT by default, LoRA on request)."""
-    if args.peft == "lora":
-        from megatron.bridge.peft.lora import LoRA
-
-        kwargs = {"dim": args.dim, "alpha": args.alpha, "dropout": args.dropout}
-        if args.target_modules:
-            kwargs["target_modules"] = args.target_modules
-        return LoRA(**kwargs)
-
+def build_oft(args):
+    """Build the OFT adapter for a quantized base model."""
     from megatron.bridge.orbit.oft.oft import OFT
 
     kwargs = {
@@ -344,6 +336,28 @@ def build_peft(args):
     if args.target_modules:
         kwargs["target_modules"] = args.target_modules
     return OFT(**kwargs)
+
+
+def _validate_runtime_topology(args, spec: dict, *, world_size: int) -> None:
+    """Retain model-specific launch constraints after launcher consolidation."""
+    if spec["key"] != "moonlight" or args.quant != "int4":
+        return
+
+    supported = {
+        (1, 1, 1, 1),
+        (2, 1, 2, 1),
+        (4, 2, 2, 1),
+    }
+    topology = (world_size, args.tp, args.ep, args.pp)
+    if topology not in supported:
+        raise SystemExit(
+            "Moonlight INT4 supported GPU/parallel layouts are: "
+            "WORLD_SIZE=1 TP=1 EP=1 PP=1; WORLD_SIZE=2 TP=1 EP=2 PP=1; "
+            "WORLD_SIZE=4 TP=2 EP=2 PP=1. "
+            f"Received WORLD_SIZE={world_size} TP={args.tp} EP={args.ep} PP={args.pp}."
+        )
+    if args.tp > 1 and not args.sp:
+        raise SystemExit("Moonlight INT4 requires sequence parallelism when TP is greater than one; pass --sp.")
 
 
 def _apply_common_model_overrides(config, args) -> None:
@@ -476,7 +490,7 @@ def _apply_quant_mode(config, args, spec: dict) -> None:
 
 def build_config(args, spec: dict):
     """Assemble the full finetuning config for the detected architecture."""
-    peft = build_peft(args)
+    peft = build_oft(args)
 
     if spec["key"] == "qwen3_moe":
         from megatron.bridge import AutoBridge
@@ -562,7 +576,7 @@ def build_config(args, spec: dict):
         config.validation.skip_train = True
         disable_evaluation(config)
 
-    slug = f"{spec['slug']}_{args.peft}_qoft_{args.quant}"
+    slug = f"{spec['slug']}_qoft_{args.quant}"
     output_dir = args.output_dir or os.path.join(os.getcwd(), "nemo_experiments", slug)
     if args.save_checkpoints:
         config.checkpoint.save = os.path.join(output_dir, "checkpoints")
@@ -599,7 +613,9 @@ def main() -> None:
         raise SystemExit(
             f"--quant {args.quant} is not supported for {spec['label']} (supported: {', '.join(spec['quants'])})"
         )
-    _fill_arch_defaults(args, spec)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    _fill_arch_defaults(args, spec, world_size=world_size)
+    _validate_runtime_topology(args, spec, world_size=world_size)
 
     if args.quant == "int4" and (
         args.int4_active_expert_chunk_size is not None or args.int4_grouped_chunk_backend is not None

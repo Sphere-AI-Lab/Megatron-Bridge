@@ -266,8 +266,8 @@ def maybe_qwen3_native_block_fp8_linear(
             bias,
             module_name,
         )
-    except RuntimeError:
-        if backend == "auto":
+    except RuntimeError as exc:
+        if backend == "auto" and exc.args == (_AUTO_UNAVAILABLE_SENTINEL,):
             return None
         raise
 

@@ -2,9 +2,8 @@
 
 """PEFT parameter-partition TSV reports (orbit fork).
 
-Extracted from ``megatron.bridge.training.setup``; the upstream module keeps a
-rank-0 hook in ``_apply_peft_transformation``. See
-``megatron/bridge/orbit/UPSTREAM_SEAMS.md``.
+Invoked on rank 0 by :class:`megatron.bridge.orbit.peft_ext.peft_mixin.OrbitPEFTMixin`
+after an Orbit PEFT transformation. It does not require a shared-code seam.
 """
 
 import os
@@ -13,12 +12,23 @@ from typing import Any
 from megatron.core.transformer.module import MegatronModule
 
 
-def _collect_parameter_partition_entries(model: MegatronModule) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _collect_parameter_partition_entries(
+    model: MegatronModule | list[MegatronModule],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Collect trainable and frozen parameter metadata for reporting."""
     trainable_entries: list[dict[str, Any]] = []
     frozen_entries: list[dict[str, Any]] = []
 
-    for name, param in model.named_parameters():
+    if isinstance(model, list):
+        named_parameters = (
+            (f"model_chunks.{chunk_index}.{name}", param)
+            for chunk_index, chunk in enumerate(model)
+            for name, param in chunk.named_parameters()
+        )
+    else:
+        named_parameters = model.named_parameters()
+
+    for name, param in named_parameters:
         entry = {
             "name": name,
             "numel": param.numel(),
@@ -48,7 +58,7 @@ def _write_parameter_partition_report(entries: list[dict[str, Any]], report_path
 
 
 def _write_peft_parameter_reports(
-    model: MegatronModule,
+    model: MegatronModule | list[MegatronModule],
     report_dir: str = "/tmp",
 ) -> dict[str, str]:
     """Write rank-0 PEFT parameter reports to disk."""

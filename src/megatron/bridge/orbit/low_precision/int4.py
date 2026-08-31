@@ -114,11 +114,19 @@ def quantize_to_int4(
     scale_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize bfloat16/float16 weights to INT4 packed format."""
+    if weight.dim() != 2:
+        raise ValueError(f"weight must be 2-D, got shape {tuple(weight.shape)}")
+    if group_size <= 0:
+        raise ValueError(f"group_size must be positive, got {group_size}")
     out_features, in_features = weight.shape
+    if in_features % group_size != 0:
+        raise ValueError(f"in_features={in_features} must be divisible by group_size={group_size}")
+    if in_features % 8 != 0:
+        raise ValueError(f"in_features must be divisible by 8, got {in_features}")
     weight_shape = torch.tensor([out_features, in_features], dtype=torch.int32)
 
     w = weight.float()
-    num_groups = (in_features + group_size - 1) // group_size
+    num_groups = in_features // group_size
     w_grouped = w.view(out_features, num_groups, -1)
 
     group_max = w_grouped.abs().amax(dim=-1)
@@ -129,8 +137,6 @@ def quantize_to_int4(
     w_q = (w_grouped / scale_expanded).round().clamp(-8, 7)
     w_q = w_q.view(out_features, -1)[:, :in_features]
     w_q = (w_q + 8).to(torch.uint8)
-
-    assert in_features % 8 == 0, f"in_features must be divisible by 8, got {in_features}"
 
     w_q_grouped = w_q.view(out_features, in_features // 8, 8).to(torch.int32)
     packed = torch.zeros(
@@ -519,7 +525,8 @@ def transform_sharded_state_dict_for_int4_dense(
 ) -> Dict[str, Any]:
     """Rewrite dense-linear BF16 weight entries as INT4 triplet entries.
 
-    Parallels the expert-only ``peft.int4_utils.transform_sharded_state_dict_for_int4``
+    Parallels the expert-only
+    ``megatron.bridge.orbit.quant.int4_utils.transform_sharded_state_dict_for_int4``
     but matches dense Megatron linear weights (``*.self_attention.linear_qkv.weight``,
     ``*.self_attention.linear_proj.weight``, ``*.mlp.linear_fc1.weight``,
     ``*.mlp.linear_fc2.weight``).

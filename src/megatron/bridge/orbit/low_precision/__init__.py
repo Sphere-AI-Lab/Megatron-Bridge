@@ -14,7 +14,7 @@
 
 """Shared helpers for low-precision HF -> Megatron checkpoint conversion."""
 
-from . import fp8, int8
+from . import fp8
 from .common import (
     add_tensor_entry,
     build_single_rank_meta_provider,
@@ -66,7 +66,6 @@ __all__ = [
     "extract_nvfp4_weight_bundle",
     "fp8",
     "hf_param_uses_int4",
-    "int8",
     "is_nvfp4_source",
     "is_nvfp4_weight_mapping",
     "patch_meta_init_for_te_modules",

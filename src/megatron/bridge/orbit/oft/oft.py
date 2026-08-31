@@ -64,18 +64,13 @@ TELayerNormColumnParallelLinear, HAVE_TE_LN_COL_LINEAR = safe_import_from(
     "TELayerNormColumnParallelLinear",
 )
 
-TEOFTLayerNormColumnParallelLinear, HAVE_TE_OFT_LN = safe_import_from(
-    "megatron.bridge.orbit.oft.te_oft",
-    "TEOFTLayerNormColumnParallelLinear",
-)
-
 
 class _SplitLNOFTLinear(nn.Module):
     """Splits a fused TELayerNormColumnParallelLinear into LN + OFT + Linear.
 
-    The fused TEOFTLayerNormColumnParallelLinear uses a custom autograd.Function
-    that severs gradient flow to OFT parameters. This module splits the fused
-    layer into three separate operations:
+    Running OFT inside TE's custom autograd.Function severs gradient flow to
+    OFT parameters. This module splits the fused layer into three separate
+    operations:
       1. LayerNorm (reusing fused module's LN weights, via torch.nn.functional)
       2. OFT rotation (normal nn.Module, autograd tracks params)
       3. Linear projection (TE path for dense/FP8 weights, de-fused path for INT4/NVFP4)
@@ -529,8 +524,6 @@ class OFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
         # Skip already transformed modules
         if isinstance(module, (OFTLinear, OFTTopKRouter, _SplitLNOFTLinear)):
             return module
-        if HAVE_TE_OFT_LN and isinstance(module, TEOFTLayerNormColumnParallelLinear):
-            return module
 
         if (ans := self.match(module, name, prefix)) is not None:
             (match, full_name) = ans
@@ -544,12 +537,9 @@ class OFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
 
             # Fused LN+Linear layers (TELayerNormColumnParallelLinear):
             # OFT needs to insert rotation between LN and GEMM. The fused
-            # TEOFTLayerNormColumnParallelLinear wrapper uses a custom autograd
-            # Function that severs gradient flow to OFT parameters (the OFT
-            # rotation runs inside the Function boundary, but backward returns
-            # None for OFT params). Instead, we de-fuse the module by extracting
-            # the underlying Linear and wrapping it with OFTLinear, which is a
-            # normal nn.Module where autograd works correctly.
+            # TE custom autograd Function cannot track OFT parameters captured
+            # inside its forward boundary. De-fuse the module so the rotation
+            # remains an ordinary nn.Module tracked by autograd.
             if HAVE_TE_LN_COL_LINEAR and isinstance(module, TELayerNormColumnParallelLinear):
                 logger.warning(
                     f"OFT on fused TELayerNormColumnParallelLinear ({full_name}): "

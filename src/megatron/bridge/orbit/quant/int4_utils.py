@@ -74,8 +74,6 @@ def transform_sharded_state_dict_for_int4(
     Non-expert keys are left unchanged (but their meta tensors are materialized
     on CPU so PyTorch's distributed checkpoint planner can handle them).
     """
-    from megatron.core.dist_checkpointing.mapping import ShardedTensor
-
     # Example: for linear_fc2.weight0 on EP rank 1 of 4 (96 local experts):
     #
     #   Original BF16 ShardedTensor from model.sharded_state_dict():
@@ -94,17 +92,8 @@ def transform_sharded_state_dict_for_int4(
     #     weight96_shape:  local (2,),        global (2,),         int64
     #
     #   Where 256 = 2048/8 (8 INT4 values per int32), 64 = 2048/32 (one scale per group)
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 
-    print(f"[INT4 transform] Processing {len(sharded_state_dict)} keys", flush=True)
-    # Debug: find expert weight keys by type
-    from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
-
-    expert_by_type: Dict[str, int] = {}
-    for k, v in sharded_state_dict.items():
-        if "experts" in k and "linear_fc" in k and "weight" in k.split(".")[-1]:
-            tname = type(v).__name__
-            expert_by_type[tname] = expert_by_type.get(tname, 0) + 1
-    print(f"[INT4 transform] Expert weight keys by type: {expert_by_type}", flush=True)
     canonical_keys = {_canonicalize_expert_key_for_checkpoint(k) for k in sharded_state_dict.keys()}
     new_sd: Dict[str, Any] = {}
     for key, value in sharded_state_dict.items():
@@ -119,7 +108,6 @@ def transform_sharded_state_dict_for_int4(
         canonical_key = _canonicalize_expert_key_for_checkpoint(key)
 
         if _EXPERT_BASE_WEIGHT_RE.match(canonical_key):
-            print(f"  [INT4 transform] Skipping base weight key: {key}", flush=True)
             continue
 
         m = _EXPERT_WEIGHT_RE.match(canonical_key)
@@ -136,10 +124,6 @@ def transform_sharded_state_dict_for_int4(
             and f"{canonical_key}_scale" in canonical_keys
             and f"{canonical_key}_shape" in canonical_keys
         ):
-            print(
-                f"  [INT4 transform] Skipping expert BF16 placeholder with existing INT4 triplets: {key}",
-                flush=True,
-            )
             continue
 
         # Expert weight key matched. It can be either:

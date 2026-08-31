@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Stage an HF NVFP4 model and its Megatron dist checkpoint to node-local storage.
 #
 # Examples:
@@ -52,10 +66,14 @@ USAGE
 }
 
 is_true() {
-    case "${1,,}" in
-        1 | true | yes | y | on) return 0 ;;
+    case "$1" in
+        1 | true | TRUE | True | yes | YES | Yes | y | Y | on | ON | On) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+canonical_path() {
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
 }
 
 resolve_local_stage_root() {
@@ -123,9 +141,56 @@ require_existing_path() {
     fi
 }
 
+require_safe_stage_destination() {
+    local destination_name="$1"
+    local destination="$2"
+    local stage_root_real
+    local destination_real
+
+    stage_root_real="$(canonical_path "${LOCAL_STAGE_ROOT}")"
+    destination_real="$(canonical_path "${destination}")"
+
+    if [[ "${stage_root_real}" == "/" || "${stage_root_real}" == "$(canonical_path "${HOME}")" ]]; then
+        echo "Unsafe stage root for ${destination_name}: ${LOCAL_STAGE_ROOT}" >&2
+        echo "Choose a dedicated scratch directory, not / or the home directory." >&2
+        exit 1
+    fi
+    case "${destination_real}" in
+        "${stage_root_real}"/*) ;;
+        *)
+            echo "Unsafe ${destination_name}: ${destination}" >&2
+            echo "A staging destination must be a child of the stage root: ${LOCAL_STAGE_ROOT}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+stage_marker_matches() {
+    local kind="$1"
+    local source_real="$2"
+    local destination="$3"
+    local marker="${destination}/.megatron-bridge-stage-source"
+    [[ -f "${marker}" ]] && [[ "$(<"${marker}")" == "${kind}|${source_real}" ]]
+}
+
+directory_is_empty() {
+    local directory="$1"
+    [[ ! -d "${directory}" ]] || [[ -z "$(find "${directory}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+}
+
 run_rsync_tree() {
-    local source_dir="$1"
-    local dest_dir="$2"
+    local kind="$1"
+    local source_dir="$2"
+    local dest_dir="$3"
+    local source_real
+
+    source_real="$(canonical_path "${source_dir}")"
+
+    if ! directory_is_empty "${dest_dir}" && ! stage_marker_matches "${kind}" "${source_real}" "${dest_dir}"; then
+        echo "Safety check failed: refusing --delete into a non-empty, unowned destination: ${dest_dir}" >&2
+        echo "Use a new destination or remove the existing directory yourself after inspecting it." >&2
+        exit 1
+    fi
 
     if is_true "${DRY_RUN:-0}"; then
         echo "DRY_RUN=1: rsync -ah --info=progress2 --delete ${source_dir}/ ${dest_dir}/"
@@ -134,6 +199,7 @@ run_rsync_tree() {
 
     mkdir -p "${dest_dir}"
     rsync -ah --info=progress2 --delete "${source_dir}/" "${dest_dir}/"
+    printf '%s\n' "${kind}|${source_real}" >"${dest_dir}/.megatron-bridge-stage-source"
 }
 
 stage_hf_model() {
@@ -141,8 +207,8 @@ stage_hf_model() {
 
     local hf_model_real
     local stage_hf_real
-    hf_model_real="$(realpath -m "${HF_MODEL}")"
-    stage_hf_real="$(realpath -m "${STAGE_HF_MODEL_TO}")"
+    hf_model_real="$(canonical_path "${HF_MODEL}")"
+    stage_hf_real="$(canonical_path "${STAGE_HF_MODEL_TO}")"
 
     if [[ "${hf_model_real}" == "${stage_hf_real}" ]]; then
         echo "Skipping HF model staging: HF_MODEL already points to ${STAGE_HF_MODEL_TO}"
@@ -150,7 +216,7 @@ stage_hf_model() {
         echo "Using existing staged HF model at ${STAGE_HF_MODEL_TO} (set FORCE_STAGE_HF_MODEL=1 to refresh)"
     else
         echo "Staging HF model from ${HF_MODEL} to ${STAGE_HF_MODEL_TO}"
-        run_rsync_tree "${HF_MODEL}" "${STAGE_HF_MODEL_TO}"
+        run_rsync_tree hf "${HF_MODEL}" "${STAGE_HF_MODEL_TO}"
     fi
 
     HF_MODEL="${STAGE_HF_MODEL_TO}"
@@ -161,8 +227,8 @@ stage_megatron_checkpoint() {
 
     local megatron_dist_real
     local stage_megatron_real
-    megatron_dist_real="$(realpath -m "${MEGATRON_DIST}")"
-    stage_megatron_real="$(realpath -m "${STAGE_MEGATRON_CKPT_TO}")"
+    megatron_dist_real="$(canonical_path "${MEGATRON_DIST}")"
+    stage_megatron_real="$(canonical_path "${STAGE_MEGATRON_CKPT_TO}")"
 
     if [[ "${megatron_dist_real}" == "${stage_megatron_real}" ]]; then
         echo "Skipping Megatron checkpoint staging: MEGATRON_DIST already points to ${STAGE_MEGATRON_CKPT_TO}"
@@ -170,7 +236,7 @@ stage_megatron_checkpoint() {
         echo "Using existing staged Megatron checkpoint at ${STAGE_MEGATRON_CKPT_TO} (set FORCE_STAGE_MEGATRON_CKPT=1 to refresh)"
     else
         echo "Staging Megatron checkpoint from ${MEGATRON_DIST} to ${STAGE_MEGATRON_CKPT_TO}"
-        run_rsync_tree "${MEGATRON_DIST}" "${STAGE_MEGATRON_CKPT_TO}"
+        run_rsync_tree megatron "${MEGATRON_DIST}" "${STAGE_MEGATRON_CKPT_TO}"
     fi
 
     MEGATRON_DIST="${STAGE_MEGATRON_CKPT_TO}"
@@ -255,6 +321,29 @@ HF_MODEL_NAME="$(basename "${HF_MODEL}")"
 MEGATRON_CKPT_NAME="$(basename "${MEGATRON_DIST}")"
 STAGE_HF_MODEL_TO="${STAGE_HF_MODEL_TO:-${LOCAL_STAGE_ROOT}/hf_models/${HF_MODEL_NAME}}"
 STAGE_MEGATRON_CKPT_TO="${STAGE_MEGATRON_CKPT_TO:-${LOCAL_STAGE_ROOT}/Megatron-Bridge/checkpoints/${MEGATRON_CKPT_NAME}}"
+
+if is_true "${STAGE_HF}"; then
+    require_safe_stage_destination "HF staging destination" "${STAGE_HF_MODEL_TO}"
+fi
+if is_true "${STAGE_MEGATRON}"; then
+    require_safe_stage_destination "Megatron staging destination" "${STAGE_MEGATRON_CKPT_TO}"
+fi
+if is_true "${STAGE_HF}" && is_true "${STAGE_MEGATRON}"; then
+    STAGE_HF_REAL="$(canonical_path "${STAGE_HF_MODEL_TO}")"
+    STAGE_MEGATRON_REAL="$(canonical_path "${STAGE_MEGATRON_CKPT_TO}")"
+    case "${STAGE_HF_REAL}/" in
+        "${STAGE_MEGATRON_REAL}/"*)
+            echo "HF and Megatron staging destinations must not contain one another." >&2
+            exit 1
+            ;;
+    esac
+    case "${STAGE_MEGATRON_REAL}/" in
+        "${STAGE_HF_REAL}/"*)
+            echo "HF and Megatron staging destinations must not contain one another." >&2
+            exit 1
+            ;;
+    esac
+fi
 
 echo "======================================"
 echo "NVFP4 checkpoint staging"

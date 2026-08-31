@@ -102,6 +102,38 @@ get_default_save_sharded_strategy = getattr(
 )
 
 
+def _save_sharded_modelopt_state_for_strategy(
+    model,
+    checkpoint_name: str,
+    checkpoint_format: tuple[str, int],
+    async_strategy: str,
+) -> None:
+    """Save ModelOpt state through the strategy-compatible implementation."""
+    if async_strategy == "nvrx":
+        save_sharded_modelopt_state(model, checkpoint_name, checkpoint_format)
+        return
+
+    from megatron.bridge.orbit.training.modelopt_checkpoint import (
+        _save_sharded_modelopt_state_with_async_strategy,
+    )
+
+    _save_sharded_modelopt_state_with_async_strategy(
+        model,
+        checkpoint_name,
+        checkpoint_format,
+        async_strategy=async_strategy,
+    )
+
+
+def _restore_modelopt_state_before_sharded_schema(model, checkpoint_name: str, state_dict: dict[str, Any]) -> None:
+    """Restore ModelOpt modules before constructing the sharded-load schema."""
+    from megatron.bridge.orbit.training.modelopt_checkpoint import (
+        _maybe_restore_modelopt_state_for_sharded_load,
+    )
+
+    _maybe_restore_modelopt_state_for_sharded_load(model, checkpoint_name, state_dict)
+
+
 _, HAVE_RESIL = safe_import("nvidia_resiliency_ext.checkpointing")
 
 try:
@@ -1092,22 +1124,13 @@ def save_checkpoint(
                 # cfg.dist can be None during checkpoint conversion (save_megatron_model)
                 if not (cfg.dist and cfg.dist.use_decentralized_pg):
                     # orbit-seam(modelopt): honour an explicitly configured non-nvrx
-                    # async strategy when saving sharded ModelOpt state. The default
-                    # path stays on the module-level save_sharded_modelopt_state
-                    # symbol so existing tests can patch it.
-                    if ckpt_cfg.async_strategy != "nvrx":
-                        from megatron.bridge.orbit.training.modelopt_checkpoint import (
-                            _save_sharded_modelopt_state_with_async_strategy,
-                        )
-
-                        _save_sharded_modelopt_state_with_async_strategy(
-                            model,
-                            checkpoint_name,
-                            (ckpt_cfg.ckpt_format, 1),
-                            async_strategy=ckpt_cfg.async_strategy,
-                        )
-                    else:
-                        save_sharded_modelopt_state(model, checkpoint_name, (ckpt_cfg.ckpt_format, 1))
+                    # async strategy when saving sharded ModelOpt state.
+                    _save_sharded_modelopt_state_for_strategy(
+                        model,
+                        checkpoint_name,
+                        (ckpt_cfg.ckpt_format, 1),
+                        ckpt_cfg.async_strategy,
+                    )
     else:
         # [ModelOpt]: Inject modelopt_state into state_dict (skip if model is empty)
         if ckpt_type == CheckpointType.LOCAL:
@@ -2206,11 +2229,7 @@ def _load_checkpoint_from_path(
 
         # orbit-seam(modelopt): restore ModelOpt state before the sharded-load
         # schema is built, so quantizer keys exist for direct-load checkpoints.
-        from megatron.bridge.orbit.training.modelopt_checkpoint import (
-            _maybe_restore_modelopt_state_for_sharded_load,
-        )
-
-        _maybe_restore_modelopt_state_for_sharded_load(model, checkpoint_name, state_dict)
+        _restore_modelopt_state_before_sharded_schema(model, checkpoint_name, state_dict)
 
         sharded_sd_metadata["dp_cp_group"] = pg_collection.dp_cp
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)

@@ -1,6 +1,48 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import torch
 import triton
 import triton.language as tl
+
+
+# Keep these launch-policy values aligned with SGLang's unsegmented and
+# segmented OFT rotation kernels. Tiling large rotation blocks prevents one
+# Triton program from exceeding H100's shared-memory limit.
+OFT_SMEM_BUDGET = 232448
+OFT_UNTILED_MAX_BS = 128
+OFT_TILE_K = 128
+OFT_TILE_N = 128
+_PIPELINE_STAGES = 3
+
+
+def _tiled_smem_bytes(block_s: int, tile_k: int, tile_n: int, itemsize: int = 2) -> int:
+    """Estimate the staged operand bytes for one pipelined Triton program."""
+
+    return _PIPELINE_STAGES * itemsize * (block_s * tile_k + tile_k * tile_n)
+
+
+def _pick_tiles(block_size: int, block_s: int) -> tuple[int, int]:
+    """Choose the largest contraction and output tiles within the H100 budget."""
+
+    if block_size <= OFT_UNTILED_MAX_BS:
+        return block_size, block_size
+    tile_n = min(OFT_TILE_N, block_size)
+    tile_k = min(OFT_TILE_K, block_size)
+    while tile_k > 16 and _tiled_smem_bytes(block_s, tile_k, tile_n) > OFT_SMEM_BUDGET:
+        tile_k //= 2
+    return tile_k, tile_n
 
 
 @triton.jit
@@ -22,14 +64,17 @@ def _sgemm_oft_r_kernel(
     num_blocks: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    TILE_K: tl.constexpr,
+    TILE_N: tl.constexpr,
 ):
     """Unified Triton kernel for segmented block-diagonal OFT rotation.
 
     Handles all cases: standard (num_slices=1), QKV (num_slices=3),
     gate_up (num_slices=2) via the grid's axis 1.
 
-    Grid: (num_blocks * cdiv(max_seg_len, BLOCK_S), num_slices, num_segments)
-      axis 0: block_idx * num_token_tiles + token_tile_idx
+    Grid: (num_blocks * cdiv(max_seg_len, BLOCK_S) * num_col_tiles,
+           num_slices, num_segments)
+      axis 0: block_idx * token/column tiles + token_tile_idx * num_col_tiles + col_tile_idx
       axis 1: slice_id (0 for standard; 0/1/2 for QKV; 0/1 for gate_up)
       axis 2: segment index
 
@@ -45,9 +90,14 @@ def _sgemm_oft_r_kernel(
     slice_id = tl.program_id(1)
     seg_idx = tl.program_id(2)
 
+    num_col_tiles: tl.constexpr = tl.cdiv(BLOCK_SIZE, TILE_N)
     num_token_tiles = tl.cdiv(max_seg_len, BLOCK_S)
-    block_idx = pid_0 // num_token_tiles
-    token_tile_idx = pid_0 % num_token_tiles
+    tiles_per_block = num_token_tiles * num_col_tiles
+
+    block_idx = pid_0 // tiles_per_block
+    rem = pid_0 % tiles_per_block
+    token_tile_idx = rem // num_col_tiles
+    col_tile_idx = rem % num_col_tiles
 
     if block_idx >= num_blocks:
         return
@@ -67,8 +117,9 @@ def _sgemm_oft_r_kernel(
     actual_s = token_offset + s_offsets
     s_mask = actual_s < seg_len
 
-    c_offsets = tl.arange(0, BLOCK_SIZE)
-    k_offsets = tl.arange(0, BLOCK_SIZE)
+    col_offset = col_tile_idx * TILE_N
+    c_offsets = col_offset + tl.arange(0, TILE_N)
+    c_mask = c_offsets < BLOCK_SIZE
 
     # Input: always read from the same x (all slices share the same input)
     x_base = x_ptr + seg_start * x_stride_0 + block_idx * BLOCK_SIZE
@@ -79,13 +130,13 @@ def _sgemm_oft_r_kernel(
         # Base model passthrough: copy x to the corresponding output slice
         x_vals = tl.load(
             x_base + actual_s[:, None] * x_stride_0 + c_offsets[None, :],
-            mask=s_mask[:, None],
+            mask=s_mask[:, None] & c_mask[None, :],
             other=0.0,
         )
         tl.store(
             out_base + actual_s[:, None] * output_stride_0 + c_offsets[None, :],
             x_vals,
-            mask=s_mask[:, None],
+            mask=s_mask[:, None] & c_mask[None, :],
         )
         return
 
@@ -94,19 +145,28 @@ def _sgemm_oft_r_kernel(
     R_base = weights_ptr + adapter_idx * weights_stride_0 + weight_block_idx * weights_stride_1
 
     if BLOCK_SIZE >= 16:
-        # Use tl.dot for efficient matmul when block_size >= 16
-        x_tile = tl.load(
-            x_base + actual_s[:, None] * x_stride_0 + k_offsets[None, :],
-            mask=s_mask[:, None],
-            other=0.0,
-        )
-        R_block = tl.load(
-            R_base + k_offsets[:, None] * weights_stride_2 + c_offsets[None, :] * weights_stride_3,
-        )
-        out = tl.dot(x_tile, R_block, input_precision="ieee")
+        # Walk large blocks in fixed-width tiles so staged operands do not grow
+        # with the full OFT block size. For blocks <= 128 both loops execute
+        # once and retain the original kernel shape.
+        acc = tl.zeros((BLOCK_S, TILE_N), dtype=tl.float32)
+        for k0 in range(0, BLOCK_SIZE, TILE_K):
+            k_offsets = k0 + tl.arange(0, TILE_K)
+            k_mask = k_offsets < BLOCK_SIZE
+            x_tile = tl.load(
+                x_base + actual_s[:, None] * x_stride_0 + k_offsets[None, :],
+                mask=s_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+            R_tile = tl.load(
+                R_base + k_offsets[:, None] * weights_stride_2 + c_offsets[None, :] * weights_stride_3,
+                mask=k_mask[:, None] & c_mask[None, :],
+                other=0.0,
+            )
+            acc += tl.dot(x_tile.to(R_tile.dtype), R_tile, input_precision="ieee")
+        out = acc
     else:
         # Element-wise loop for small block sizes (block_size < 16)
-        acc = tl.zeros((BLOCK_S, BLOCK_SIZE), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_S, TILE_N), dtype=tl.float32)
         for k in range(BLOCK_SIZE):
             x_col = tl.load(
                 x_base + actual_s * x_stride_0 + k,
@@ -115,6 +175,8 @@ def _sgemm_oft_r_kernel(
             ).to(tl.float32)
             R_row = tl.load(
                 R_base + k * weights_stride_2 + c_offsets * weights_stride_3,
+                mask=c_mask,
+                other=0.0,
             ).to(tl.float32)
             acc += x_col[:, None] * R_row[None, :]
         out = acc
@@ -122,7 +184,7 @@ def _sgemm_oft_r_kernel(
     tl.store(
         out_base + actual_s[:, None] * output_stride_0 + c_offsets[None, :],
         out.to(x_ptr.dtype.element_ty),
-        mask=s_mask[:, None],
+        mask=s_mask[:, None] & c_mask[None, :],
     )
 
 
@@ -262,14 +324,19 @@ def sgemm_oft_r_fwd(
     if block_size == 0 or total_blocks_buf == 0:
         return x.repeat(1, num_slices)
 
+    if input_dim % block_size != 0:
+        raise ValueError(f"OFT input_dim ({input_dim}) must be divisible by block_size ({block_size})")
+
     num_blocks = input_dim // block_size
     output = torch.empty((total_tokens, num_slices * input_dim), device=x.device, dtype=x.dtype)
 
     BLOCK_S = 16
     BLOCK_SIZE = block_size
 
+    TILE_K, TILE_N = _pick_tiles(BLOCK_SIZE, BLOCK_S)
     num_token_tiles = triton.cdiv(batch_info.max_len, BLOCK_S)
-    grid = (num_blocks * num_token_tiles, num_slices, batch_info.num_segments)
+    num_col_tiles = triton.cdiv(BLOCK_SIZE, TILE_N)
+    grid = (num_blocks * num_token_tiles * num_col_tiles, num_slices, batch_info.num_segments)
 
     _sgemm_oft_r_kernel[grid](
         x,
@@ -289,6 +356,8 @@ def sgemm_oft_r_fwd(
         num_blocks=num_blocks,
         BLOCK_S=BLOCK_S,
         BLOCK_SIZE=BLOCK_SIZE,
+        TILE_K=TILE_K,
+        TILE_N=TILE_N,
     )
 
     return output

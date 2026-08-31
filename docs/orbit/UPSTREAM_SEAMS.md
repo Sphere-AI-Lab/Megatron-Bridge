@@ -171,10 +171,7 @@ internals and will break silently on a version bump:
   `megatron.core.tensor_parallel.layers` and
   `megatron.core.extensions.transformer_engine`.
 - `orbit/peft_ext/peft_mixin.py` — uses `PEFT._walk_model`, `params_to_save`.
-- `orbit/peft_ext/int4_lora.py` — `type(out) is LoRALinear` exact-type check.
 - `orbit/conversion/{fp8_preserve,oft_export}.py` — use
   `MegatronModelBridge._with_progress_tracking`, `_unwrap_name`.
 - `orbit/conversion/oft_export.py` — uses
   `model_bridge._megatron_local_name_to_global`.
-- `orbit/oft/te_oft/te_oft_layernorm_linear.py` — vendored copy of TE's
-  `LayerNormLinear`; tied to a specific TransformerEngine build.

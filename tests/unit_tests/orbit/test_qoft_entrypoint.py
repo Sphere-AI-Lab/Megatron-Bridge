@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import importlib.util
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,18 @@ from transformers import Qwen3Config
 
 _REPO_ROOT = Path(__file__).parents[3]
 _SCRIPT_PATH = _REPO_ROOT / "scripts" / "orbit" / "finetune_qoft.py"
+_QOFT_LAUNCHER_PATH = _REPO_ROOT / "scripts" / "orbit" / "run_qoft_finetune.sh"
+_STAGING_SCRIPT_PATH = _REPO_ROOT / "scripts" / "orbit" / "stage_nvfp4_checkpoint_pair.sh"
+
+_RETIRED_RECIPE_PATHS = [
+    "scripts/orbit/models/gpt_oss/finetune_oft.py",
+    "scripts/orbit/models/kimi_k25/finetune_qoft_int4.py",
+    "scripts/orbit/models/kimi_k25/finetune_qoft_nvfp4.py",
+    "scripts/orbit/models/moonlight_16b/finetune_qoft_int4.py",
+    "scripts/orbit/models/qwen3_moe/finetune_qoft.py",
+    "scripts/orbit/models/qwen3_moe/finetune_qoft_int4.py",
+    "scripts/orbit/tutorials/llama/01_quickstart_finetune_lora.py",
+]
 
 
 def _load_qoft_entrypoint():
@@ -32,6 +46,13 @@ def _load_qoft_entrypoint():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("relative_path", _RETIRED_RECIPE_PATHS)
+def test_superseded_model_recipes_are_removed(relative_path: str) -> None:
+    """The generic PEFT/QOFT entrypoints are the only maintained launch surfaces."""
+    assert not (_REPO_ROOT / relative_path).exists()
 
 
 @pytest.mark.unit
@@ -114,3 +135,200 @@ def test_fp8_preflight_reports_only_missing_request_keys() -> None:
     assert missing_key in message
     assert present_key not in message
     assert "checkpoint index of 1 entries" in message
+
+
+@pytest.mark.unit
+def test_qoft_cli_rejects_removed_quantized_lora_option(tmp_path: Path) -> None:
+    """The quantized entrypoint owns OFT only until QLoRA has an implementation."""
+    entrypoint = _load_qoft_entrypoint()
+
+    with pytest.raises(SystemExit):
+        entrypoint.parse_args(
+            [
+                "--quant",
+                "int4",
+                "--hf-model-path",
+                str(tmp_path / "hf-model"),
+                "--pretrained-checkpoint",
+                str(tmp_path / "checkpoint"),
+                "--peft",
+                "lora",
+            ]
+        )
+
+
+@pytest.mark.unit
+def test_moonlight_topology_validation_preserves_supported_layouts(tmp_path: Path) -> None:
+    """The generic entrypoint retains the old Moonlight launcher safety checks."""
+    entrypoint = _load_qoft_entrypoint()
+    spec = entrypoint.ARCH_SPECS["DeepseekV3ForCausalLM"]
+    base_argv = [
+        "--quant",
+        "int4",
+        "--hf-model-path",
+        str(tmp_path / "hf-model"),
+        "--pretrained-checkpoint",
+        str(tmp_path / "checkpoint"),
+    ]
+
+    supported = entrypoint.parse_args(base_argv + ["--tp", "2", "--ep", "2", "--sp"])
+    entrypoint._fill_arch_defaults(supported, spec)
+    entrypoint._validate_runtime_topology(supported, spec, world_size=4)
+
+    unsupported = entrypoint.parse_args(base_argv + ["--tp", "1", "--ep", "1"])
+    entrypoint._fill_arch_defaults(unsupported, spec)
+    with pytest.raises(SystemExit, match="supported GPU/parallel layouts"):
+        entrypoint._validate_runtime_topology(unsupported, spec, world_size=8)
+
+    missing_sp = entrypoint.parse_args(base_argv + ["--tp", "2", "--ep", "2", "--no-sp"])
+    entrypoint._fill_arch_defaults(missing_sp, spec)
+    with pytest.raises(SystemExit, match="sequence parallelism"):
+        entrypoint._validate_runtime_topology(missing_sp, spec, world_size=4)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("world_size", "expected_tp", "expected_ep", "expected_sp"),
+    [
+        (1, 1, 1, False),
+        (2, 1, 2, False),
+        (4, 2, 2, True),
+    ],
+)
+def test_moonlight_defaults_match_supported_world_size(
+    tmp_path: Path,
+    world_size: int,
+    expected_tp: int,
+    expected_ep: int,
+    expected_sp: bool,
+) -> None:
+    """Required-variable-only launches choose a supported Moonlight topology."""
+    entrypoint = _load_qoft_entrypoint()
+    spec = entrypoint.ARCH_SPECS["DeepseekV3ForCausalLM"]
+    args = entrypoint.parse_args(
+        [
+            "--quant",
+            "int4",
+            "--hf-model-path",
+            str(tmp_path / "hf-model"),
+            "--pretrained-checkpoint",
+            str(tmp_path / "checkpoint"),
+        ]
+    )
+
+    entrypoint._fill_arch_defaults(args, spec, world_size=world_size)
+    entrypoint._validate_runtime_topology(args, spec, world_size=world_size)
+
+    assert (args.tp, args.ep, args.sp) == (expected_tp, expected_ep, expected_sp)
+
+
+def _run_staging_script(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(_STAGING_SCRIPT_PATH), *args],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "DRY_RUN": "1"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.unit
+def test_staging_rejects_destination_outside_stage_root(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    (source / "model.safetensors").touch()
+    stage_root = tmp_path / "stage"
+    outside = tmp_path / "outside"
+
+    result = _run_staging_script(
+        "--hf-only",
+        "--hf-model",
+        str(source),
+        "--stage-root",
+        str(stage_root),
+        "--stage-hf-to",
+        str(outside),
+    )
+
+    assert result.returncode != 0
+    assert "must be a child of the stage root" in result.stderr
+
+
+@pytest.mark.unit
+def test_forced_staging_rejects_unowned_nonempty_destination(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    (source / "model.safetensors").touch()
+    stage_root = tmp_path / "stage"
+    destination = stage_root / "hf_models" / "model"
+    destination.mkdir(parents=True)
+    (destination / "unrelated.txt").write_text("keep me")
+
+    result = _run_staging_script(
+        "--hf-only",
+        "--hf-model",
+        str(source),
+        "--stage-root",
+        str(stage_root),
+        "--stage-hf-to",
+        str(destination),
+        "--force-hf",
+    )
+
+    assert result.returncode != 0
+    assert "refusing --delete into a non-empty, unowned destination" in result.stderr
+
+
+@pytest.mark.unit
+def test_qoft_launcher_forwards_explicit_operational_controls(tmp_path: Path) -> None:
+    """The consolidated launcher exposes former model-wrapper controls directly."""
+    capture_path = tmp_path / "torchrun-args.txt"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    torchrun = bin_dir / "torchrun"
+    torchrun.write_text('#!/bin/bash\nprintf "%s\\n" "$@" >"$CAPTURE_PATH"\n')
+    torchrun.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "CAPTURE_PATH": str(capture_path),
+        "QUANT": "int4",
+        "HF_MODEL_PATH": "/models/kimi",
+        "MEGATRON_CKPT": "/checkpoints/kimi",
+        "NUM_GPUS": "8",
+        "SP": "1",
+        "DISTRIBUTED_TIMEOUT_MINUTES": "60",
+        "TARGET_MODULES": "linear_fc1,linear_fc2",
+        "GROUP_SIZE": "128",
+        "SAVE_CHECKPOINTS": "1",
+        "SAVE_INTERVAL": "250",
+        "SKIP_EVAL": "1",
+        "PROFILE_MEMORY": "1",
+        "PROFILE_MEMORY_STEPS": "2",
+    }
+
+    result = subprocess.run(
+        ["bash", str(_QOFT_LAUNCHER_PATH)],
+        cwd=_REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    forwarded = capture_path.read_text().splitlines()
+    assert forwarded[:2] == ["--nproc_per_node=8", "scripts/orbit/finetune_qoft.py"]
+    assert "--sp" in forwarded
+    assert "--distributed-timeout-minutes" in forwarded
+    assert "--target-modules" in forwarded
+    assert "--group-size" in forwarded
+    assert "--save-checkpoints" in forwarded
+    assert "--save-interval" in forwarded
+    assert "--skip-eval" in forwarded
+    assert "--profile-memory" in forwarded
+    assert "--profile-memory-steps" in forwarded
+    assert "--peft" not in forwarded

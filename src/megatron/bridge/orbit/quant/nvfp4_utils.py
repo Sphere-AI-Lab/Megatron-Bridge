@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NVFP4 checkpoint-loading utilities for QOFT (mirrors peft/int4_utils.py).
+"""NVFP4 checkpoint-loading utilities for QOFT.
 
 The dense-linear half of the pipeline lives in
-``models.conversion.low_precision.nvfp4`` and is re-exported here for
-back-compat. This module adds the grouped-MoE expert pre-load shape transform
+``megatron.bridge.orbit.low_precision.nvfp4`` and is re-exported here as a
+combined import surface. This module mirrors the grouped-MoE INT4 helpers in
+``megatron.bridge.orbit.quant.int4_utils`` and adds the expert pre-load shape transform
 ``transform_sharded_state_dict_for_nvfp4`` that matches
 ``*.experts.linear_fc{1,2}.weight{N}`` runtime keys and emits the per-expert
 NVFP4 4-tuple entries the on-disk checkpoint stores.
@@ -39,7 +40,7 @@ from megatron.bridge.orbit.low_precision.int4 import (
     _replica_id_with_current_tp_rank,
 )
 
-# Re-exports for back-compat with code that imports from peft.nvfp4_utils.
+# Re-export the dense helpers through the combined NVFP4 checkpoint-loading surface.
 from megatron.bridge.orbit.low_precision.nvfp4 import (
     NVFP4_GROUP_SIZE,
     apply_modelopt_nvfp4_to_meta_model,
