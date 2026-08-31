@@ -40,6 +40,11 @@ from megatron.bridge.orbit.low_precision.common import (
     add_tensor_entry,
     prepare_empty_model_state,
 )
+from megatron.bridge.orbit.quant.int4_utils import (
+    INT4_PACKED_SUFFIX,
+    INT4_SCALE_SUFFIX,
+    INT4_SHAPE_SUFFIX,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -428,9 +433,15 @@ def build_int4_direct_model_state_dict(
             scale = converted_triplet.scale
             shape = converted_triplet.shape
 
-            add_tensor_entry(model_state, f"{task.param_name}_packed", packed, spill_manager=spill_manager)
-            add_tensor_entry(model_state, f"{task.param_name}_scale", scale, spill_manager=spill_manager)
-            add_tensor_entry(model_state, f"{task.param_name}_shape", shape, spill_manager=spill_manager)
+            add_tensor_entry(
+                model_state, f"{task.param_name}{INT4_PACKED_SUFFIX}", packed, spill_manager=spill_manager
+            )
+            add_tensor_entry(
+                model_state, f"{task.param_name}{INT4_SCALE_SUFFIX}", scale, spill_manager=spill_manager
+            )
+            add_tensor_entry(
+                model_state, f"{task.param_name}{INT4_SHAPE_SUFFIX}", shape, spill_manager=spill_manager
+            )
             num_int4 += 1
         else:
             hf_weights = int4_bridge.maybe_modify_loaded_hf_weight(
@@ -673,20 +684,20 @@ def transform_sharded_state_dict_for_int4_dense(
 
             triplets = [
                 (
-                    "_packed",
+                    INT4_PACKED_SUFFIX,
                     (local_out, packed_in),
                     (global_out, global_packed_in),
                     (out_offset_full, in_offset_full // 8),
                     torch.int32,
                 ),
                 (
-                    "_scale",
+                    INT4_SCALE_SUFFIX,
                     (local_out, num_groups),
                     (global_out, global_num_groups),
                     (out_offset_full, in_offset_full // group_size),
                     scale_dtype,
                 ),
-                ("_shape", (2,), (2,), (0,), torch.int64),
+                (INT4_SHAPE_SUFFIX, (2,), (2,), (0,), torch.int64),
             ]
 
             for suffix, local_sh, global_sh, off, dtype in triplets:
@@ -709,7 +720,7 @@ def transform_sharded_state_dict_for_int4_dense(
                         f"original_dense_data_device={original_device}"
                     ) from exc
                 cumulative_allocated_bytes += alloc_bytes
-                axis_frags = weight_axis_fragmentations if suffix != "_shape" else (1,)
+                axis_frags = weight_axis_fragmentations if suffix != INT4_SHAPE_SUFFIX else (1,)
                 new_sd[ckpt_key + suffix] = ShardedTensor(
                     key=ckpt_key + suffix,
                     data=data,
@@ -720,11 +731,11 @@ def transform_sharded_state_dict_for_int4_dense(
                     axis_fragmentations=axis_frags,
                     replica_id=(
                         _replica_id_with_current_tp_rank(sh_ten.replica_id)
-                        if suffix == "_shape"
+                        if suffix == INT4_SHAPE_SUFFIX
                         else sh_ten.replica_id
                     ),
                     prepend_axis_num=0,
-                    allow_shape_mismatch=(suffix == "_shape"),
+                    allow_shape_mismatch=(suffix == INT4_SHAPE_SUFFIX),
                 )
             replaced += 1
 

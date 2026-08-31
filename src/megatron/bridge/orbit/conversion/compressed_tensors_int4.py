@@ -65,10 +65,14 @@ from collections.abc import Iterable, Mapping
 
 import torch
 
+from megatron.bridge.orbit.quant.int4_utils import (
+    INT4_PACKED_SUFFIX as _PACKED_SUFFIX,
+    INT4_SCALE_SUFFIX as _SCALE_SUFFIX,
+    INT4_SHAPE_SUFFIX as _SHAPE_SUFFIX,
+)
+
 
 logger = logging.getLogger(__name__)
-
-_PACKED_SUFFIX = "_packed"
 
 
 def synthesize_virtual_weight_keys(keys: list[str]) -> list[str]:
@@ -89,7 +93,7 @@ def synthesize_virtual_weight_keys(keys: list[str]) -> list[str]:
     for key in keys:
         if key.endswith(_PACKED_SUFFIX):
             base = key[: -len(_PACKED_SUFFIX)]  # "...weight_packed" -> "...weight"
-            if f"{base}_scale" in all_keys and f"{base}_shape" in all_keys and base not in all_keys:
+            if f"{base}{_SCALE_SUFFIX}" in all_keys and f"{base}{_SHAPE_SUFFIX}" in all_keys and base not in all_keys:
                 virtual_keys.append(base)
     return list(keys) + virtual_keys
 
@@ -153,8 +157,8 @@ class CompressedTensorsINT4DequantMixin:
 
                 weight = dequantize_int4(
                     hf_state_dict[packed_key],
-                    hf_state_dict[hf_key + "_scale"],
-                    hf_state_dict[hf_key + "_shape"],
+                    hf_state_dict[hf_key + _SCALE_SUFFIX],
+                    hf_state_dict[hf_key + _SHAPE_SUFFIX],
                     device=hf_state_dict[packed_key].device,
                 )
                 logger.info("Dequantized INT4 -> BF16: %s shape=%s", hf_key, list(weight.shape))
