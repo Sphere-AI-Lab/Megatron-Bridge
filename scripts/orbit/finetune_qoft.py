@@ -108,6 +108,7 @@ ARCH_SPECS = {
             "global_batch_size": 8,
             "micro_batch_size": 1,
             "seq_length": 2048,
+            "group_size": 128,
         },
         "quant_defaults": {},
         "target_modules": {"fp8": None},
@@ -130,6 +131,7 @@ ARCH_SPECS = {
             "global_batch_size": 32,
             "micro_batch_size": 1,
             "seq_length": 2048,
+            "group_size": 128,
         },
         "quant_defaults": {"nvfp4": {"ep": 4}},
         "target_modules": {"fp8": None, "int4": None, "nvfp4": list(QWEN3_MOE_OFT_TARGET_MODULES)},
@@ -153,6 +155,7 @@ ARCH_SPECS = {
             "micro_batch_size": 1,
             "seq_length": 2048,
             "log_interval": 1,
+            "group_size": 32,
         },
         "quant_defaults": {},
         "target_modules": {
@@ -179,6 +182,7 @@ ARCH_SPECS = {
             "micro_batch_size": 1,
             "seq_length": 2048,
             "log_interval": 10,
+            "group_size": 32,
         },
         "quant_defaults": {"int4": {"int4_active_expert_chunk_size": 4, "int4_grouped_chunk_backend": "python"}},
         "target_modules": {"int4": None},
@@ -267,7 +271,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
 
     i4 = p.add_argument_group("INT4")
-    i4.add_argument("--group-size", type=int, default=128)
+    i4.add_argument(
+        "--group-size",
+        type=int,
+        default=None,
+        help="INT4 quantization group size (default per architecture -- getting this wrong "
+        "silently changes checkpoint-load precision, not a crash)",
+    )
     i4.add_argument(
         "--int4-active-expert-chunk-size",
         type=int,

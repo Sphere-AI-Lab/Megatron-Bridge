@@ -1121,7 +1121,7 @@ def install_int4_checkpoint_load_patches(
                     model_state, group_size=group_size, scale_dtype=INT4_SCALE_DTYPE
                 )
             else:
-                model_state = transform_sharded_state_dict_for_int4(model_state)
+                model_state = transform_sharded_state_dict_for_int4(model_state, group_size=group_size)
             state_dict[model_key] = model_state
         return state_dict
 

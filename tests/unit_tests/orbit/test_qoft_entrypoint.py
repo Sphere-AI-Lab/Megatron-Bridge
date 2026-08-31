@@ -93,6 +93,68 @@ def test_build_config_accepts_dense_qwen3_fp8(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("architecture", "expected_group_size"),
+    [
+        ("Qwen3MoeForCausalLM", 128),
+        ("KimiK25ForConditionalGeneration", 32),
+        ("DeepseekV3ForCausalLM", 32),
+    ],
+)
+def test_int4_group_size_defaults_per_architecture(
+    tmp_path: Path, architecture: str, expected_group_size: int
+) -> None:
+    """--group-size must default per architecture, not to one fixed value.
+
+    Kimi and Moonlight's converted checkpoints are quantized at group_size=32
+    (the legacy default their converter falls back to when the HF config has
+    no quantization_config); Qwen3 MoE's are quantized at 128. A single
+    global default would silently mismatch one side or the other and produce
+    wrong dequantized weights with no error -- see
+    docs/orbit/MIGRATION_MEMORY.md for the finding this regression-tests.
+    """
+    entrypoint = _load_qoft_entrypoint()
+    spec = entrypoint.ARCH_SPECS[architecture]
+    args = entrypoint.parse_args(
+        [
+            "--quant",
+            "int4",
+            "--hf-model-path",
+            str(tmp_path / "hf-model"),
+            "--pretrained-checkpoint",
+            str(tmp_path / "checkpoint"),
+        ]
+    )
+
+    entrypoint._fill_arch_defaults(args, spec)
+
+    assert args.group_size == expected_group_size
+
+
+@pytest.mark.unit
+def test_int4_group_size_explicit_override_wins_over_architecture_default(tmp_path: Path) -> None:
+    """An explicit --group-size must still take priority over the architecture default."""
+    entrypoint = _load_qoft_entrypoint()
+    spec = entrypoint.ARCH_SPECS["KimiK25ForConditionalGeneration"]
+    args = entrypoint.parse_args(
+        [
+            "--quant",
+            "int4",
+            "--hf-model-path",
+            str(tmp_path / "hf-model"),
+            "--pretrained-checkpoint",
+            str(tmp_path / "checkpoint"),
+            "--group-size",
+            "64",
+        ]
+    )
+
+    entrypoint._fill_arch_defaults(args, spec)
+
+    assert args.group_size == 64
+
+
+@pytest.mark.unit
 def test_fp8_explicit_checkpoint_requests_per_layer_state_dict() -> None:
     """Direct FP8 keys must disable Megatron's homogeneous-layer schema."""
     entrypoint = _load_qoft_entrypoint()
