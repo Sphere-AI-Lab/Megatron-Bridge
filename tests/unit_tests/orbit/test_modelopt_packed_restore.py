@@ -196,3 +196,37 @@ def test_grouped_moe_patch_uses_empty_extra_state_for_weightless_linears() -> No
         "modelopt_q_tensor_state": None,
     }
     assert not hasattr(grouped, "weight")
+
+
+@pytest.mark.unit
+def test_real_unpatched_update_compress_metadata_crashes_on_weightless_grouped() -> None:
+    """The concrete reason the patch must precede restore, on real ModelOpt code.
+
+    ``restore_from_modelopt_state`` replaying a ``real_quantize`` mode enters
+    ModelOpt's compress-restore, whose ``update_compress_metadata`` reads
+    ``module.weight`` on every RealQuantLinear without a hasattr guard. A grouped
+    expert linear has ``weight0..weightN`` and no ``.weight``, so the unpatched
+    function raises AttributeError -- before, in a fresh process, the patch that
+    used to be installed only after restore ever existed. This drives the real
+    function (no mocks), then shows the guarded variant handles the same module.
+    """
+    compress_module = importlib.import_module("modelopt.torch.quantization.compress")
+    marker = "_megatron_bridge_grouped_moe_patch_applied"
+    base_qtensor = importlib.import_module("modelopt.torch.quantization.qtensor.base_qtensor")
+    if getattr(base_qtensor, marker, False):  # pragma: no cover - defensive
+        pytest.skip("grouped-MoE patch already installed process-wide; cannot observe the crash")
+
+    root = torch.nn.Module()
+    grouped = _weightless_real_quant_linear()
+    root.add_module("grouped", grouped)
+
+    # Real, unpatched ModelOpt function: the crash the ordering fix prevents.
+    with pytest.raises(AttributeError):
+        compress_module.update_compress_metadata(root, {}, {})
+
+    # Same module, same real function once the guards are installed: no crash.
+    with _isolated_grouped_moe_patch() as modules:
+        metadata: dict = {}
+        modules["compress"].update_compress_metadata(root, {}, metadata)
+    assert metadata["q_tensor_state"] == {}
+    assert not hasattr(grouped, "weight")

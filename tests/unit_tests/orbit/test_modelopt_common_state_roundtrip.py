@@ -107,3 +107,90 @@ def test_common_reader_restore_returns_quietly_when_dir_missing(tmp_path: Path) 
 def test_common_reader_restore_rejects_virtual_pipeline_chunks(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="virtual pipeline"):
         restore_sharded_modelopt_state_via_common_reader([torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)], str(tmp_path))
+
+
+@pytest.fixture
+def single_rank_model_parallel(tmp_path: Path):
+    """Full parallel state for helpers that build ShardedTensors (one gloo rank)."""
+    from megatron.core import parallel_state
+
+    created = False
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend="gloo", init_method=f"file://{tmp_path}/pg_store", rank=0, world_size=1
+        )
+        created = True
+    parallel_state.initialize_model_parallel()
+    yield
+    parallel_state.destroy_model_parallel()
+    if created:
+        torch.distributed.destroy_process_group()
+
+
+class _TinyModeloptModel(torch.nn.Module):
+    """A minimal model ModelOpt can quantize and whose weights save as a distcp."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc = torch.nn.Linear(32, 32, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(x)
+
+    def sharded_state_dict(self, prefix: str = "", sharded_offsets=(), metadata=None):
+        from megatron.core.utils import make_sharded_tensor_for_checkpoint
+
+        # A real (tiny) sharded tensor so the outer checkpoint dir is a valid
+        # distributed checkpoint for the restore's extra_state phase to read.
+        return {f"{prefix}marker": make_sharded_tensor_for_checkpoint(torch.zeros(4), f"{prefix}marker")}
+
+
+@pytest.mark.unit
+def test_real_modelopt_quantize_compress_save_detect_restore_roundtrip(
+    single_rank_model_parallel, tmp_path: Path
+) -> None:
+    """End-to-end with NO mocks on the ModelOpt path: a real quantize + compress
+    (real_quantize mode) is saved, detected, and restored through the fixed
+    reader, and a fresh model recovers the converted + real-quantized state.
+
+    This is the reviewer's requested save -> detect -> restore filesystem
+    roundtrip. It exercises exactly what the fix changed: the pinned MCore's
+    save writes no common.pt (asserted), has_modelopt_state reads the embedded
+    common state anyway, and restore_sharded_modelopt_state_via_common_reader
+    loads common state through load_common_state_dict rather than a literal
+    common.pt open (which is what ModelOpt's own restore still does).
+    """
+    import copy
+
+    modelopt_quantization = pytest.importorskip("modelopt.torch.quantization")
+    import modelopt.torch.opt as mto
+    from modelopt.torch.opt.plugins.mcore_dist_checkpointing import remove_per_module_state
+    from modelopt.torch.quantization.compress import is_real_quantized
+
+    from megatron.bridge.orbit.training.modelopt_checkpoint import (
+        restore_sharded_modelopt_state_via_common_reader,
+    )
+
+    model = _TinyModeloptModel()
+    modelopt_quantization.quantize(model, modelopt_quantization.FP8_DEFAULT_CFG, lambda m: m(torch.randn(4, 32)))
+    modelopt_quantization.compress(model)
+    assert is_real_quantized(model)
+
+    checkpoint_dir = tmp_path / "ckpt"
+    checkpoint_dir.mkdir()
+    dist_checkpointing.save(model.sharded_state_dict(), str(checkpoint_dir))  # outer model weights
+    state_dir = checkpoint_dir / "modelopt_state"
+    state_dir.mkdir()
+    modelopt_state = copy.deepcopy(mto.modelopt_state(model))
+    remove_per_module_state(modelopt_state)
+    dist_checkpointing.save(modelopt_state, str(state_dir))
+
+    assert not (state_dir / "common.pt").exists(), "pinned MCore must write no common.pt"
+    assert has_modelopt_state(str(checkpoint_dir)) is True
+
+    fresh = _TinyModeloptModel()
+    assert not mto.ModeloptStateManager.is_converted(fresh)
+    restore_sharded_modelopt_state_via_common_reader([fresh], str(checkpoint_dir))
+
+    assert mto.ModeloptStateManager.is_converted(fresh)
+    assert is_real_quantized(fresh), "restore must recover the real_quantize mode"
