@@ -283,6 +283,15 @@ def test_moonlight_defaults_match_supported_world_size(
 
 
 @pytest.mark.unit
+def test_big_model_specs_define_pipeline_layout() -> None:
+    entrypoint = _load_qoft_entrypoint()
+
+    for spec in entrypoint.ARCH_SPECS.values():
+        if spec["big_block"]:
+            assert callable(spec.get("pipeline_layout_fn")), spec["label"]
+
+
+@pytest.mark.unit
 def test_qoft_launcher_forwards_explicit_operational_controls(tmp_path: Path) -> None:
     """The consolidated launcher exposes former model-wrapper controls directly."""
     capture_path = tmp_path / "torchrun-args.txt"

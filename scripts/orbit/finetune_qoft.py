@@ -87,6 +87,31 @@ QWEN3_MOE_OFT_TARGET_MODULES = [
     "linear_fc2",
 ]
 
+# Single source of truth for Moonlight's supported INT4 GPU/parallel
+# layouts: _fill_arch_defaults uses it to pick tp/ep/sp defaults from
+# world_size, and _validate_runtime_topology uses the same table to reject
+# any other layout. Keeping both readers on one table means a new supported
+# layout (or a correction to an existing one) cannot update one without the
+# other.
+MOONLIGHT_INT4_TOPOLOGIES: dict[int, dict[str, int | bool]] = {
+    1: {"tp": 1, "ep": 1, "sp": False, "pp": 1},
+    2: {"tp": 1, "ep": 2, "sp": False, "pp": 1},
+    4: {"tp": 2, "ep": 2, "sp": True, "pp": 1},
+}
+
+
+def _kimi_k25_pipeline_layout(pp: int):
+    from megatron.bridge.recipes.kimi.kimi_k2 import _get_kimi_k2_pipeline_layout
+
+    return _get_kimi_k2_pipeline_layout(pp, 1)
+
+
+def _moonlight_pipeline_layout(pp: int):
+    from megatron.bridge.recipes.moonlight.moonlight_16b import _get_moonlight_pipeline_layout
+
+    return _get_moonlight_pipeline_layout(pp, 1)
+
+
 # Per-architecture behavior, carried over verbatim from the retired
 # per-model entrypoints. ``defaults`` fills any CLI argument left unset;
 # ``quant_defaults`` refines them per quantization format.
@@ -147,6 +172,7 @@ ARCH_SPECS = {
         "trust_remote_code": True,
         "quants": ("int4", "nvfp4"),
         "big_block": True,
+        "pipeline_layout_fn": _kimi_k25_pipeline_layout,
         "int4_scope": "experts",
         "validate_nonfinite": False,
         "defaults": {
@@ -175,6 +201,7 @@ ARCH_SPECS = {
         "trust_remote_code": True,
         "quants": ("int4",),
         "big_block": True,
+        "pipeline_layout_fn": _moonlight_pipeline_layout,
         "int4_scope": "experts",
         "validate_nonfinite": True,
         "defaults": {
@@ -333,12 +360,8 @@ def _fill_arch_defaults(args, spec: dict, *, world_size: int | None = None) -> N
     defaults = dict(spec["defaults"])
     defaults.update(spec["quant_defaults"].get(args.quant, {}))
     if spec["key"] == "moonlight" and args.quant == "int4" and world_size is not None:
-        topology_defaults = {
-            1: {"tp": 1, "ep": 1, "sp": False},
-            2: {"tp": 1, "ep": 2, "sp": False},
-            4: {"tp": 2, "ep": 2, "sp": True},
-        }
-        defaults.update(topology_defaults.get(world_size, {}))
+        topology = MOONLIGHT_INT4_TOPOLOGIES.get(world_size, {})
+        defaults.update({name: value for name, value in topology.items() if name != "pp"})
     for name, value in defaults.items():
         if getattr(args, name) is None:
             setattr(args, name, value)
@@ -382,17 +405,14 @@ def _validate_runtime_topology(args, spec: dict, *, world_size: int) -> None:
     if spec["key"] != "moonlight" or args.quant != "int4":
         return
 
-    supported = {
-        (1, 1, 1, 1),
-        (2, 1, 2, 1),
-        (4, 2, 2, 1),
-    }
-    topology = (world_size, args.tp, args.ep, args.pp)
-    if topology not in supported:
+    expected = MOONLIGHT_INT4_TOPOLOGIES.get(world_size)
+    if expected is None or (args.tp, args.ep, args.pp) != (expected["tp"], expected["ep"], expected["pp"]):
+        supported_desc = "; ".join(
+            f"WORLD_SIZE={ws} TP={topo['tp']} EP={topo['ep']} PP={topo['pp']}"
+            for ws, topo in sorted(MOONLIGHT_INT4_TOPOLOGIES.items())
+        )
         raise SystemExit(
-            "Moonlight INT4 supported GPU/parallel layouts are: "
-            "WORLD_SIZE=1 TP=1 EP=1 PP=1; WORLD_SIZE=2 TP=1 EP=2 PP=1; "
-            "WORLD_SIZE=4 TP=2 EP=2 PP=1. "
+            f"Moonlight INT4 supported GPU/parallel layouts are: {supported_desc}. "
             f"Received WORLD_SIZE={world_size} TP={args.tp} EP={args.ep} PP={args.pp}."
         )
     if args.tp > 1 and not args.sp:
@@ -420,14 +440,10 @@ def _apply_big_model_block(config, args, spec: dict) -> None:
     config.model.pipeline_dtype = torch.bfloat16 if args.pp > 1 else None
 
     if args.pp > 1:
-        if spec["key"] == "kimi_k25":
-            from megatron.bridge.recipes.kimi.kimi_k2 import _get_kimi_k2_pipeline_layout
-
-            config.model.pipeline_model_parallel_layout = _get_kimi_k2_pipeline_layout(args.pp, 1)
-        else:
-            from megatron.bridge.recipes.moonlight.moonlight_16b import _get_moonlight_pipeline_layout
-
-            config.model.pipeline_model_parallel_layout = _get_moonlight_pipeline_layout(args.pp, 1)
+        pipeline_layout_fn = spec.get("pipeline_layout_fn")
+        if pipeline_layout_fn is None:
+            raise SystemExit(f"{spec['label']} has no pipeline_layout_fn defined in ARCH_SPECS for pp > 1.")
+        config.model.pipeline_model_parallel_layout = pipeline_layout_fn(args.pp)
     else:
         config.model.pipeline_model_parallel_layout = None
 

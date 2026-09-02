@@ -26,6 +26,13 @@ from typing import Any, Dict
 import torch
 
 
+# Canonical INT4 checkpoint triplet suffixes. All Orbit INT4 checkpoint
+# readers and writers should use these instead of spelling the strings
+# independently.
+INT4_PACKED_SUFFIX = "_packed"
+INT4_SCALE_SUFFIX = "_scale"
+INT4_SHAPE_SUFFIX = "_shape"
+
 _EXPERT_WEIGHT_RE = re.compile(r"^(.*\.experts\.linear_fc[12])\.weight(\d+)$")
 # Also matches the base "weight" key (no digit suffix) for expert grouped linears.
 # This key is produced by sharded_state_dict() but has no corresponding checkpoint
@@ -120,9 +127,9 @@ def transform_sharded_state_dict_for_int4(
         # weight (e.g. after loading an INT4 checkpoint for QOFT), prefer those
         # real triplets and drop the emptied BF16 placeholder weight entry.
         if (
-            f"{canonical_key}_packed" in canonical_keys
-            and f"{canonical_key}_scale" in canonical_keys
-            and f"{canonical_key}_shape" in canonical_keys
+            f"{canonical_key}{INT4_PACKED_SUFFIX}" in canonical_keys
+            and f"{canonical_key}{INT4_SCALE_SUFFIX}" in canonical_keys
+            and f"{canonical_key}{INT4_SHAPE_SUFFIX}" in canonical_keys
         ):
             continue
 
@@ -228,7 +235,7 @@ def transform_sharded_state_dict_for_int4(
         triplets = [
             # weight_packed: [out, in/8] int32 — the quantized weights
             (
-                "_packed",
+                INT4_PACKED_SUFFIX,
                 (local_out, packed_in),
                 (global_out, global_packed_in),
                 (out_offset, in_offset // 8),
@@ -237,7 +244,7 @@ def transform_sharded_state_dict_for_int4(
             ),
             # weight_scale: [out, in/group_size] fp16 — per-group scale factors
             (
-                "_scale",
+                INT4_SCALE_SUFFIX,
                 (local_out, num_groups),
                 (global_out, global_num_groups),
                 (out_offset, in_offset // group_size),
@@ -245,7 +252,7 @@ def transform_sharded_state_dict_for_int4(
                 scale_dtype,
             ),
             # weight_shape: [2] int64 — original (out, in) dimensions
-            ("_shape", (2,), (2,), (0,), (1,), torch.int64),
+            (INT4_SHAPE_SUFFIX, (2,), (2,), (0,), (1,), torch.int64),
         ]
 
         for suffix, local_sh, global_sh, off, axis_frags, dtype in triplets:
