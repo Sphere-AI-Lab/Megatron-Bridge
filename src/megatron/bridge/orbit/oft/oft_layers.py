@@ -1358,54 +1358,115 @@ class OFTLinear(AdapterWrapper):
 
         input_chunks = list(torch.split(x_to_split, token_splits, dim=split_dim))
 
-        for idx in active_experts:
-            name = self._weight_names[idx]
-            suffix = name[len("weight") :]
-            scale_suffix = self._nvfp4_grouped_scale_suffix(suffix)
-            if scale_suffix is None:
-                raise ValueError(
-                    f"NVFP4 grouped forward: missing weight_scale/weight_double_scale for local expert {suffix}"
+        # The rotated input requires grad, so each F.linear saves its WEIGHT for
+        # backward (grad_input = grad_output @ W) -- and that weight is the
+        # temporary BF16 dequantized copy, not the 4-bit buffer. Without hooks,
+        # the graph retained every active expert's BF16 copy until this layer's
+        # backward; with no recomputation (the Qwen3-MoE NVFP4 recipe) those
+        # copies accumulated across all layers, ~4x the entire 4-bit payload.
+        # Same pack/unpack pattern as _forward_nvfp4_grouped_eager, except the
+        # handle stores the SwiGLU packed halves separately (caching the fused
+        # torch.cat would keep a duplicate 4-bit payload alive) and each entry
+        # is registered only for the duration of its own F.linear: the save is
+        # synchronous inside the call, and popping immediately afterwards means
+        # a later allocation reusing the freed address can never be mistaken
+        # for a registered weight. Peak = ONE dequantized expert at a time.
+        ptr_to_handle: Dict[int, tuple] = {}
+
+        def pack(tensor):
+            handle = ptr_to_handle.get(tensor.data_ptr())
+            if handle is not None:
+                return (
+                    *handle,
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.storage_offset(),
                 )
-            scale = getattr(self.to_wrap, f"weight_scale{scale_suffix}")
-            double_scale = getattr(self.to_wrap, f"weight_double_scale{scale_suffix}")
+            return tensor
 
-            packed_full = getattr(self.to_wrap, f"{name}_packed", None)
-            if packed_full is None:
-                # SwiGLU fc1: reassemble fused packed weight from gate (_w) + up (_v) halves.
-                w_half = getattr(self.to_wrap, f"{name}_w_packed", None)
-                v_half = getattr(self.to_wrap, f"{name}_v_packed", None)
-                if w_half is None or v_half is None:
+        def unpack(packed_tuple):
+            if isinstance(packed_tuple, tuple) and len(packed_tuple) == 10:
+                (
+                    packed_full,
+                    w_half,
+                    v_half,
+                    scale,
+                    double_scale,
+                    shape,
+                    dtype,
+                    saved_shape,
+                    saved_stride,
+                    saved_storage_offset,
+                ) = packed_tuple
+                packed = packed_full if packed_full is not None else torch.cat([w_half, v_half], dim=0)
+                base = dequantize_nvfp4(packed, scale, double_scale, shape, device=packed.device, dtype=dtype)
+                return base.as_strided(saved_shape, saved_stride, saved_storage_offset)
+            return packed_tuple
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            for idx in active_experts:
+                name = self._weight_names[idx]
+                suffix = name[len("weight") :]
+                scale_suffix = self._nvfp4_grouped_scale_suffix(suffix)
+                if scale_suffix is None:
                     raise ValueError(
-                        f"NVFP4 grouped forward: expert {idx} missing both `{name}_packed` and "
-                        f"`{name}_w_packed`/`{name}_v_packed` buffers"
+                        f"NVFP4 grouped forward: missing weight_scale/weight_double_scale for local expert {suffix}"
                     )
-                packed = torch.cat([w_half, v_half], dim=0)
-                local_out = int(w_half.shape[0]) + int(v_half.shape[0])
-                local_in = int(w_half.shape[1]) * 2
-            else:
-                packed = packed_full
-                local_out = int(packed.shape[0])
-                local_in = int(packed.shape[1]) * 2
+                scale = getattr(self.to_wrap, f"weight_scale{scale_suffix}")
+                double_scale = getattr(self.to_wrap, f"weight_double_scale{scale_suffix}")
 
-            w_compute = dequantize_nvfp4(
-                packed,
-                scale,
-                double_scale,
-                (local_out, local_in),
-                device=x.device,
-                dtype=x.dtype,
-            )
-            bias = _get_active_bias_tensor(self.to_wrap, f"bias{idx}")
-            # F.linear expects [..., in_features]; for split_dim==1 the chunk is
-            # [hidden, tokens] so transpose to [tokens, hidden] for the GEMM, then
-            # transpose back when concatenating.
-            chunk_input = input_chunks[idx]
-            if split_dim == 1:
-                chunk_input = chunk_input.transpose(0, 1).contiguous()
-            chunk_output = F.linear(chunk_input, w_compute, bias)
-            if split_dim == 1:
-                chunk_output = chunk_output.transpose(0, 1).contiguous()
-            output_chunks[idx] = chunk_output
+                packed_full = getattr(self.to_wrap, f"{name}_packed", None)
+                w_half = v_half = None
+                if packed_full is None:
+                    # SwiGLU fc1: reassemble fused packed weight from gate (_w) + up (_v) halves.
+                    w_half = getattr(self.to_wrap, f"{name}_w_packed", None)
+                    v_half = getattr(self.to_wrap, f"{name}_v_packed", None)
+                    if w_half is None or v_half is None:
+                        raise ValueError(
+                            f"NVFP4 grouped forward: expert {idx} missing both `{name}_packed` and "
+                            f"`{name}_w_packed`/`{name}_v_packed` buffers"
+                        )
+                    packed = torch.cat([w_half, v_half], dim=0)
+                    local_out = int(w_half.shape[0]) + int(v_half.shape[0])
+                    local_in = int(w_half.shape[1]) * 2
+                else:
+                    packed = packed_full
+                    local_out = int(packed.shape[0])
+                    local_in = int(packed.shape[1]) * 2
+
+                w_compute = dequantize_nvfp4(
+                    packed,
+                    scale,
+                    double_scale,
+                    (local_out, local_in),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+                w_compute_ptr = w_compute.data_ptr()
+                ptr_to_handle[w_compute_ptr] = (
+                    packed_full,
+                    w_half,
+                    v_half,
+                    scale,
+                    double_scale,
+                    (local_out, local_in),
+                    w_compute.dtype,
+                )
+                try:
+                    bias = _get_active_bias_tensor(self.to_wrap, f"bias{idx}")
+                    # F.linear expects [..., in_features]; for split_dim==1 the chunk is
+                    # [hidden, tokens] so transpose to [tokens, hidden] for the GEMM, then
+                    # transpose back when concatenating.
+                    chunk_input = input_chunks[idx]
+                    if split_dim == 1:
+                        chunk_input = chunk_input.transpose(0, 1).contiguous()
+                    chunk_output = F.linear(chunk_input, w_compute, bias)
+                finally:
+                    ptr_to_handle.pop(w_compute_ptr, None)
+                    del w_compute
+                if split_dim == 1:
+                    chunk_output = chunk_output.transpose(0, 1).contiguous()
+                output_chunks[idx] = chunk_output
 
         output = torch.cat(output_chunks, dim=split_dim)
         # Restore trailing-junk padding so the caller sees a tensor of the
