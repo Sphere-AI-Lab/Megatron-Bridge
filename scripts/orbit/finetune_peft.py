@@ -38,6 +38,7 @@ import argparse
 import os
 
 from megatron.bridge import AutoBridge
+from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
 from megatron.bridge.orbit.oft.oft import OFT
 from megatron.bridge.peft.dora import DoRA
 from megatron.bridge.peft.lora import LoRA
@@ -102,6 +103,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     tr.add_argument("--recompute", action="store_true", help="Full uniform recompute (large models)")
 
     oft = p.add_argument_group("OFT")
+    oft.add_argument(
+        "--oft-type",
+        choices=("canonical_oft", "oft"),
+        default="canonical_oft",
+        help="canonical_oft (default): independent rotations per Q/K/V and per gate/up. "
+        "oft: the legacy shared-R class, one rotation for the whole fused projection.",
+    )
     oft.add_argument("--block-size", type=int, default=32)
     oft.add_argument("--coft", action="store_true", default=False)
     oft.add_argument("--eps", type=float, default=6e-5)
@@ -125,12 +133,17 @@ def build_peft(args):
     if args.peft == "none":
         return None
     if args.peft == "oft":
-        return OFT(
-            block_size=args.block_size,
-            coft=args.coft,
-            eps=args.eps,
-            block_share=args.block_share,
-        )
+        kwargs = {
+            "block_size": args.block_size,
+            "coft": args.coft,
+            "eps": args.eps,
+            "block_share": args.block_share,
+        }
+        if args.oft_type == "oft":
+            return OFT(**kwargs)
+        # This entrypoint exposes no --target-modules, and CanonicalOFT's default
+        # target list is already the split (linear_q / linear_fc1_gate / ...) form.
+        return CanonicalOFT(**kwargs)
     cls = DoRA if args.peft == "dora" else LoRA
     return cls(dim=args.dim, alpha=args.alpha, dropout=args.dropout)
 

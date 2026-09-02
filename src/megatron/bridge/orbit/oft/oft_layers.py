@@ -265,7 +265,7 @@ try:
     HAS_TRITON_OFT = True
 except ImportError:
     HAS_TRITON_OFT = False
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
@@ -359,6 +359,73 @@ class MultiplicativeDropoutLayer(nn.Module):
         return x * mask + eye * (1 - mask)
 
 
+def _make_expert_ep_sharded_tensor(
+    tensor: torch.Tensor,
+    key: str,
+    *,
+    ep_new_axis: bool,
+    blocks_local_axis: int,
+    blocks_tp_sharded: bool,
+    sharded_offsets: Tuple = (),
+) -> ShardedTensor:
+    """Build a ShardedTensor for expert ``oft_r`` with EP encoded as a real axis.
+
+    Distributed checkpointing distinguishes tensors two ways: key/offsets say
+    *what data this is*; ``replica_id`` says *who else holds an identical copy*
+    (the all-zero holder is the one that writes). Expert ``oft_r`` is rank-local
+    learned state (``allreduce=False``), so the EP rank is part of the data's
+    identity and must live in the offsets. Encoding it in ``replica_id`` instead
+    marks unique data as skippable duplicates and the default
+    ``keep_only_main_replica`` save silently drops every nonzero-EP-rank
+    rotation. Mirrors ``peft.utils._make_grouped_expert_sharded_tensor`` (the
+    multi-LoRA fix for the same problem) and MCore's own grouped experts.
+
+    Args:
+        tensor: the local ``oft_r``.
+        key: checkpoint key.
+        ep_new_axis: True when the local tensor has no expert axis (one rotation
+            shared across this rank's experts) so EP becomes a new prepended
+            axis of length ``ep_size`` with this rank at index ``ep_rank``.
+            False when local axis 0 already is the packed local-expert axis
+            (``GroupedOFTRotation``'s 3D layout) and EP shards it.
+        blocks_local_axis: local axis holding rotation blocks (0 for 2D, 1 for 3D).
+        blocks_tp_sharded: True when the blocks axis is expert-TP sharded
+            (RowParallel base without ``block_share``); its identity then also
+            goes into the offsets. False means ETP ranks replicate the blocks,
+            which is recorded in ``replica_id``'s TP slot instead.
+        sharded_offsets: offsets prepended by enclosing modules.
+    """
+    prepend_axis_num = len(sharded_offsets)
+    rank_offsets = list(sharded_offsets)
+
+    ep_rank = parallel_state.get_expert_model_parallel_rank() or 0
+    ep_size = parallel_state.get_expert_model_parallel_world_size() or 1
+    etp_rank = parallel_state.get_expert_tensor_parallel_rank() or 0
+    etp_size = parallel_state.get_expert_tensor_parallel_world_size() or 1
+    edp_rank = parallel_state.get_expert_data_parallel_rank() or 0
+
+    # Same tuple either way -- global axis ``prepend_axis_num`` is the EP axis.
+    # With ``ep_new_axis`` it counts as a prepended axis (local tensor lacks it);
+    # otherwise it shards the local expert axis 0 in place.
+    rank_offsets.append((prepend_axis_num, ep_rank, ep_size))
+    if ep_new_axis:
+        prepend_axis_num += 1
+
+    if blocks_tp_sharded and etp_size > 1:
+        rank_offsets.append((prepend_axis_num + blocks_local_axis, etp_rank, etp_size))
+
+    # ETP ranks are true replicas only when the blocks axis is NOT sharded
+    # across them; a sharded axis already gives each ETP rank its own offsets.
+    etp_replica = 0 if blocks_tp_sharded else etp_rank
+    return ShardedTensor.from_rank_offsets(
+        key,
+        tensor,
+        *rank_offsets,
+        replica_id=(0, etp_replica, edp_rank),
+        prepend_axis_num=prepend_axis_num,
+    )
+
+
 class OFTRotationModule(nn.Module):
     """Core OFT module that computes block-diagonal orthogonal transformations.
 
@@ -445,6 +512,13 @@ class OFTRotationModule(nn.Module):
         self.oft_r = nn.Parameter(torch.zeros(num_blocks, n_elements, dtype=dtype, device=device))
         if self.is_expert:
             self.oft_r.allreduce = False
+        # Stamped True by wrappers around grouped expert bases (TEGroupedLinear):
+        # those containers pass no per-expert sharded offsets and rewrite no
+        # replica ids for adapter keys, and this one shared rotation is trained
+        # per EP rank, so sharded_state_dict must encode the EP rank itself as
+        # a prepended axis. Sequential expert containers leave this False --
+        # SequentialMLP handles expert identity for every child key.
+        self.ep_axis_sharded = False
 
         self.dropout = MultiplicativeDropoutLayer(p=module_dropout)
 
@@ -525,22 +599,33 @@ class OFTRotationModule(nn.Module):
         return R.to(previous_dtype)
 
     def _project_batch(self, weight: torch.Tensor, eps: float) -> torch.Tensor:
-        """Project weight parameters for Constrained OFT.
+        """Project each block onto the Constrained-OFT epsilon-ball.
 
-        Constructs the rotation from the weight, computes distance from identity,
-        and scales the weight so the rotation stays within an epsilon-ball.
+        The constraint is on the skew-symmetric generator and is centred on
+        **zero**, matching the reference PEFT OFT implementation. Blocks already
+        inside the ball pass through unchanged; blocks outside are pulled back so
+        their Frobenius norm becomes exactly ``eps``. That makes the boundary a
+        fixed point, which matters because this runs on every forward.
+
+        Centring on the identity instead is wrong: ``Q_skew`` is skew-symmetric,
+        so its diagonal is structurally zero and
+        ``||Q - I||^2 == ||Q||^2 + block_size``. The measured distance could then
+        never fall below ``sqrt(block_size)`` (5.66 at the default block_size=32),
+        so the scale was a near-constant ``eps / sqrt(block_size)`` ~= 1e-5 for
+        any parameter value, and -- because the measurement did not track the
+        value being scaled -- there was no fixed point except zero. Repeated
+        forwards drove the parameter to zero and the rotation to the identity.
 
         Args:
             weight: (num_blocks, n_elements) parameter vectors.
-            eps: Maximum Frobenius norm distance from identity.
+            eps: Maximum Frobenius norm of each block's skew-symmetric generator.
         """
         Q_skew = self._pytorch_skew_symmetric(weight, self.block_size)
-        bs = self.block_size
-        eye = torch.eye(bs, dtype=weight.dtype, device=weight.device).unsqueeze(0)
-        diff = Q_skew - eye
-        norm = torch.norm(diff, p="fro", dim=(-2, -1), keepdim=True)
+        norm = torch.norm(Q_skew, p="fro", dim=(-2, -1), keepdim=True)
+        # Inside the ball clamp() returns `norm` and the ratio is 1 (up to the
+        # 1e-8 division guard); outside it returns `eps` and the ratio is the
+        # exact shrink factor. Scaling `weight` scales Q_skew by the same factor.
         scale = torch.clamp(norm, max=eps) / (norm + 1e-8)
-        # Scale the original weight vectors
         return weight * (scale.squeeze(-1).squeeze(-1).unsqueeze(-1))
 
     def _compute_rotation(self) -> torch.Tensor:
@@ -549,16 +634,32 @@ class OFTRotationModule(nn.Module):
         Returns:
             (r, block_size, block_size) orthogonal blocks.
         """
+        if self.coft:
+            # Project the Parameter itself, *before* the tensor-parallel wrapper.
+            # ``oft_r`` is a leaf, so an in-place write under ``no_grad`` is legal
+            # on every layout -- mechanically the same thing an optimizer step does.
+            #
+            # Projecting ``oft_r_parallel`` instead was broken on column-parallel
+            # layers (linear_qkv, linear_fc1): copy_to_tensor_model_parallel_region
+            # returns an autograd *view* of the parameter, so the in-place write
+            # never reached the parameter and the following _cayley_batch tripped
+            # autograd's view-version check ("Output 0 of _CopyToModelParallelRegion
+            # is a view and its base ... has been modified inplace").
+            #
+            # Ranks stay consistent under both layouts. _project_batch reduces over
+            # dim=(-2, -1) only, i.e. one norm per block with no cross-block term,
+            # so a row-parallel rank projecting its own shard produces bitwise the
+            # same values as slicing a full projection; column-parallel ranks all
+            # hold the same replicated oft_r and apply the same deterministic map.
+            with torch.no_grad():
+                self.oft_r.copy_(self._project_batch(self.oft_r, eps=self.eps))
+
         if self.input_is_parallel:
             # Row Tensor Parallel: each TP rank has a shard of the blocks, so use directly
             oft_r_parallel = self.oft_r
         else:
             # Column Tensor Parallel: each TP rank has the full set of blocks, so replicate across TP ranks
             oft_r_parallel = copy_to_tensor_model_parallel_region(self.oft_r, group=self.tp_group)
-
-        if self.coft:
-            with torch.no_grad():
-                oft_r_parallel.copy_(self._project_batch(oft_r_parallel, eps=self.eps))
 
         R = self._cayley_batch(oft_r_parallel, self.block_size)
 
@@ -631,6 +732,21 @@ class OFTRotationModule(nn.Module):
         sharded_state_dict = {}
         state_dict = self.state_dict(prefix="", keep_vars=True)
 
+        if getattr(self, "ep_axis_sharded", False):
+            # Per-EP-rank shared rotation on a grouped expert base: the EP rank
+            # is part of the data's identity (see _make_expert_ep_sharded_tensor).
+            key = f"{prefix}oft_r"
+            return {
+                key: _make_expert_ep_sharded_tensor(
+                    state_dict["oft_r"],
+                    key,
+                    ep_new_axis=True,
+                    blocks_local_axis=0,
+                    blocks_tp_sharded=self.input_is_parallel and not self.block_share,
+                    sharded_offsets=sharded_offsets,
+                )
+            }
+
         # Determine TP sharding: when input_is_parallel, oft_r blocks are
         # partitioned across TP ranks (axis 0). Otherwise replicated.
         if self.input_is_parallel and not self.block_share:
@@ -648,16 +764,20 @@ class OFTRotationModule(nn.Module):
         )
 
         if self.is_expert:
-            ep_rank = parallel_state.get_expert_model_parallel_rank()
-            edp_rank = parallel_state.get_expert_data_parallel_rank()
-            dp_size = parallel_state.get_data_parallel_world_size()
-            # TODO: This modification logic is in question and needs further verification.
-            rank = (ep_rank + 1) * (edp_rank + 1) - 1 if dp_size == 1 else ep_rank
-            for sd in [oft_r_sd]:
-                for v in sd.values():
-                    if hasattr(v, "replica_id"):
-                        old_rid = v.replica_id
-                        v.replica_id = (old_rid[0], rank, old_rid[2])
+            # Fix the replica DP slot: adapters on expert layers replicate
+            # across the expert-DP group, not the dense dp_cp group the helper
+            # defaulted to. Everything else is the enclosing module's job --
+            # SequentialMLP hands the global expert index down via
+            # ``sharded_offsets`` and renames prefixes itself. The removed
+            # rewrite here used to push an EP-derived value into the TP slot,
+            # which marked each rank's unique rotations as non-main replicas
+            # and made ``keep_only_main_replica`` saves silently drop every
+            # nonzero-EP-rank rotation.
+            edp_rank = parallel_state.get_expert_data_parallel_rank() or 0
+            for v in oft_r_sd.values():
+                if hasattr(v, "replica_id"):
+                    old_rid = v.replica_id
+                    v.replica_id = (old_rid[0], old_rid[1], edp_rank)
 
         sharded_state_dict.update(oft_r_sd)
         return sharded_state_dict
@@ -709,6 +829,13 @@ class OFTLinear(AdapterWrapper):
         # Standard linears have .weight; grouped expert linears (TEGroupedLinear)
         # have .weight0 ... .weight{num_gemms-1}, one per local expert on this rank.
         num_gemms = getattr(self.to_wrap, "num_gemms", 0)
+        # Grouped expert containers (TEGroupedMLP) neither pass per-expert
+        # sharded offsets to adapter keys nor rewrite their replica ids, and a
+        # shared rotation on a grouped base is trained per EP rank
+        # (allreduce=False) -- unique data per rank. Stamp the adapter so its
+        # sharded_state_dict encodes the EP rank as a real prepended axis.
+        if num_gemms > 0 and getattr(adapter, "is_expert", False):
+            adapter.ep_axis_sharded = True
         if num_gemms > 0:
             self._weight_names = [f"weight{i}" for i in range(num_gemms)]
             first_w = getattr(self.to_wrap, "weight0")
@@ -1231,54 +1358,115 @@ class OFTLinear(AdapterWrapper):
 
         input_chunks = list(torch.split(x_to_split, token_splits, dim=split_dim))
 
-        for idx in active_experts:
-            name = self._weight_names[idx]
-            suffix = name[len("weight") :]
-            scale_suffix = self._nvfp4_grouped_scale_suffix(suffix)
-            if scale_suffix is None:
-                raise ValueError(
-                    f"NVFP4 grouped forward: missing weight_scale/weight_double_scale for local expert {suffix}"
+        # The rotated input requires grad, so each F.linear saves its WEIGHT for
+        # backward (grad_input = grad_output @ W) -- and that weight is the
+        # temporary BF16 dequantized copy, not the 4-bit buffer. Without hooks,
+        # the graph retained every active expert's BF16 copy until this layer's
+        # backward; with no recomputation (the Qwen3-MoE NVFP4 recipe) those
+        # copies accumulated across all layers, ~4x the entire 4-bit payload.
+        # Same pack/unpack pattern as _forward_nvfp4_grouped_eager, except the
+        # handle stores the SwiGLU packed halves separately (caching the fused
+        # torch.cat would keep a duplicate 4-bit payload alive) and each entry
+        # is registered only for the duration of its own F.linear: the save is
+        # synchronous inside the call, and popping immediately afterwards means
+        # a later allocation reusing the freed address can never be mistaken
+        # for a registered weight. Peak = ONE dequantized expert at a time.
+        ptr_to_handle: Dict[int, tuple] = {}
+
+        def pack(tensor):
+            handle = ptr_to_handle.get(tensor.data_ptr())
+            if handle is not None:
+                return (
+                    *handle,
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.storage_offset(),
                 )
-            scale = getattr(self.to_wrap, f"weight_scale{scale_suffix}")
-            double_scale = getattr(self.to_wrap, f"weight_double_scale{scale_suffix}")
+            return tensor
 
-            packed_full = getattr(self.to_wrap, f"{name}_packed", None)
-            if packed_full is None:
-                # SwiGLU fc1: reassemble fused packed weight from gate (_w) + up (_v) halves.
-                w_half = getattr(self.to_wrap, f"{name}_w_packed", None)
-                v_half = getattr(self.to_wrap, f"{name}_v_packed", None)
-                if w_half is None or v_half is None:
+        def unpack(packed_tuple):
+            if isinstance(packed_tuple, tuple) and len(packed_tuple) == 10:
+                (
+                    packed_full,
+                    w_half,
+                    v_half,
+                    scale,
+                    double_scale,
+                    shape,
+                    dtype,
+                    saved_shape,
+                    saved_stride,
+                    saved_storage_offset,
+                ) = packed_tuple
+                packed = packed_full if packed_full is not None else torch.cat([w_half, v_half], dim=0)
+                base = dequantize_nvfp4(packed, scale, double_scale, shape, device=packed.device, dtype=dtype)
+                return base.as_strided(saved_shape, saved_stride, saved_storage_offset)
+            return packed_tuple
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            for idx in active_experts:
+                name = self._weight_names[idx]
+                suffix = name[len("weight") :]
+                scale_suffix = self._nvfp4_grouped_scale_suffix(suffix)
+                if scale_suffix is None:
                     raise ValueError(
-                        f"NVFP4 grouped forward: expert {idx} missing both `{name}_packed` and "
-                        f"`{name}_w_packed`/`{name}_v_packed` buffers"
+                        f"NVFP4 grouped forward: missing weight_scale/weight_double_scale for local expert {suffix}"
                     )
-                packed = torch.cat([w_half, v_half], dim=0)
-                local_out = int(w_half.shape[0]) + int(v_half.shape[0])
-                local_in = int(w_half.shape[1]) * 2
-            else:
-                packed = packed_full
-                local_out = int(packed.shape[0])
-                local_in = int(packed.shape[1]) * 2
+                scale = getattr(self.to_wrap, f"weight_scale{scale_suffix}")
+                double_scale = getattr(self.to_wrap, f"weight_double_scale{scale_suffix}")
 
-            w_compute = dequantize_nvfp4(
-                packed,
-                scale,
-                double_scale,
-                (local_out, local_in),
-                device=x.device,
-                dtype=x.dtype,
-            )
-            bias = _get_active_bias_tensor(self.to_wrap, f"bias{idx}")
-            # F.linear expects [..., in_features]; for split_dim==1 the chunk is
-            # [hidden, tokens] so transpose to [tokens, hidden] for the GEMM, then
-            # transpose back when concatenating.
-            chunk_input = input_chunks[idx]
-            if split_dim == 1:
-                chunk_input = chunk_input.transpose(0, 1).contiguous()
-            chunk_output = F.linear(chunk_input, w_compute, bias)
-            if split_dim == 1:
-                chunk_output = chunk_output.transpose(0, 1).contiguous()
-            output_chunks[idx] = chunk_output
+                packed_full = getattr(self.to_wrap, f"{name}_packed", None)
+                w_half = v_half = None
+                if packed_full is None:
+                    # SwiGLU fc1: reassemble fused packed weight from gate (_w) + up (_v) halves.
+                    w_half = getattr(self.to_wrap, f"{name}_w_packed", None)
+                    v_half = getattr(self.to_wrap, f"{name}_v_packed", None)
+                    if w_half is None or v_half is None:
+                        raise ValueError(
+                            f"NVFP4 grouped forward: expert {idx} missing both `{name}_packed` and "
+                            f"`{name}_w_packed`/`{name}_v_packed` buffers"
+                        )
+                    packed = torch.cat([w_half, v_half], dim=0)
+                    local_out = int(w_half.shape[0]) + int(v_half.shape[0])
+                    local_in = int(w_half.shape[1]) * 2
+                else:
+                    packed = packed_full
+                    local_out = int(packed.shape[0])
+                    local_in = int(packed.shape[1]) * 2
+
+                w_compute = dequantize_nvfp4(
+                    packed,
+                    scale,
+                    double_scale,
+                    (local_out, local_in),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+                w_compute_ptr = w_compute.data_ptr()
+                ptr_to_handle[w_compute_ptr] = (
+                    packed_full,
+                    w_half,
+                    v_half,
+                    scale,
+                    double_scale,
+                    (local_out, local_in),
+                    w_compute.dtype,
+                )
+                try:
+                    bias = _get_active_bias_tensor(self.to_wrap, f"bias{idx}")
+                    # F.linear expects [..., in_features]; for split_dim==1 the chunk is
+                    # [hidden, tokens] so transpose to [tokens, hidden] for the GEMM, then
+                    # transpose back when concatenating.
+                    chunk_input = input_chunks[idx]
+                    if split_dim == 1:
+                        chunk_input = chunk_input.transpose(0, 1).contiguous()
+                    chunk_output = F.linear(chunk_input, w_compute, bias)
+                finally:
+                    ptr_to_handle.pop(w_compute_ptr, None)
+                    del w_compute
+                if split_dim == 1:
+                    chunk_output = chunk_output.transpose(0, 1).contiguous()
+                output_chunks[idx] = chunk_output
 
         output = torch.cat(output_chunks, dim=split_dim)
         # Restore trailing-junk padding so the caller sees a tensor of the

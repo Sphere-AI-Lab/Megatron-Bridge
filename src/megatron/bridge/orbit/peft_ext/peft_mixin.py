@@ -31,25 +31,8 @@ class OrbitPEFTMixin:
             # Upstream's recompute fix only recognizes LoRA parameter names;
             # run the orbit-aware variant (shared registry, never double-patches).
             maybe_enable_recompute_inputs_grad_orbit(model)
-            self._write_parameter_reports(model)
 
         return model
-
-    def _write_parameter_reports(self, model) -> None:
-        """Rank-0 TSV reports of trainable/frozen parameter partitions."""
-        from megatron.bridge.utils.common_utils import get_rank_safe, print_rank_0
-
-        if get_rank_safe() != 0:
-            return
-        try:
-            from megatron.bridge.orbit.training.peft_reports import _write_peft_parameter_reports
-
-            report_paths = _write_peft_parameter_reports(model, report_dir="/tmp")
-            print_rank_0(f"  Trainable parameter report: {report_paths['trainable']}")
-            print_rank_0(f"  Frozen parameter report: {report_paths['frozen']}")
-            print_rank_0(f"  PEFT summary report: {report_paths['summary']}")
-        except Exception as exc:  # pragma: no cover - reports are best-effort
-            print_rank_0(f"[Orbit PEFT] Warning: failed to write parameter reports: {exc}")
 
     def adapter_key_filter(self, key) -> bool:
         """Save-filter that recognizes orbit adapter parameter names."""
