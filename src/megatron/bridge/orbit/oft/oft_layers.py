@@ -525,22 +525,33 @@ class OFTRotationModule(nn.Module):
         return R.to(previous_dtype)
 
     def _project_batch(self, weight: torch.Tensor, eps: float) -> torch.Tensor:
-        """Project weight parameters for Constrained OFT.
+        """Project each block onto the Constrained-OFT epsilon-ball.
 
-        Constructs the rotation from the weight, computes distance from identity,
-        and scales the weight so the rotation stays within an epsilon-ball.
+        The constraint is on the skew-symmetric generator and is centred on
+        **zero**, matching the reference PEFT OFT implementation. Blocks already
+        inside the ball pass through unchanged; blocks outside are pulled back so
+        their Frobenius norm becomes exactly ``eps``. That makes the boundary a
+        fixed point, which matters because this runs on every forward.
+
+        Centring on the identity instead is wrong: ``Q_skew`` is skew-symmetric,
+        so its diagonal is structurally zero and
+        ``||Q - I||^2 == ||Q||^2 + block_size``. The measured distance could then
+        never fall below ``sqrt(block_size)`` (5.66 at the default block_size=32),
+        so the scale was a near-constant ``eps / sqrt(block_size)`` ~= 1e-5 for
+        any parameter value, and -- because the measurement did not track the
+        value being scaled -- there was no fixed point except zero. Repeated
+        forwards drove the parameter to zero and the rotation to the identity.
 
         Args:
             weight: (num_blocks, n_elements) parameter vectors.
-            eps: Maximum Frobenius norm distance from identity.
+            eps: Maximum Frobenius norm of each block's skew-symmetric generator.
         """
         Q_skew = self._pytorch_skew_symmetric(weight, self.block_size)
-        bs = self.block_size
-        eye = torch.eye(bs, dtype=weight.dtype, device=weight.device).unsqueeze(0)
-        diff = Q_skew - eye
-        norm = torch.norm(diff, p="fro", dim=(-2, -1), keepdim=True)
+        norm = torch.norm(Q_skew, p="fro", dim=(-2, -1), keepdim=True)
+        # Inside the ball clamp() returns `norm` and the ratio is 1 (up to the
+        # 1e-8 division guard); outside it returns `eps` and the ratio is the
+        # exact shrink factor. Scaling `weight` scales Q_skew by the same factor.
         scale = torch.clamp(norm, max=eps) / (norm + 1e-8)
-        # Scale the original weight vectors
         return weight * (scale.squeeze(-1).squeeze(-1).unsqueeze(-1))
 
     def _compute_rotation(self) -> torch.Tensor:
@@ -549,16 +560,32 @@ class OFTRotationModule(nn.Module):
         Returns:
             (r, block_size, block_size) orthogonal blocks.
         """
+        if self.coft:
+            # Project the Parameter itself, *before* the tensor-parallel wrapper.
+            # ``oft_r`` is a leaf, so an in-place write under ``no_grad`` is legal
+            # on every layout -- mechanically the same thing an optimizer step does.
+            #
+            # Projecting ``oft_r_parallel`` instead was broken on column-parallel
+            # layers (linear_qkv, linear_fc1): copy_to_tensor_model_parallel_region
+            # returns an autograd *view* of the parameter, so the in-place write
+            # never reached the parameter and the following _cayley_batch tripped
+            # autograd's view-version check ("Output 0 of _CopyToModelParallelRegion
+            # is a view and its base ... has been modified inplace").
+            #
+            # Ranks stay consistent under both layouts. _project_batch reduces over
+            # dim=(-2, -1) only, i.e. one norm per block with no cross-block term,
+            # so a row-parallel rank projecting its own shard produces bitwise the
+            # same values as slicing a full projection; column-parallel ranks all
+            # hold the same replicated oft_r and apply the same deterministic map.
+            with torch.no_grad():
+                self.oft_r.copy_(self._project_batch(self.oft_r, eps=self.eps))
+
         if self.input_is_parallel:
             # Row Tensor Parallel: each TP rank has a shard of the blocks, so use directly
             oft_r_parallel = self.oft_r
         else:
             # Column Tensor Parallel: each TP rank has the full set of blocks, so replicate across TP ranks
             oft_r_parallel = copy_to_tensor_model_parallel_region(self.oft_r, group=self.tp_group)
-
-        if self.coft:
-            with torch.no_grad():
-                oft_r_parallel.copy_(self._project_batch(oft_r_parallel, eps=self.eps))
 
         R = self._cayley_batch(oft_r_parallel, self.block_size)
 

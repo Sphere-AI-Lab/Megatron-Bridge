@@ -118,3 +118,170 @@ def test_split_wrapper_sharded_state_dict_delegates_each_child(monkeypatch: pyte
         ("decoder.to_wrap.", "base-tp"),
         ("decoder.adapter_q.", "adapter-tp"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Constrained OFT (--coft) epsilon-ball projection
+#
+# The projection is centred on zero, on the skew-symmetric generator, matching
+# the reference PEFT implementation. It previously measured ||Q_skew - I||,
+# which for a skew-symmetric Q is sqrt(||Q||^2 + block_size) and therefore never
+# below sqrt(block_size); the resulting shrink factor was a near-constant
+# eps/sqrt(block_size) that ignored the parameter and had no fixed point above
+# zero, so repeated forwards annihilated the adapter.
+# ---------------------------------------------------------------------------
+
+_COFT_EPS = 1e-1
+
+
+def _coft_adapter() -> OFTRotationModule:
+    adapter = OFTRotationModule(
+        in_features=8,
+        block_size=4,
+        coft=True,
+        eps=_COFT_EPS,
+        input_is_parallel=True,
+        dtype=torch.float64,
+    )
+    adapter.eval()
+    return adapter
+
+
+def _generator_norms(adapter: OFTRotationModule, weight: torch.Tensor) -> torch.Tensor:
+    """Frobenius norm of each block's skew-symmetric generator."""
+    skew = adapter._pytorch_skew_symmetric(weight, adapter.block_size)
+    return torch.norm(skew, p="fro", dim=(-2, -1))
+
+
+@pytest.mark.unit
+def test_coft_projection_leaves_blocks_inside_the_ball_untouched() -> None:
+    """Below the boundary the projection must be a no-op."""
+    adapter = _coft_adapter()
+    weight = torch.full_like(adapter.oft_r, 1e-3)
+    assert float(_generator_norms(adapter, weight).max()) < _COFT_EPS
+
+    projected = adapter._project_batch(weight, eps=_COFT_EPS)
+
+    # rtol accommodates the 1e-8 guard in the denominator, not a real change.
+    torch.testing.assert_close(projected, weight, rtol=1e-4, atol=0.0)
+
+
+@pytest.mark.unit
+def test_coft_projection_pulls_blocks_outside_the_ball_onto_the_boundary() -> None:
+    """Above the boundary the generator norm must land exactly on eps."""
+    adapter = _coft_adapter()
+    weight = torch.full_like(adapter.oft_r, 1.0)
+    assert float(_generator_norms(adapter, weight).min()) > _COFT_EPS
+
+    norms = _generator_norms(adapter, adapter._project_batch(weight, eps=_COFT_EPS))
+
+    torch.testing.assert_close(norms, torch.full_like(norms, _COFT_EPS), rtol=1e-6, atol=0.0)
+
+
+@pytest.mark.unit
+def test_coft_projection_is_idempotent_on_the_boundary() -> None:
+    """Projecting twice must equal projecting once -- the boundary is a fixed point.
+
+    Under the identity-centred version the second call shrank again by another
+    ~1e-5, which is what drove the parameter to zero.
+    """
+    adapter = _coft_adapter()
+    weight = torch.full_like(adapter.oft_r, 1.0)
+
+    once = adapter._project_batch(weight, eps=_COFT_EPS)
+    twice = adapter._project_batch(once, eps=_COFT_EPS)
+
+    torch.testing.assert_close(twice, once, rtol=1e-4, atol=0.0)
+
+
+@pytest.mark.unit
+def test_coft_rotation_does_not_collapse_the_parameter_over_repeated_forwards() -> None:
+    """End-to-end regression: _compute_rotation writes the projection back into
+    oft_r in place on every forward, so a non-idempotent projection compounds."""
+    adapter = _coft_adapter()
+    with torch.no_grad():
+        adapter.oft_r.fill_(1e-3)
+    before = adapter.oft_r.detach().clone()
+
+    for _ in range(8):
+        adapter._compute_rotation()
+
+    # Identity-centred projection shrank by ~0.05 per call here, reaching 3.9e-14
+    # by the eighth. (At the shipped block_size=32 / eps=6e-5 the factor is 1e-5.)
+    torch.testing.assert_close(adapter.oft_r, before, rtol=1e-4, atol=0.0)
+
+
+@pytest.mark.unit
+def test_coft_scale_tracks_the_parameter_not_the_block_size() -> None:
+    """A parameter 10x further outside the ball must be shrunk 10x harder.
+
+    Uses a tight eps and small parameters -- the regime real training sits in,
+    where ``sqrt(block_size)`` completely swamps ``||Q||``. The identity-centred
+    version returned 5.00e-05 for both (ratio 1.0001), i.e. a shrink factor that
+    ignored the parameter entirely; centred on zero the ratio is exactly 10.
+    """
+    adapter = _coft_adapter()
+    eps = 1e-4
+    near = torch.full_like(adapter.oft_r, 1e-3)
+    far = torch.full_like(adapter.oft_r, 1e-2)
+    assert float(_generator_norms(adapter, near).min()) > eps
+
+    ratio_near = (adapter._project_batch(near, eps=eps) / near).mean()
+    ratio_far = (adapter._project_batch(far, eps=eps) / far).mean()
+
+    torch.testing.assert_close(ratio_near / ratio_far, torch.tensor(10.0, dtype=ratio_near.dtype), rtol=1e-4, atol=0.0)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("input_is_parallel", [True, False], ids=["row_parallel", "column_parallel"])
+def test_coft_forward_runs_on_both_tensor_parallel_layouts(input_is_parallel: bool) -> None:
+    """Regression: --coft used to raise in forward on column-parallel targets.
+
+    linear_qkv and linear_fc1 are column-parallel, where oft_r is replicated and
+    handed to copy_to_tensor_model_parallel_region. The projection used to be
+    applied to that wrapper's *output*, which is an autograd view of the
+    parameter; the in-place write never reached the parameter and the following
+    _cayley_batch raised "Output 0 of _CopyToModelParallelRegion is a view and
+    its base ... has been modified inplace". So --coft could not run at all on
+    the two most important targets. Projecting the leaf parameter first works on
+    both layouts.
+
+    Forward only: the column-parallel backward all-reduces oft_r's gradient
+    through mcore's _reduce(), which needs a real process group. That plumbing is
+    unrelated to this fix; gradient flow is covered for the row-parallel layout
+    below, and end to end by the distributed tests.
+    """
+    adapter = OFTRotationModule(
+        in_features=8,
+        block_size=4,
+        coft=True,
+        eps=_COFT_EPS,
+        input_is_parallel=input_is_parallel,
+        dtype=torch.float64,
+    )
+    adapter.eval()
+    with torch.no_grad():
+        adapter.oft_r.fill_(1.0)  # outside the ball, so the projection must act
+
+    out = adapter(torch.randn(3, 8, dtype=torch.float64))
+
+    assert torch.isfinite(out).all()
+    # The constraint landed on the Parameter itself, on both layouts.
+    norms = _generator_norms(adapter, adapter.oft_r.detach())
+    torch.testing.assert_close(norms, torch.full_like(norms, _COFT_EPS), rtol=1e-6, atol=0.0)
+
+
+@pytest.mark.unit
+def test_coft_row_parallel_backward_still_reaches_oft_r() -> None:
+    """The in-place projection must not sever the autograd graph."""
+    adapter = OFTRotationModule(
+        in_features=8, block_size=4, coft=True, eps=_COFT_EPS, input_is_parallel=True, dtype=torch.float64
+    )
+    adapter.eval()
+    with torch.no_grad():
+        adapter.oft_r.fill_(1.0)
+
+    adapter(torch.randn(3, 8, dtype=torch.float64, requires_grad=True)).sum().backward()
+
+    assert adapter.oft_r.grad is not None
+    assert torch.isfinite(adapter.oft_r.grad).all()
