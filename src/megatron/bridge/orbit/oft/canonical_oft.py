@@ -102,78 +102,114 @@ def _has_dequantized_nvfp4_buffers(module: nn.Module) -> bool:
     return hasattr(module, "_nvfp4_weight_scale") and hasattr(module, "_nvfp4_weight_double_scale")
 
 
-def _is_quantized_single_weight_linear(module: nn.Module) -> bool:
-    if (
-        hasattr(module, "weight_packed")
-        or hasattr(module, "weight_quantizer")
-        or _has_dequantized_nvfp4_buffers(module)
-    ):
-        return True
-    return _is_direct_fp8_runtime_weight(
-        getattr(module, "weight", None),
-        getattr(module, "weight_scale_inv", None),
-    )
+_DEQUANT_HANDLE_TAG = object()
 
 
-def _quantized_base_kind(module: nn.Module) -> str:
+def _dequantize_single_weight_base(module: nn.Module, dtype: torch.dtype):
+    """BF16 view of a quantized single-weight fused base, plus a rebuild closure.
+
+    Returns ``None`` when the base weight is directly usable for compute (plain
+    BF16, or the materialized dequantized-NVFP4 layout whose ``weight`` is a
+    persistent BF16 parameter) -- callers then use ``module.weight`` with no
+    hooks, since autograd saving a persistent parameter costs nothing extra.
+
+    Otherwise returns ``(w_compute, rebuild)``: the transient dequantized copy
+    to run the split GEMMs on, and a closure re-dequantizing it from the low-bit
+    buffers for backward (via ``_single_weight_dequant_hooks``). One dequantize
+    is exactly what the retired shared-R fallback paid per forward; the split
+    math on top is what it never did.
+    """
     if hasattr(module, "weight_packed"):
-        return "int4"
-    if hasattr(module, "weight_quantizer"):
-        return type(getattr(module, "weight_quantizer")).__name__
+        from megatron.bridge.orbit.low_precision.int4 import dequantize_int4
+
+        packed = module.weight_packed
+        scale = module.weight_scale
+        shape = module.weight_shape
+
+        def rebuild() -> torch.Tensor:
+            return dequantize_int4(packed, scale, shape, device=packed.device).to(dtype)
+
+        return rebuild(), rebuild
+
+    quantizer = getattr(module, "weight_quantizer", None)
+    weight = getattr(module, "weight", None)
+    if quantizer is not None and getattr(weight, "dtype", None) == torch.uint8:
+        from megatron.bridge.orbit.low_precision.nvfp4 import NVFP4_AMAX_SCALE, dequantize_nvfp4
+
+        packed = weight
+        scale = getattr(quantizer, "_scale", None)
+        scale_2 = getattr(quantizer, "_double_scale", None)
+        if scale_2 is None:
+            amax = getattr(quantizer, "_amax", None)
+            if amax is not None:
+                scale_2 = amax.to(torch.float32) / NVFP4_AMAX_SCALE
+        if scale is None or scale_2 is None:
+            raise RuntimeError(
+                f"{type(module).__name__}: NVFP4 base carries weight_quantizer but no "
+                "_scale/_double_scale (or _amax) buffers to dequantize from"
+            )
+        shape = getattr(module, "weight_shape", None)
+        if shape is None:
+            shape = (int(packed.shape[0]), int(packed.shape[1]) * 2)
+
+        def rebuild() -> torch.Tensor:
+            return dequantize_nvfp4(packed, scale, scale_2, shape, device=packed.device, dtype=dtype)
+
+        return rebuild(), rebuild
+
     if _has_dequantized_nvfp4_buffers(module):
-        return "nvfp4_dequantized"
-    if _is_direct_fp8_runtime_weight(
-        getattr(module, "weight", None),
-        getattr(module, "weight_scale_inv", None),
-    ):
-        return "direct_fp8"
-    return type(module).__name__
+        return None
+
+    scale_inv = getattr(module, "weight_scale_inv", None)
+    if _is_direct_fp8_runtime_weight(weight, scale_inv):
+        from megatron.bridge.orbit.quant.fp8_utils import dequant_fp8
+
+        w_fp8 = weight
+
+        def rebuild() -> torch.Tensor:
+            return dequant_fp8(w_fp8, scale_inv, out_dtype=dtype)
+
+        return rebuild(), rebuild
+
+    return None
 
 
-def _warn_quantized_shared_fallback(wrapper_name: str, module: nn.Module) -> None:
-    quant_kind = _quantized_base_kind(module)
-    key = (wrapper_name, quant_kind)
-    if key in _QUANTIZED_SHARED_FALLBACK_WARNED:
-        return
-    _QUANTIZED_SHARED_FALLBACK_WARNED.add(key)
-    logger.warning(
-        "%s on quantized fused base (%s) is using shared-input OFT rotation "
-        "fallback; exact split-slice OFT is currently dense-only.",
-        wrapper_name,
-        quant_kind,
-    )
+def _single_weight_dequant_hooks(w_ptr: int, rebuild) -> torch.autograd.graph.saved_tensors_hooks:
+    """saved_tensors_hooks that swap one dequantized weight for its rebuild handle.
+
+    ``pack`` recognizes the transient dequantized copy by data pointer and hands
+    autograd the closure instead, so the BF16 copy dies with the forward frame;
+    ``unpack`` re-dequantizes during backward and restores whatever view autograd
+    had saved. Same discipline as OFTLinear's per-format forwards.
+    """
+
+    def pack(tensor: torch.Tensor):
+        if tensor.data_ptr() == w_ptr:
+            return (
+                _DEQUANT_HANDLE_TAG,
+                rebuild,
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.storage_offset(),
+            )
+        return tensor
+
+    def unpack(handle):
+        if isinstance(handle, tuple) and len(handle) == 5 and handle[0] is _DEQUANT_HANDLE_TAG:
+            _, rebuild_fn, saved_shape, saved_stride, saved_storage_offset = handle
+            return rebuild_fn().as_strided(saved_shape, saved_stride, saved_storage_offset)
+        return handle
+
+    return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
 
 
-def _sync_oft_linear_quant_state(fallback: OFTLinear) -> None:
-    fallback._base_fp8 = fallback._is_base_fp8()
-    fallback._base_int4 = hasattr(fallback.to_wrap, "weight_packed")
-    fallback._base_nvfp4 = fallback._is_base_nvfp4()
-    fallback._base_nvfp4_grouped = fallback._detect_nvfp4_grouped_buffers()
-    if fallback._base_nvfp4_grouped:
-        fallback._base_int4 = False
-
-
-def _run_quantized_shared_oft_fallback(
-    wrapper: nn.Module,
-    adapter: OFTRotationModule,
-    x: torch.Tensor,
-    *args: Any,
-    **kwargs: Any,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    fallback = getattr(wrapper, "_quantized_shared_fallback", None)
-    if (
-        fallback is None
-        or getattr(fallback, "to_wrap", None) is not wrapper.to_wrap
-        or getattr(fallback, "adapter", None) is not adapter
-    ):
-        fallback = OFTLinear(wrapper.to_wrap, adapter)
-        object.__setattr__(wrapper, "_quantized_shared_fallback", fallback)
-
-    fallback.train(wrapper.training)
-    fallback._adapter_enabled = getattr(wrapper, "_adapter_enabled", True)
-    _sync_oft_linear_quant_state(fallback)
-    _warn_quantized_shared_fallback(type(wrapper).__name__, wrapper.to_wrap)
-    return fallback(x, *args, **kwargs)
+def _fused_base_linear(to_wrap: nn.Module, x: torch.Tensor, W: torch.Tensor):
+    """Adapter-disabled base behavior on a transient dequantized weight."""
+    bias = getattr(to_wrap, "bias", None)
+    out = F.linear(x, W, None)
+    if bias is not None and not getattr(to_wrap, "skip_bias_add", False):
+        return out + bias, None
+    return out, bias
 
 
 def _should_treat_linear_fc1_as_unfused(full_name: str) -> bool:
@@ -364,15 +400,6 @@ class OFTLinearSplitFC1UpGate(nn.Module):
         half = out_features // 2
         return W[:half], W[half:]
 
-    def _assert_unquantized(self) -> None:
-        if hasattr(self.to_wrap, "weight_packed") or hasattr(self.to_wrap, "weight_quantizer"):
-            raise RuntimeError(
-                f"{type(self).__name__} on quantized fused linear_fc1 is not implemented yet "
-                f"(weight_packed={hasattr(self.to_wrap, 'weight_packed')}, "
-                f"weight_quantizer={hasattr(self.to_wrap, 'weight_quantizer')}). "
-                f"Follow-up plan covers FP8 / INT4 / NVFP4 split GEMM."
-            )
-
     def _fused_fast_path_supported(self) -> bool:
         """Both gate and up adapters must satisfy the rotation-bank contract:
         same dtype, same block_size, same num_blocks, no per-block share. The
@@ -381,13 +408,24 @@ class OFTLinearSplitFC1UpGate(nn.Module):
         return _oft_fast_path_supported([self.adapter_gate, self.adapter_up])
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
-        if _is_quantized_single_weight_linear(self.to_wrap):
-            return _run_quantized_shared_oft_fallback(self, self.adapter_gate, x, *args, **kwargs)
-        self._assert_unquantized()
-        W = self.to_wrap.weight
-        if not self._adapter_enabled:
-            return self.to_wrap(x, *args, **kwargs)
+        # Quantized fused base: dequantize once (the same cost the retired
+        # shared-R fallback paid) and run the REAL split math on the BF16 copy,
+        # with hooks so the graph keeps only the low-bit rebuild handle.
+        dequant = _dequantize_single_weight_base(self.to_wrap, x.dtype)
+        if dequant is None:
+            if not self._adapter_enabled:
+                return self.to_wrap(x, *args, **kwargs)
+            return self._forward_with_weight(x, self.to_wrap.weight)
+        w_compute, rebuild = dequant
+        try:
+            with _single_weight_dequant_hooks(w_compute.data_ptr(), rebuild):
+                if not self._adapter_enabled:
+                    return _fused_base_linear(self.to_wrap, x.contiguous(), w_compute)
+                return self._forward_with_weight(x, w_compute)
+        finally:
+            del w_compute
 
+    def _forward_with_weight(self, x: torch.Tensor, W: torch.Tensor):
         x = x.contiguous()
         bias = getattr(self.to_wrap, "bias", None)
 
@@ -1292,13 +1330,6 @@ class OFTLinearSplitQKV(nn.Module):
         v = qkv[:, heads_per_group + 1 : heads_per_group + 2].reshape(-1, in_features)
         return q, k, v
 
-    def _assert_unquantized(self) -> None:
-        if hasattr(self.to_wrap, "weight_packed") or hasattr(self.to_wrap, "weight_quantizer"):
-            raise RuntimeError(
-                f"{type(self).__name__} on quantized fused linear_qkv is not implemented yet. "
-                f"Follow-up plan covers FP8 / INT4 / NVFP4 split GEMM."
-            )
-
     def _interleave_qkv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """Reassemble [Q,K,V] in Megatron's per-query-group interleaved layout."""
         cfg = self._provider
@@ -1333,14 +1364,25 @@ class OFTLinearSplitQKV(nn.Module):
         return _oft_fast_path_supported([self.adapter_q, self.adapter_k, self.adapter_v])
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
-        if _is_quantized_single_weight_linear(self.to_wrap):
-            return _run_quantized_shared_oft_fallback(self, self.adapter_q, x, *args, **kwargs)
-        self._assert_unquantized()
-        W = self.to_wrap.weight
-        W_q, W_k, W_v = self._split_qkv_weight(W)
+        # Quantized fused base: dequantize once (the same cost the retired
+        # shared-R fallback paid) and run the REAL split math on the BF16 copy,
+        # with hooks so the graph keeps only the low-bit rebuild handle.
+        dequant = _dequantize_single_weight_base(self.to_wrap, x.dtype)
+        if dequant is None:
+            if not self._adapter_enabled:
+                return self.to_wrap(x, *args, **kwargs)
+            return self._forward_with_weight(x, self.to_wrap.weight)
+        w_compute, rebuild = dequant
+        try:
+            with _single_weight_dequant_hooks(w_compute.data_ptr(), rebuild):
+                if not self._adapter_enabled:
+                    return _fused_base_linear(self.to_wrap, x.contiguous(), w_compute)
+                return self._forward_with_weight(x, w_compute)
+        finally:
+            del w_compute
 
-        if not self._adapter_enabled:
-            return self.to_wrap(x, *args, **kwargs)
+    def _forward_with_weight(self, x: torch.Tensor, W: torch.Tensor):
+        W_q, W_k, W_v = self._split_qkv_weight(W)
 
         x = x.contiguous()
         bias = getattr(self.to_wrap, "bias", None)
