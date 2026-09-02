@@ -125,8 +125,16 @@ def _save_sharded_modelopt_state_for_strategy(
     )
 
 
-def _restore_modelopt_state_before_sharded_schema(model, checkpoint_name: str, state_dict: dict[str, Any]) -> None:
+def _restore_modelopt_state_before_sharded_schema(
+    model, checkpoint_name: str | os.PathLike[str], state_dict: dict[str, Any]
+) -> None:
     """Restore ModelOpt modules before constructing the sharded-load schema."""
+    # Local checkpoints use a rank-local CkptID/iteration identifier rather
+    # than a filesystem path. ModelOpt state lives only in global checkpoint
+    # directories, and its reader joins paths internally.
+    if not isinstance(checkpoint_name, (str, os.PathLike)):
+        return
+
     from megatron.bridge.orbit.training.modelopt_checkpoint import (
         _maybe_restore_modelopt_state_for_sharded_load,
     )

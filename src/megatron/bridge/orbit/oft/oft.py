@@ -178,6 +178,8 @@ class _SplitLNOFTLinear(nn.Module):
         """Apply LayerNorm or RMSNorm using the fused module's weights."""
         ln_weight = self._orig_module.layer_norm_weight
         ln_bias = self._orig_module.layer_norm_bias
+        if getattr(self._orig_module, "zero_centered_gamma", False):
+            ln_weight = ln_weight + 1.0
         if self._normalization == "RMSNorm":
             return torch.nn.functional.rms_norm(x, (self._hidden_size,), ln_weight, self._eps)
         else:

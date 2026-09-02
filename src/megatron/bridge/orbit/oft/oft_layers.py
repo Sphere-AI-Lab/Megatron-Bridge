@@ -654,11 +654,15 @@ class OFTRotationModule(nn.Module):
             with torch.no_grad():
                 self.oft_r.copy_(self._project_batch(self.oft_r, eps=self.eps))
 
-        if self.input_is_parallel:
-            # Row Tensor Parallel: each TP rank has a shard of the blocks, so use directly
+        if self.input_is_parallel and not self.block_share:
+            # Row Tensor Parallel: each TP rank has a shard of the blocks, so use directly.
+            # A block-shared adapter is the exception: its one block is a TP
+            # replica, so its gradient must be reduced across ranks.
             oft_r_parallel = self.oft_r
         else:
-            # Column Tensor Parallel: each TP rank has the full set of blocks, so replicate across TP ranks
+            # Column Tensor Parallel and row-parallel block_share both carry a
+            # replicated parameter. The copy op is identity in forward and
+            # all-reduces its gradient in backward.
             oft_r_parallel = copy_to_tensor_model_parallel_region(self.oft_r, group=self.tp_group)
 
         R = self._cayley_batch(oft_r_parallel, self.block_size)

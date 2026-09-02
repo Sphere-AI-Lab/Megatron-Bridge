@@ -247,6 +247,33 @@ def test_helper_returns_none_for_plain_bf16_base() -> None:
     assert _dequantize_single_weight_base(module, torch.float32) is None
 
 
+@pytest.mark.unit
+def test_gated_q_split_matches_fused_base_at_identity() -> None:
+    provider = SimpleNamespace(
+        num_attention_heads=4,
+        num_query_groups=2,
+        kv_channels=4,
+        attention_output_gate=True,
+        sequence_parallel=False,
+    )
+    # Per group: 2 Q heads + 2 gate heads + K + V, each with head_size=4.
+    weight = torch.randn(48, _IN)
+    module = _base_module(weight)
+    wrapper = OFTLinearSplitQKV(
+        module,
+        in_features=_IN,
+        provider=provider,
+        block_size=4,
+        input_is_parallel=True,
+    )
+    x = torch.randn(3, _IN)
+
+    actual, bias = wrapper(x)
+
+    assert bias is None
+    torch.testing.assert_close(actual, torch.nn.functional.linear(x, weight))
+
+
 # ---------------------------------------------------------------------------
 # Grouped expert FC1 (OFTLinearGroupedSplitFC1UpGate) on quantized bases
 # ---------------------------------------------------------------------------

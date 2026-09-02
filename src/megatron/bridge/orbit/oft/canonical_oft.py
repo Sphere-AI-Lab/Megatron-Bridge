@@ -348,6 +348,32 @@ def _batched_equal_output_linear_with_bias(
     return out.reshape(*leading_shape, num_slices * H)
 
 
+def _prepare_split_column_parallel_input(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Restore the input-gradient collective bypassed by split ``F.linear`` calls.
+
+    Megatron's column-parallel kernels all-reduce dgrad internally when
+    ``allreduce_dgrad`` is enabled. CanonicalOFT replaces that kernel with local
+    split GEMMs, so one copy-region autograd node must surround the shared input.
+    """
+    sequence_parallel = getattr(
+        module,
+        "sequence_parallel",
+        getattr(getattr(module, "config", None), "sequence_parallel", False),
+    )
+    disable_grad_reduce = getattr(module, "disable_grad_reduce", False)
+    explicit_expert_comm = getattr(module, "explicit_expert_comm", False)
+    allreduce_dgrad = getattr(module, "allreduce_dgrad", None)
+    if allreduce_dgrad is None:
+        # Transformer-Engine column-parallel wrappers perform dgrad reduction
+        # internally but do not expose MCore's ``allreduce_dgrad`` attribute.
+        allreduce_dgrad = getattr(module, "tp_size", 1) > 1 and not sequence_parallel
+
+    if allreduce_dgrad and not sequence_parallel and not explicit_expert_comm and not disable_grad_reduce:
+        tp_group = getattr(module, "tp_group", None) or getattr(module, "_tp_group", None)
+        return copy_to_tensor_model_parallel_region(x, group=tp_group)
+    return x
+
+
 class OFTLinearSplitFC1UpGate(nn.Module):
     """Wraps a fused ``linear_fc1`` (ColumnParallelLinear producing ``[gate; up]``)
     with two independent input rotations applied per output slice.
@@ -426,7 +452,7 @@ class OFTLinearSplitFC1UpGate(nn.Module):
             del w_compute
 
     def _forward_with_weight(self, x: torch.Tensor, W: torch.Tensor):
-        x = x.contiguous()
+        x = _prepare_split_column_parallel_input(self.to_wrap, x).contiguous()
         bias = getattr(self.to_wrap, "bias", None)
 
         if self._fused_fast_path_supported():
@@ -592,18 +618,16 @@ class GroupedOFTRotation(nn.Module):
         every local expert but in a single launch — the same code path the
         rotation-bank fast path takes for the dense split FC1.
         """
-        if self.input_is_parallel:
+        if self.coft:
+            with torch.no_grad():
+                flat = self.oft_r.reshape(-1, self.oft_r.shape[-1])
+                projected = self._template._project_batch(flat, eps=self.eps)
+                self.oft_r.copy_(projected.reshape_as(self.oft_r))
+
+        if self.input_is_parallel and not self.block_share:
             oft_r_parallel = self.oft_r
         else:
             oft_r_parallel = copy_to_tensor_model_parallel_region(self.oft_r, group=self.tp_group)
-
-        if self.coft:
-            with torch.no_grad():
-                # _project_batch expects (b, n_elements). Reshape, project,
-                # reshape back so the COFT clamp acts per-block.
-                flat = oft_r_parallel.reshape(-1, oft_r_parallel.shape[-1])
-                projected = self._template._project_batch(flat, eps=self.eps)
-                oft_r_parallel.copy_(projected.reshape_as(oft_r_parallel))
 
         E, num_blocks, n_elements = oft_r_parallel.shape
         flat = oft_r_parallel.reshape(E * num_blocks, n_elements)
@@ -681,12 +705,18 @@ class GroupedOFTRotation(nn.Module):
         if required_dtype != self.oft_r.dtype:
             x = x.to(self.oft_r.dtype)
 
-        if self.input_is_parallel:
+        if self.coft:
+            with torch.no_grad():
+                oft_r = self.oft_r[expert_idx]
+                oft_r.copy_(self._template._project_batch(oft_r, eps=self.eps))
+
+        if self.input_is_parallel and not self.block_share:
             oft_r = self.oft_r[expert_idx]
         else:
             oft_r = copy_to_tensor_model_parallel_region(self.oft_r[expert_idx], group=self.tp_group)
         # Reuse the template's _cayley_batch which honors triton when available.
         R = self._template._cayley_batch(oft_r, self.block_size)
+        R = self._template.dropout(R)
 
         rank = self.in_features // self.block_size if self.block_share else self.r
         if self.block_share:
@@ -1472,13 +1502,14 @@ class OFTLinearSplitQKV(nn.Module):
         local_query_groups, heads_per_group, head_size = self._packed_qkv_layout(W.shape[0])
         in_features = W.shape[1]
         has_output_gate = getattr(self._provider, "attention_output_gate", False)
-        if has_output_gate:
-            raise NotImplementedError("CanonicalOFT split-QKV does not yet support attention_output_gate")
-
-        qkv = W.reshape(local_query_groups, heads_per_group + 2, head_size, in_features)
+        units_per_group = (2 * heads_per_group + 2) if has_output_gate else (heads_per_group + 2)
+        qkv = W.reshape(local_query_groups, units_per_group, head_size, in_features)
         q = qkv[:, :heads_per_group].reshape(-1, in_features)
-        k = qkv[:, heads_per_group : heads_per_group + 1].reshape(-1, in_features)
-        v = qkv[:, heads_per_group + 1 : heads_per_group + 2].reshape(-1, in_features)
+        if has_output_gate:
+            gate = qkv[:, heads_per_group : 2 * heads_per_group].reshape(-1, in_features)
+            q = torch.cat([q, gate], dim=0)
+        k = qkv[:, -2:-1].reshape(-1, in_features)
+        v = qkv[:, -1:].reshape(-1, in_features)
         return q, k, v
 
     def _interleave_qkv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -1489,10 +1520,12 @@ class OFTLinearSplitQKV(nn.Module):
         head_size = cfg.kv_channels or (cfg.hidden_size // head_num)
         heads_per_group = head_num // num_query_groups
 
-        local_head_num = q.shape[-1] // head_size
+        has_output_gate = getattr(cfg, "attention_output_gate", False)
+        q_width = q.shape[-1] // 2 if has_output_gate else q.shape[-1]
+        local_head_num = q_width // head_size
         local_query_groups = k.shape[-1] // head_size
         if (
-            q.shape[-1] % head_size != 0
+            q_width % head_size != 0
             or k.shape[-1] % head_size != 0
             or v.shape[-1] % head_size != 0
             or v.shape[-1] != k.shape[-1]
@@ -1505,10 +1538,14 @@ class OFTLinearSplitQKV(nn.Module):
             )
 
         leading_shape = q.shape[:-1]
+        if has_output_gate:
+            q, gate = q.split(q_width, dim=-1)
+            gate = gate.reshape(-1, local_query_groups, heads_per_group, head_size)
         q = q.reshape(-1, local_query_groups, heads_per_group, head_size)
         k = k.reshape(-1, local_query_groups, 1, head_size)
         v = v.reshape(-1, local_query_groups, 1, head_size)
-        return torch.cat([q, k, v], dim=2).reshape(*leading_shape, -1)
+        pieces = [q, gate, k, v] if has_output_gate else [q, k, v]
+        return torch.cat(pieces, dim=2).reshape(*leading_shape, -1)
 
     def _fused_fast_path_supported(self) -> bool:
         """Q/K/V rotation banks must agree on dtype, block_size, num_blocks."""
@@ -1535,7 +1572,7 @@ class OFTLinearSplitQKV(nn.Module):
     def _forward_with_weight(self, x: torch.Tensor, W: torch.Tensor):
         W_q, W_k, W_v = self._split_qkv_weight(W)
 
-        x = x.contiguous()
+        x = _prepare_split_column_parallel_input(self.to_wrap, x).contiguous()
         bias = getattr(self.to_wrap, "bias", None)
 
         if self._fused_fast_path_supported():
