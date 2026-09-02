@@ -416,13 +416,13 @@ def test_qoft_oft_type_oft_opts_back_into_legacy_shared_r(tmp_path: Path) -> Non
 
 @pytest.mark.unit
 @pytest.mark.parametrize("quant", ["fp8", "nvfp4"])
-def test_qoft_canonical_rejects_grouped_expert_fc1_on_fp8_and_nvfp4(tmp_path: Path, quant: str) -> None:
-    """OFTLinearGroupedSplitFC1UpGate raises on FP8/NVFP4 in forward, i.e. after the
-    checkpoint is loaded. The launcher must reject the combination up front."""
-    entrypoint = _load_qoft_entrypoint()
+def test_qoft_canonical_allowed_on_fp8_and_nvfp4_grouped_experts(tmp_path: Path, quant: str) -> None:
+    """Grouped expert FC1 now has real split GEMMs for every quantized kind, so
+    the former launch-time rejection is gone and canonical stays the default."""
+    from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
 
-    with pytest.raises(SystemExit, match="cannot train grouped-expert linear_fc1"):
-        _build_oft(entrypoint, tmp_path, "Qwen3MoeForCausalLM", quant)
+    entrypoint = _load_qoft_entrypoint()
+    assert isinstance(_build_oft(entrypoint, tmp_path, "Qwen3MoeForCausalLM", quant), CanonicalOFT)
 
 
 @pytest.mark.unit
@@ -436,7 +436,7 @@ def test_qoft_canonical_allowed_on_int4_grouped_experts(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_qoft_canonical_allowed_on_nvfp4_when_fc1_is_not_targeted(tmp_path: Path) -> None:
-    """The guard is about grouped FC1 specifically, not about NVFP4 as a whole."""
+    """Target translation drops nothing when fc1 is deliberately excluded."""
     from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
 
     entrypoint = _load_qoft_entrypoint()

@@ -267,10 +267,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         choices=("canonical_oft", "oft"),
         default="canonical_oft",
         help="canonical_oft (default): independent rotations per Q/K/V and per gate/up, "
-        "on BF16 and quantized fused bases alike (the base weight is dequantized for "
-        "the split GEMMs, with autograd hooks keeping only the low-bit handle). "
-        "oft: the legacy shared-R class, one rotation for the whole fused projection. "
-        "Grouped-expert FC1 remains BF16/INT4 only.",
+        "on BF16 and quantized bases alike, grouped experts included (the base weight "
+        "is dequantized for the split GEMMs, with autograd hooks keeping only the "
+        "low-bit handle). oft: the legacy shared-R class, one rotation for the whole "
+        "fused projection.",
     )
     oft.add_argument("--block-size", type=int, default=32)
     oft.add_argument("--coft", action="store_true", default=False)
@@ -346,40 +346,6 @@ def _fill_arch_defaults(args, spec: dict, *, world_size: int | None = None) -> N
         args.target_modules = spec["target_modules"][args.quant]
 
 
-# Quantized formats whose grouped-expert FC1 has no per-expert split GEMM yet.
-_CANONICAL_UNSUPPORTED_GROUPED_FC1_QUANTS = ("fp8", "nvfp4")
-
-
-def _targets_grouped_fc1(target_modules) -> bool:
-    """Whether the effective CanonicalOFT target list covers expert FC1."""
-    if not target_modules:
-        # Falling back to CanonicalOFT's own default list, which includes
-        # linear_fc1_gate / linear_fc1_up.
-        return True
-    return any(name.endswith(("linear_fc1", "linear_fc1_gate", "linear_fc1_up")) for name in target_modules)
-
-
-def validate_canonical_oft_supported(args, spec: dict) -> None:
-    """Reject --oft-type canonical_oft where the split wrappers cannot run.
-
-    ``OFTLinearGroupedSplitFC1UpGate`` handles BF16 and INT4 grouped experts but
-    raises on FP8 / NVFP4 (see its ``_assert_unquantized``). That raise fires in
-    ``forward`` -- after the checkpoint is loaded and the first batch is running --
-    so catch the combination here and name the alternative instead.
-    """
-    if not spec["moe"] or args.quant not in _CANONICAL_UNSUPPORTED_GROUPED_FC1_QUANTS:
-        return
-    if not _targets_grouped_fc1(args.target_modules):
-        return
-    raise SystemExit(
-        f"--oft-type canonical_oft cannot train grouped-expert linear_fc1 under "
-        f"--quant {args.quant}: the per-expert split GEMM is implemented for BF16 "
-        f"and INT4 only, so OFTLinearGroupedSplitFC1UpGate raises on this format. "
-        f"Re-run with --oft-type oft (the legacy shared-R class, which is what every "
-        f"run used before --oft-type existed), or drop linear_fc1 from --target-modules."
-    )
-
-
 def build_oft(args, spec: dict):
     """Build the OFT adapter for a quantized base model.
 
@@ -401,8 +367,6 @@ def build_oft(args, spec: dict):
         if args.target_modules:
             kwargs["target_modules"] = args.target_modules
         return OFT(**kwargs)
-
-    validate_canonical_oft_supported(args, spec)
 
     from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT, canonical_target_modules
 

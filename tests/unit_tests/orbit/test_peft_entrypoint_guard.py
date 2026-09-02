@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""finetune_peft.py canonical-OFT guard.
+"""finetune_peft.py OFT-type selection on quantized MoE models.
 
-finetune_qoft.py rejects canonical OFT on grouped-expert FC1 under FP8/NVFP4 at
-launch; finetune_peft.py shipped without the equivalent, so a MoE model under
---quant nvfp4 sailed to the first training step and died in
-OFTLinearGroupedSplitFC1UpGate._assert_unquantized. These tests pin the
-launch-time guard.
+Grouped expert FC1 now has real split GEMMs for every quantized kind, so the
+temporary launch-time guard is gone: canonical stays the default everywhere,
+and --oft-type oft remains the explicit legacy opt-out.
 """
 
 import importlib.util
@@ -55,16 +53,17 @@ def _args(entrypoint, model_path: str, *extra: str):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("quant", ["fp8", "nvfp4"])
-def test_peft_guard_rejects_canonical_on_moe_quantized(tmp_path: Path, quant: str) -> None:
+def test_peft_builds_canonical_on_moe_quantized(tmp_path: Path, quant: str) -> None:
+    from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
+
     entrypoint = _load_peft_entrypoint()
     model_path = _model_dir(tmp_path, {"architectures": ["Qwen3MoeForCausalLM"], "num_experts": 128})
 
-    with pytest.raises(SystemExit, match="grouped-expert linear_fc1"):
-        entrypoint.build_peft(_args(entrypoint, model_path, "--quant", quant))
+    assert isinstance(entrypoint.build_peft(_args(entrypoint, model_path, "--quant", quant)), CanonicalOFT)
 
 
 @pytest.mark.unit
-def test_peft_guard_allows_dense_quantized_and_moe_bf16(tmp_path: Path) -> None:
+def test_peft_builds_canonical_on_dense_quantized_and_moe_bf16(tmp_path: Path) -> None:
     entrypoint = _load_peft_entrypoint()
     from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
 
@@ -78,7 +77,7 @@ def test_peft_guard_allows_dense_quantized_and_moe_bf16(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_peft_guard_legacy_opt_out_still_works_on_moe_quantized(tmp_path: Path) -> None:
+def test_peft_legacy_opt_out_still_works_on_moe_quantized(tmp_path: Path) -> None:
     entrypoint = _load_peft_entrypoint()
     from megatron.bridge.orbit.oft.oft import OFT
 

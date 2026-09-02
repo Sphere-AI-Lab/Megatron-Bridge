@@ -123,50 +123,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _model_is_moe(model_path: str) -> bool:
-    """Whether the HF config declares MoE experts (num_experts / n_routed_experts)."""
-    import json
-    import os
-
-    config_path = os.path.join(model_path, "config.json")
-    if not os.path.isfile(config_path):
-        # HF hub id: resolve through transformers without downloading weights.
-        try:
-            from transformers import AutoConfig
-
-            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-            hf_config = config.to_dict()
-        except Exception:
-            return False
-    else:
-        with open(config_path) as fh:
-            hf_config = json.load(fh)
-    for key in ("num_experts", "n_routed_experts", "num_local_experts"):
-        if hf_config.get(key) or (hf_config.get("text_config") or {}).get(key):
-            return True
-    return False
-
-
-def validate_canonical_oft_supported(args) -> None:
-    """Reject --oft-type canonical_oft where the split wrappers cannot run.
-
-    Mirrors finetune_qoft.py's guard: OFTLinearGroupedSplitFC1UpGate raises on
-    FP8 / NVFP4 grouped expert FC1 -- in forward, after the checkpoint is
-    loaded -- so a MoE model under those formats must be caught at launch.
-    CanonicalOFT's default target list includes linear_fc1_gate/up, and this
-    entrypoint exposes no --target-modules to drop them.
-    """
-    if args.quant not in ("fp8", "nvfp4"):
-        return
-    if not _model_is_moe(args.model_path):
-        return
-    raise SystemExit(
-        f"--oft-type canonical_oft cannot train grouped-expert linear_fc1 under "
-        f"--quant {args.quant} (the per-expert split GEMM exists for BF16/INT4 only, "
-        f"and this MoE model routes expert FC1 through it). Re-run with --oft-type oft."
-    )
-
-
 def build_peft(args):
     """Return the PEFT object, or None for full finetuning.
 
@@ -185,7 +141,6 @@ def build_peft(args):
         }
         if args.oft_type == "oft":
             return OFT(**kwargs)
-        validate_canonical_oft_supported(args)
         # This entrypoint exposes no --target-modules, and CanonicalOFT's default
         # target list is already the split (linear_q / linear_fc1_gate / ...) form.
         return CanonicalOFT(**kwargs)
