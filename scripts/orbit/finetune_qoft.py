@@ -93,6 +93,7 @@ QWEN3_MOE_OFT_TARGET_MODULES = [
 ARCH_SPECS = {
     "Qwen3ForCausalLM": {
         "key": "qwen3_dense",
+        "moe": False,
         "label": "Qwen3 dense",
         "slug": "qwen3_dense",
         "trust_remote_code": False,
@@ -116,6 +117,7 @@ ARCH_SPECS = {
     },
     "Qwen3MoeForCausalLM": {
         "key": "qwen3_moe",
+        "moe": True,
         "label": "Qwen3 MoE",
         "slug": "qwen3_30b_a3b",
         "trust_remote_code": False,
@@ -139,6 +141,7 @@ ARCH_SPECS = {
     },
     "KimiK25ForConditionalGeneration": {
         "key": "kimi_k25",
+        "moe": True,
         "label": "Kimi",
         "slug": "kimi_k25",
         "trust_remote_code": True,
@@ -166,6 +169,7 @@ ARCH_SPECS = {
     },
     "DeepseekV3ForCausalLM": {
         "key": "moonlight",
+        "moe": True,
         "label": "Moonlight",
         "slug": "moonlight_16b",
         "trust_remote_code": True,
@@ -258,6 +262,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     tr.add_argument("--log-interval", type=int, default=None)
 
     oft = p.add_argument_group("OFT")
+    oft.add_argument(
+        "--oft-type",
+        choices=("canonical_oft", "oft"),
+        default="canonical_oft",
+        help="canonical_oft (default): independent rotations per Q/K/V and per gate/up, "
+        "on BF16 and quantized fused bases alike (the base weight is dequantized for "
+        "the split GEMMs, with autograd hooks keeping only the low-bit handle). "
+        "oft: the legacy shared-R class, one rotation for the whole fused projection. "
+        "Grouped-expert FC1 remains BF16/INT4 only.",
+    )
     oft.add_argument("--block-size", type=int, default=32)
     oft.add_argument("--coft", action="store_true", default=False)
     oft.add_argument("--eps", type=float, default=6e-5)
@@ -332,10 +346,47 @@ def _fill_arch_defaults(args, spec: dict, *, world_size: int | None = None) -> N
         args.target_modules = spec["target_modules"][args.quant]
 
 
-def build_oft(args):
-    """Build the OFT adapter for a quantized base model."""
-    from megatron.bridge.orbit.oft.oft import OFT
+# Quantized formats whose grouped-expert FC1 has no per-expert split GEMM yet.
+_CANONICAL_UNSUPPORTED_GROUPED_FC1_QUANTS = ("fp8", "nvfp4")
 
+
+def _targets_grouped_fc1(target_modules) -> bool:
+    """Whether the effective CanonicalOFT target list covers expert FC1."""
+    if not target_modules:
+        # Falling back to CanonicalOFT's own default list, which includes
+        # linear_fc1_gate / linear_fc1_up.
+        return True
+    return any(name.endswith(("linear_fc1", "linear_fc1_gate", "linear_fc1_up")) for name in target_modules)
+
+
+def validate_canonical_oft_supported(args, spec: dict) -> None:
+    """Reject --oft-type canonical_oft where the split wrappers cannot run.
+
+    ``OFTLinearGroupedSplitFC1UpGate`` handles BF16 and INT4 grouped experts but
+    raises on FP8 / NVFP4 (see its ``_assert_unquantized``). That raise fires in
+    ``forward`` -- after the checkpoint is loaded and the first batch is running --
+    so catch the combination here and name the alternative instead.
+    """
+    if not spec["moe"] or args.quant not in _CANONICAL_UNSUPPORTED_GROUPED_FC1_QUANTS:
+        return
+    if not _targets_grouped_fc1(args.target_modules):
+        return
+    raise SystemExit(
+        f"--oft-type canonical_oft cannot train grouped-expert linear_fc1 under "
+        f"--quant {args.quant}: the per-expert split GEMM is implemented for BF16 "
+        f"and INT4 only, so OFTLinearGroupedSplitFC1UpGate raises on this format. "
+        f"Re-run with --oft-type oft (the legacy shared-R class, which is what every "
+        f"run used before --oft-type existed), or drop linear_fc1 from --target-modules."
+    )
+
+
+def build_oft(args, spec: dict):
+    """Build the OFT adapter for a quantized base model.
+
+    ``--oft-type canonical_oft`` (the default) attaches independent rotations to
+    each of Q/K/V and to gate/up. ``--oft-type oft`` selects the legacy class,
+    which applies one shared rotation to the whole fused projection.
+    """
     kwargs = {
         "block_size": args.block_size,
         "coft": args.coft,
@@ -343,9 +394,23 @@ def build_oft(args):
         "block_share": args.block_share,
         "module_dropout": args.module_dropout,
     }
+
+    if args.oft_type == "oft":
+        from megatron.bridge.orbit.oft.oft import OFT
+
+        if args.target_modules:
+            kwargs["target_modules"] = args.target_modules
+        return OFT(**kwargs)
+
+    validate_canonical_oft_supported(args, spec)
+
+    from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT, canonical_target_modules
+
     if args.target_modules:
-        kwargs["target_modules"] = args.target_modules
-    return OFT(**kwargs)
+        # Architecture defaults are written with the fused Megatron leaf names;
+        # CanonicalOFT rejects those and wants the split siblings.
+        kwargs["target_modules"] = canonical_target_modules(args.target_modules)
+    return CanonicalOFT(**kwargs)
 
 
 def _validate_runtime_topology(args, spec: dict, *, world_size: int) -> None:
@@ -500,7 +565,7 @@ def _apply_quant_mode(config, args, spec: dict) -> None:
 
 def build_config(args, spec: dict):
     """Assemble the full finetuning config for the detected architecture."""
-    peft = build_oft(args)
+    peft = build_oft(args, spec)
 
     if spec["key"] == "qwen3_moe":
         from megatron.bridge import AutoBridge

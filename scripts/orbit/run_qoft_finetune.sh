@@ -18,7 +18,7 @@
 #
 # Required: QUANT, HF_MODEL_PATH, MEGATRON_CKPT
 # Common: NUM_GPUS, TP, EP, PP, SP, TRAIN_ITERS, GLOBAL_BATCH_SIZE,
-# MICRO_BATCH_SIZE, SEQ_LENGTH, OUTPUT_DIR, BLOCK_SIZE, TARGET_MODULES
+# MICRO_BATCH_SIZE, SEQ_LENGTH, OUTPUT_DIR, OFT_TYPE, BLOCK_SIZE, TARGET_MODULES
 # Advanced: DISTRIBUTED_TIMEOUT_MINUTES, LOG_INTERVAL, COFT, EPS, BLOCK_SHARE,
 # MODULE_DROPOUT, GROUP_SIZE, INT4_ACTIVE_EXPERT_CHUNK_SIZE,
 # INT4_GROUPED_CHUNK_BACKEND, SAVE_CHECKPOINTS, SAVE_INTERVAL, SKIP_TRAIN,
@@ -83,6 +83,7 @@ fi
 [[ -n "${SEQ_LENGTH:-}" ]] && args+=(--seq-length "${SEQ_LENGTH}")
 [[ -n "${LOG_INTERVAL:-}" ]] && args+=(--log-interval "${LOG_INTERVAL}")
 
+[[ -n "${OFT_TYPE:-}" ]] && args+=(--oft-type "${OFT_TYPE}")
 [[ -n "${BLOCK_SIZE:-}" ]] && args+=(--block-size "${BLOCK_SIZE}")
 is_true "${COFT:-0}" && args+=(--coft)
 [[ -n "${EPS:-}" ]] && args+=(--eps "${EPS}")

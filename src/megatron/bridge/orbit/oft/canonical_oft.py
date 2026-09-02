@@ -17,12 +17,14 @@
 Unlike the legacy ``OFT`` class (one shared rotation R for the fused linear_qkv),
 CanonicalOFT attaches three independent rotations (R_q, R_k, R_v) and applies
 each to its own projection slice. This is the only correct OFT semantics for
-fused projections; the orbit launcher always uses CanonicalOFT for OFT runs.
+fused projections, and is what ``--oft-type canonical_oft`` -- the default on
+both orbit launchers -- selects. ``--oft-type oft`` opts back into the legacy
+class.
 """
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1467,6 +1469,45 @@ class _SplitLNCanonicalOFTFC1(nn.Module):
 
     def disable_adapter_layers(self) -> None:
         self._fc1.disable_adapter_layers()
+
+
+# Fused Megatron leaf -> the canonical split suffixes that replace it. This is the
+# inverse of ``CanonicalOFT._SPLIT_SUFFIX_TO_FUSED``, kept at module level so a
+# launcher can translate a legacy target list without building the PEFT object.
+_FUSED_TO_SPLIT_SUFFIXES: Dict[str, Tuple[str, ...]] = {
+    "linear_qkv": ("linear_q", "linear_k", "linear_v"),
+    "linear_fc1": ("linear_fc1_gate", "linear_fc1_up"),
+}
+
+
+def canonical_target_modules(target_modules: Iterable[str]) -> List[str]:
+    """Translate a legacy ``OFT`` target list into ``CanonicalOFT`` split names.
+
+    ``CanonicalOFT.__post_init__`` rejects the fused leaves ``linear_qkv`` and
+    ``linear_fc1``: a single input rotation on a fused projection forces Q/K/V
+    (and gate/up) to share one rotation, which is the semantics CanonicalOFT
+    exists to replace. Each fused name expands to its split siblings, keeping
+    any wildcard prefix intact::
+
+        ["linear_qkv", "linear_proj"] -> ["linear_q", "linear_k", "linear_v", "linear_proj"]
+        ["*.layers.0.*.linear_fc1"]   -> ["*.layers.0.*.linear_fc1_gate",
+                                          "*.layers.0.*.linear_fc1_up"]
+
+    Names that are already split, and names that are not fused leaves at all
+    (``linear_proj``, ``linear_fc2``, Kimi's MLA projections), pass through
+    unchanged. Order is preserved and duplicates are dropped.
+    """
+    expanded: List[str] = []
+    for target in target_modules:
+        for fused, split_suffixes in _FUSED_TO_SPLIT_SUFFIXES.items():
+            if target.endswith(fused):
+                prefix = target[: -len(fused)]
+                expanded.extend(prefix + suffix for suffix in split_suffixes)
+                break
+        else:
+            expanded.append(target)
+    # dict.fromkeys de-duplicates while preserving first-seen order.
+    return list(dict.fromkeys(expanded))
 
 
 @dataclass

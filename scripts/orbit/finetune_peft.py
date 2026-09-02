@@ -38,6 +38,7 @@ import argparse
 import os
 
 from megatron.bridge import AutoBridge
+from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
 from megatron.bridge.orbit.oft.oft import OFT
 from megatron.bridge.peft.dora import DoRA
 from megatron.bridge.peft.lora import LoRA
@@ -102,6 +103,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     tr.add_argument("--recompute", action="store_true", help="Full uniform recompute (large models)")
 
     oft = p.add_argument_group("OFT")
+    oft.add_argument(
+        "--oft-type",
+        choices=("canonical_oft", "oft"),
+        default="canonical_oft",
+        help="canonical_oft (default): independent rotations per Q/K/V and per gate/up. "
+        "oft: the legacy shared-R class, one rotation for the whole fused projection.",
+    )
     oft.add_argument("--block-size", type=int, default=32)
     oft.add_argument("--coft", action="store_true", default=False)
     oft.add_argument("--eps", type=float, default=6e-5)
@@ -115,6 +123,50 @@ def parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _model_is_moe(model_path: str) -> bool:
+    """Whether the HF config declares MoE experts (num_experts / n_routed_experts)."""
+    import json
+    import os
+
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        # HF hub id: resolve through transformers without downloading weights.
+        try:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            hf_config = config.to_dict()
+        except Exception:
+            return False
+    else:
+        with open(config_path) as fh:
+            hf_config = json.load(fh)
+    for key in ("num_experts", "n_routed_experts", "num_local_experts"):
+        if hf_config.get(key) or (hf_config.get("text_config") or {}).get(key):
+            return True
+    return False
+
+
+def validate_canonical_oft_supported(args) -> None:
+    """Reject --oft-type canonical_oft where the split wrappers cannot run.
+
+    Mirrors finetune_qoft.py's guard: OFTLinearGroupedSplitFC1UpGate raises on
+    FP8 / NVFP4 grouped expert FC1 -- in forward, after the checkpoint is
+    loaded -- so a MoE model under those formats must be caught at launch.
+    CanonicalOFT's default target list includes linear_fc1_gate/up, and this
+    entrypoint exposes no --target-modules to drop them.
+    """
+    if args.quant not in ("fp8", "nvfp4"):
+        return
+    if not _model_is_moe(args.model_path):
+        return
+    raise SystemExit(
+        f"--oft-type canonical_oft cannot train grouped-expert linear_fc1 under "
+        f"--quant {args.quant} (the per-expert split GEMM exists for BF16/INT4 only, "
+        f"and this MoE model routes expert FC1 through it). Re-run with --oft-type oft."
+    )
+
+
 def build_peft(args):
     """Return the PEFT object, or None for full finetuning.
 
@@ -125,12 +177,18 @@ def build_peft(args):
     if args.peft == "none":
         return None
     if args.peft == "oft":
-        return OFT(
-            block_size=args.block_size,
-            coft=args.coft,
-            eps=args.eps,
-            block_share=args.block_share,
-        )
+        kwargs = {
+            "block_size": args.block_size,
+            "coft": args.coft,
+            "eps": args.eps,
+            "block_share": args.block_share,
+        }
+        if args.oft_type == "oft":
+            return OFT(**kwargs)
+        validate_canonical_oft_supported(args)
+        # This entrypoint exposes no --target-modules, and CanonicalOFT's default
+        # target list is already the split (linear_q / linear_fc1_gate / ...) form.
+        return CanonicalOFT(**kwargs)
     cls = DoRA if args.peft == "dora" else LoRA
     return cls(dim=args.dim, alpha=args.alpha, dropout=args.dropout)
 

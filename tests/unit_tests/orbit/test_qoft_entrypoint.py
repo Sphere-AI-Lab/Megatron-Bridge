@@ -332,3 +332,174 @@ def test_qoft_launcher_forwards_explicit_operational_controls(tmp_path: Path) ->
     assert "--profile-memory" in forwarded
     assert "--profile-memory-steps" in forwarded
     assert "--peft" not in forwarded
+
+
+def _oft_argv(tmp_path: Path, quant: str, *extra: str) -> list[str]:
+    return [
+        "--quant",
+        quant,
+        "--hf-model-path",
+        str(tmp_path / "hf-model"),
+        "--pretrained-checkpoint",
+        str(tmp_path / "checkpoint"),
+        *extra,
+    ]
+
+
+def _build_oft(entrypoint, tmp_path: Path, arch: str, quant: str, *extra: str):
+    """parse_args -> arch defaults -> build_oft, the order main() uses."""
+    spec = entrypoint.ARCH_SPECS[arch]
+    args = entrypoint.parse_args(_oft_argv(tmp_path, quant, *extra))
+    entrypoint._fill_arch_defaults(args, spec)
+    return entrypoint.build_oft(args, spec)
+
+
+@pytest.mark.unit
+def test_qoft_defaults_to_canonical_oft_with_split_targets(tmp_path: Path) -> None:
+    """Without --oft-type the entrypoint builds CanonicalOFT, not legacy shared-R OFT.
+
+    Regression test: both launchers used to hardcode ``OFT``, so Q/K/V shared one
+    rotation on the fused linear_qkv and CanonicalOFT was unreachable.
+    """
+    from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
+
+    entrypoint = _load_qoft_entrypoint()
+    peft = _build_oft(entrypoint, tmp_path, "Qwen3MoeForCausalLM", "int4")
+
+    assert isinstance(peft, CanonicalOFT)
+    # CanonicalOFT rejects the fused leaves outright; assert the resolved list is split.
+    assert not any(target.endswith(("linear_qkv", "linear_fc1")) for target in peft.target_modules)
+    assert {"linear_q", "linear_k", "linear_v"}.issubset(set(peft.target_modules))
+
+
+@pytest.mark.unit
+def test_qoft_translates_architecture_fused_targets_to_split_names(tmp_path: Path) -> None:
+    """Arch defaults are written with fused leaf names; canonical mode expands them."""
+    from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
+
+    entrypoint = _load_qoft_entrypoint()
+    # nvfp4 is the one arch/quant pair carrying an explicit fused target list.
+    peft = _build_oft(
+        entrypoint,
+        tmp_path,
+        "Qwen3MoeForCausalLM",
+        "nvfp4",
+        "--target-modules",
+        "linear_qkv,linear_proj",
+    )
+
+    assert isinstance(peft, CanonicalOFT)
+    assert peft.target_modules == ["linear_q", "linear_k", "linear_v", "linear_proj"]
+
+
+@pytest.mark.unit
+def test_qoft_oft_type_oft_opts_back_into_legacy_shared_r(tmp_path: Path) -> None:
+    """--oft-type oft is the explicit opt-in to the legacy one-rotation class."""
+    from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
+    from megatron.bridge.orbit.oft.oft import OFT
+
+    entrypoint = _load_qoft_entrypoint()
+    peft = _build_oft(
+        entrypoint,
+        tmp_path,
+        "Qwen3MoeForCausalLM",
+        "nvfp4",
+        "--oft-type",
+        "oft",
+    )
+
+    assert isinstance(peft, OFT)
+    assert not isinstance(peft, CanonicalOFT)
+    # Legacy targets are passed through unchanged, fused leaves included.
+    assert peft.target_modules == list(entrypoint.QWEN3_MOE_OFT_TARGET_MODULES)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("quant", ["fp8", "nvfp4"])
+def test_qoft_canonical_rejects_grouped_expert_fc1_on_fp8_and_nvfp4(tmp_path: Path, quant: str) -> None:
+    """OFTLinearGroupedSplitFC1UpGate raises on FP8/NVFP4 in forward, i.e. after the
+    checkpoint is loaded. The launcher must reject the combination up front."""
+    entrypoint = _load_qoft_entrypoint()
+
+    with pytest.raises(SystemExit, match="cannot train grouped-expert linear_fc1"):
+        _build_oft(entrypoint, tmp_path, "Qwen3MoeForCausalLM", quant)
+
+
+@pytest.mark.unit
+def test_qoft_canonical_allowed_on_int4_grouped_experts(tmp_path: Path) -> None:
+    """INT4 grouped FC1 is implemented, so canonical stays the default there."""
+    from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
+
+    entrypoint = _load_qoft_entrypoint()
+    assert isinstance(_build_oft(entrypoint, tmp_path, "DeepseekV3ForCausalLM", "int4"), CanonicalOFT)
+
+
+@pytest.mark.unit
+def test_qoft_canonical_allowed_on_nvfp4_when_fc1_is_not_targeted(tmp_path: Path) -> None:
+    """The guard is about grouped FC1 specifically, not about NVFP4 as a whole."""
+    from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
+
+    entrypoint = _load_qoft_entrypoint()
+    peft = _build_oft(
+        entrypoint,
+        tmp_path,
+        "Qwen3MoeForCausalLM",
+        "nvfp4",
+        "--target-modules",
+        "linear_qkv,linear_proj,linear_fc2",
+    )
+
+    assert isinstance(peft, CanonicalOFT)
+    assert "linear_fc2" in peft.target_modules
+
+
+@pytest.mark.unit
+def test_qoft_canonical_allowed_on_dense_architecture(tmp_path: Path) -> None:
+    """Qwen3 dense has no grouped experts, so FP8 canonical is not gated."""
+    from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
+
+    entrypoint = _load_qoft_entrypoint()
+    assert isinstance(_build_oft(entrypoint, tmp_path, "Qwen3ForCausalLM", "fp8"), CanonicalOFT)
+
+
+@pytest.mark.unit
+def test_qoft_rejects_unknown_oft_type(tmp_path: Path) -> None:
+    entrypoint = _load_qoft_entrypoint()
+
+    with pytest.raises(SystemExit):
+        entrypoint.parse_args(_oft_argv(tmp_path, "int4", "--oft-type", "canonical"))
+
+
+@pytest.mark.unit
+def test_qoft_launcher_forwards_oft_type(tmp_path: Path) -> None:
+    """OFT_TYPE reaches the entrypoint, so legacy OFT is selectable from the launcher."""
+    capture_path = tmp_path / "torchrun-args.txt"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    torchrun = bin_dir / "torchrun"
+    torchrun.write_text('#!/bin/bash\nprintf "%s\\n" "$@" >"$CAPTURE_PATH"\n')
+    torchrun.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "CAPTURE_PATH": str(capture_path),
+        "QUANT": "nvfp4",
+        "HF_MODEL_PATH": "/models/qwen3-moe",
+        "MEGATRON_CKPT": "/checkpoints/qwen3-moe",
+        "NUM_GPUS": "4",
+        "OFT_TYPE": "oft",
+    }
+
+    result = subprocess.run(
+        ["bash", str(_QOFT_LAUNCHER_PATH)],
+        cwd=_REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    forwarded = capture_path.read_text().splitlines()
+    assert "--oft-type" in forwarded
+    assert forwarded[forwarded.index("--oft-type") + 1] == "oft"
