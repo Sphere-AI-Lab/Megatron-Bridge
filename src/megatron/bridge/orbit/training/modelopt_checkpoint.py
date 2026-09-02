@@ -76,6 +76,46 @@ def _save_sharded_modelopt_state_with_async_strategy(
     )
 
 
+def restore_sharded_modelopt_state_via_common_reader(
+    model: list[MegatronModule],
+    checkpoint_name: str | Path,
+    prefix: str = "",
+    metadata: Optional[dict[str, Any]] = None,
+) -> None:
+    """Restore sharded ModelOpt state, reading common state with MCore's reader.
+
+    Mirrors the pinned ModelOpt ``restore_sharded_modelopt_state`` except for one
+    line: the common modelopt state is loaded through
+    ``dist_checkpointing.load_common_state_dict()`` instead of a direct
+    ``common.pt`` read. The pinned MCore's ``dist_checkpointing.save()`` embeds
+    common data as a ``ShardedObject("common_state")`` inside the torch-dist
+    files and never writes ``common.pt``, so ModelOpt's own restore raises
+    FileNotFoundError on every modelopt_state this repo saves. MCore's reader
+    understands that layout (and reads rank-locally: torch-dist load with
+    ``no_dist=True``).
+    """
+    import modelopt.torch.opt as mto
+
+    # Private but pinned: the per-module extra_state loader is the second phase
+    # of ModelOpt's own two-phase restore and has no public equivalent.
+    from modelopt.torch.opt.plugins.mcore_dist_checkpointing import (
+        _load_extra_state_from_sharded_checkpoint,
+    )
+
+    if len(model) > 1:
+        raise ValueError("sharded_modelopt_state does not support virtual pipeline parallel!")
+
+    modelopt_checkpoint_name = f"{checkpoint_name}/modelopt_state"
+    if not os.path.exists(modelopt_checkpoint_name) or mto.ModeloptStateManager.is_converted(model[0]):
+        return
+
+    common_modelopt_state = dist_checkpointing.load_common_state_dict(modelopt_checkpoint_name)
+    print(f"nvidia-modelopt ckpt version: {common_modelopt_state.get('modelopt_version')}")
+
+    model[0] = mto.restore_from_modelopt_state(model[0], common_modelopt_state)
+    _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name, prefix, metadata=metadata)
+
+
 def _maybe_restore_modelopt_state_for_sharded_load(
     model: list[MegatronModule],
     checkpoint_path: Optional[str],
@@ -91,5 +131,13 @@ def _maybe_restore_modelopt_state_for_sharded_load(
     if not has_modelopt_state(checkpoint_path):
         return False
 
+    # ModelOpt's restore replays the saved mode list, which contains
+    # ``real_quantize`` once a prior run has been through ``mtq.compress``.
+    # Replaying that mode walks grouped expert linears (``weight0..weightN``,
+    # no ``.weight``) through unpatched ModelOpt code, so the guards must be in
+    # place before the replay -- not only in the packed-restore path.
+    from megatron.bridge.orbit.training.modelopt_packed_restore import _patch_modelopt_pack_for_grouped_moe
+
+    _patch_modelopt_pack_for_grouped_moe()
     restore_modelopt_state(model, common_state_dict)
     return True

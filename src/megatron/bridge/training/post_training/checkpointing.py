@@ -15,15 +15,13 @@
 """Input/output checkpointing for ModelOpt."""
 
 try:
-    from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
+    from modelopt.torch.opt.plugins import restore_sharded_modelopt_state  # noqa: F401  # modelopt install canary
 except ImportError as e:
     raise ImportError('Required `"nvidia-modelopt[torch]"` is not installed!') from e
 
 import os
 
-import torch
 from megatron.core import dist_checkpointing
-from megatron.core.dist_checkpointing.strategies.common import COMMON_STATE_FNAME
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
 
@@ -85,7 +83,12 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
     if not os.path.isdir(modelopt_state_path):
         return False
 
-    modelopt_state = torch.load(modelopt_state_path + "/" + COMMON_STATE_FNAME, weights_only=True)
+    # orbit-seam(modelopt): the pinned MCore's dist_checkpointing.save() embeds
+    # common data as a ShardedObject("common_state") inside the torch-dist files
+    # and writes no common.pt, so a direct torch.load of that file name raised
+    # FileNotFoundError for every checkpoint this repo saves. MCore's own reader
+    # handles the layout and reads rank-locally (no process group needed).
+    modelopt_state = dist_checkpointing.load_common_state_dict(modelopt_state_path)
     modes = modelopt_state["modelopt_state_dict"]
     if len(modes) == 1 and modes[0][0] == "kd_loss":
         # Ignore KD state
@@ -100,14 +103,31 @@ def load_modelopt_state(model: list[MegatronModule], checkpoint_path: str) -> No
         model: The model to load the modelopt_state into
         checkpoint_path: Path to the checkpoint directory
     """
+    # orbit-seam(modelopt): install the grouped-MoE ``.weight`` guards BEFORE
+    # the restore below, not after it. The restore replays the checkpoint's
+    # saved mode list, and a run checkpoint written after ``mtq.compress``
+    # contains ``real_quantize``; replaying that mode in a fresh process walks
+    # grouped expert linears (``weight0..weightN``, no ``.weight``) through
+    # unpatched ModelOpt and raises AttributeError before the patch at the end
+    # of this function would ever have been installed.
+    from megatron.bridge.orbit.training.modelopt_packed_restore import (
+        _maybe_compress_restored_modelopt_model,
+        _patch_modelopt_pack_for_grouped_moe,
+    )
+
+    _patch_modelopt_pack_for_grouped_moe()
+
     modelopt_checkpoint_path = _get_modelopt_checkpoint_path(checkpoint_path)
     unwrapped_model = unwrap_model(model)
-    restore_sharded_modelopt_state(unwrapped_model, modelopt_checkpoint_path)
+
+    # orbit-seam(modelopt): restore through the orbit reader -- the pinned MCore
+    # writes no common.pt, which ModelOpt's own restore reads by literal name.
+    from megatron.bridge.orbit.training.modelopt_checkpoint import (
+        restore_sharded_modelopt_state_via_common_reader,
+    )
+
+    restore_sharded_modelopt_state_via_common_reader(unwrapped_model, modelopt_checkpoint_path)
 
     # orbit-seam(modelopt): compress packed low-precision checkpoints once
     # ModelOpt state is restored.
-    from megatron.bridge.orbit.training.modelopt_packed_restore import (
-        _maybe_compress_restored_modelopt_model,
-    )
-
     _maybe_compress_restored_modelopt_model(unwrapped_model, modelopt_checkpoint_path)

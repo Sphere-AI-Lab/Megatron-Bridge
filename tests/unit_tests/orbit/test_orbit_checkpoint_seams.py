@@ -73,14 +73,24 @@ def test_modelopt_restore_runs_before_schema_helper(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.unit
-def test_post_training_restore_compresses_after_modelopt_state(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_post_training_restore_patches_before_restore_then_compresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Order matters: the grouped-MoE ``.weight`` guards must be installed before
+    ModelOpt's restore replays the saved mode list. A run checkpoint written
+    after ``mtq.compress`` contains ``real_quantize``; replaying it unpatched in
+    a fresh process raised AttributeError on grouped expert linears before the
+    patch (which used to be installed after the restore) ever existed."""
     events = []
     model = [object()]
     monkeypatch.setattr(post_training_checkpointing, "_get_modelopt_checkpoint_path", lambda path: f"{path}/iter_9")
     monkeypatch.setattr(post_training_checkpointing, "unwrap_model", lambda chunks: ["unwrapped"])
     monkeypatch.setattr(
-        post_training_checkpointing,
-        "restore_sharded_modelopt_state",
+        modelopt_packed_restore,
+        "_patch_modelopt_pack_for_grouped_moe",
+        lambda: events.append(("patch",)),
+    )
+    monkeypatch.setattr(
+        modelopt_checkpoint,
+        "restore_sharded_modelopt_state_via_common_reader",
         lambda unwrapped, path: events.append(("restore", unwrapped, path)),
     )
     monkeypatch.setattr(
@@ -92,9 +102,33 @@ def test_post_training_restore_compresses_after_modelopt_state(monkeypatch: pyte
     post_training_checkpointing.load_modelopt_state(model, "checkpoint")
 
     assert events == [
+        ("patch",),
         ("restore", ["unwrapped"], "checkpoint/iter_9"),
         ("compress", ["unwrapped"], "checkpoint/iter_9"),
     ]
+
+
+@pytest.mark.unit
+def test_sharded_load_restore_installs_grouped_moe_patch_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The schema-helper restore seam replays the same saved mode list and had
+    no patch install at all."""
+    events = []
+    monkeypatch.setattr(post_training_checkpointing, "has_modelopt_state", lambda path: True)
+    monkeypatch.setattr(
+        modelopt_packed_restore,
+        "_patch_modelopt_pack_for_grouped_moe",
+        lambda: events.append("patch"),
+    )
+    monkeypatch.setattr(
+        modelopt_checkpoint,
+        "restore_modelopt_state",
+        lambda model, state: events.append("restore"),
+    )
+
+    restored = modelopt_checkpoint._maybe_restore_modelopt_state_for_sharded_load(["m"], "ckpt", {"k": 1})
+
+    assert restored is True
+    assert events == ["patch", "restore"]
 
 
 @pytest.mark.unit
