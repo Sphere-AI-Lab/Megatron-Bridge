@@ -73,6 +73,20 @@ def test_modelopt_restore_runs_before_schema_helper(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.unit
+def test_modelopt_restore_skips_non_path_local_checkpoint_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        modelopt_checkpoint,
+        "_maybe_restore_modelopt_state_for_sharded_load",
+        lambda model, path, state: calls.append((model, path, state)),
+    )
+
+    checkpointing._restore_modelopt_state_before_sharded_schema("model", 42, {"iteration": 42})
+
+    assert calls == []
+
+
+@pytest.mark.unit
 def test_post_training_restore_patches_before_restore_then_compresses(monkeypatch: pytest.MonkeyPatch) -> None:
     """Order matters: the grouped-MoE ``.weight`` guards must be installed before
     ModelOpt's restore replays the saved mode list. A run checkpoint written

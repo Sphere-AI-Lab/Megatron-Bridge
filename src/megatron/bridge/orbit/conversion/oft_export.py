@@ -42,7 +42,7 @@ MegatronModel = TypeVar("MegatronModel", bound=MegatronModule)
 
 # Map Megatron adapter suffixes to HuggingFace OFT parameter suffixes
 MEGATRON_TO_HF_OFT_SUFFIX = {
-    ".oft_r": ".oft_R",
+    ".oft_r": ".oft_R.weight",
 }
 
 GDN_IN_PROJ_KEYS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
@@ -258,7 +258,7 @@ class OrbitOFTExportMixin:
         """Translate a base HF weight name into its OFT-specific counterpart.
 
         Example:
-            ``model.layers.0.self_attn.q_proj.weight`` → ``model.layers.0.self_attn.q_proj.oft_R``
+            ``model.layers.0.self_attn.q_proj.weight`` → ``model.layers.0.self_attn.q_proj.oft_R.weight``
         """
         if not base_name.endswith(".weight"):
             return None
@@ -527,7 +527,7 @@ class OrbitOFTExportMixin:
 
         Yields:
             ``HFWeightTuple`` with the HF adapter parameter name (e.g.
-            ``model.layers.0.self_attn.q_proj.oft_R``) and the corresponding tensor.
+            ``model.layers.0.self_attn.q_proj.oft_R.weight``) and the corresponding tensor.
         """
 
         from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
@@ -637,7 +637,7 @@ class OrbitOFTExportMixin:
                     if dsv4_grouped_layer_match is not None:
                         hf_oft_name = (
                             f"layers.{dsv4_grouped_layer_match.group('layer')}.ffn.experts."
-                            f"{expert_idx}.{dsv4_grouped_layer_match.group('proj')}.oft_R"
+                            f"{expert_idx}.{dsv4_grouped_layer_match.group('proj')}.oft_R.weight"
                         )
                         yield HFWeightTuple(hf_oft_name, current_oft_r)
                 continue
@@ -735,7 +735,7 @@ class OrbitOFTExportMixin:
                     # Legacy shared-R OFT on a GROUPED MoE expert fused gate/up:
                     # the serve side (sglang FusedMoE) stores ONE fused ``w13_oft_r``
                     # rotation per expert and detects the fused layout as
-                    # ``gate_proj.oft_R`` present + ``up_proj.oft_R`` ABSENT. Emit
+                    # ``gate_proj.oft_R.weight`` present + ``up_proj.oft_R.weight`` ABSENT. Emit
                     # only the gate projection (the shared rotation, applied to the
                     # fused gate/up input); sending both gate+up would be read as the
                     # split layout and mis-route to the unregistered w1/w3 buffers.
@@ -856,7 +856,7 @@ class OrbitOFTExportMixin:
 # and exposes free-function entrypoints below.
 # ---------------------------------------------------------------------------
 
-_HF_OFT_SUFFIXES = (".oft_R",)
+_HF_OFT_SUFFIXES = (".oft_R.weight",)
 
 _OFT_BRIDGE_CLASS_CACHE: Dict[type, type] = {}
 

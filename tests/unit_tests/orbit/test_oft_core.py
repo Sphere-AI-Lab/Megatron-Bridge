@@ -18,7 +18,8 @@ import torch.nn as nn
 from megatron.core import parallel_state
 from megatron.core.transformer import utils as transformer_utils
 
-from megatron.bridge.orbit.oft.canonical_oft import _split_wrapper_sharded_state_dict
+from megatron.bridge.orbit.oft.canonical_oft import GroupedOFTRotation, _split_wrapper_sharded_state_dict
+from megatron.bridge.orbit.oft.oft import _SplitLNOFTLinear
 from megatron.bridge.orbit.oft.oft_layers import MultiplicativeDropoutLayer, OFTRotationModule
 from megatron.bridge.orbit.oft.param_names import is_peft_adapter_param_name, is_trainable_base_param_name
 
@@ -26,6 +27,7 @@ from megatron.bridge.orbit.oft.param_names import is_peft_adapter_param_name, is
 @pytest.fixture(autouse=True)
 def mock_tensor_parallel_group(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_group", lambda: object())
+    monkeypatch.setattr(parallel_state, "get_expert_tensor_parallel_group", lambda: object())
 
 
 @pytest.mark.unit
@@ -68,6 +70,65 @@ def test_multiplicative_dropout_replaces_every_block_with_identity() -> None:
     result = dropout(rotations)
 
     torch.testing.assert_close(result, torch.eye(4).repeat(3, 1, 1))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+def test_split_fused_norm_honors_zero_centered_gamma(normalization: str) -> None:
+    split = _SplitLNOFTLinear.__new__(_SplitLNOFTLinear)
+    nn.Module.__init__(split)
+    split._normalization = normalization
+    split._hidden_size = 4
+    split._eps = 1e-5
+    split._orig_module = nn.Module()
+    split._orig_module.layer_norm_weight = nn.Parameter(torch.zeros(4))
+    split._orig_module.layer_norm_bias = nn.Parameter(torch.zeros(4))
+    split._orig_module.zero_centered_gamma = True
+    x = torch.tensor([[1.0, 2.0, 4.0, 8.0]])
+
+    actual = split._apply_norm(x)
+    if normalization == "RMSNorm":
+        expected = torch.nn.functional.rms_norm(x, (4,), torch.ones(4), split._eps)
+    else:
+        expected = torch.nn.functional.layer_norm(x, (4,), torch.ones(4), torch.zeros(4), split._eps)
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.unit
+def test_grouped_oft_eager_fallback_applies_coft_projection() -> None:
+    rotation = GroupedOFTRotation(
+        num_local_experts=2,
+        in_features=8,
+        block_size=4,
+        coft=True,
+        eps=_COFT_EPS,
+        input_is_parallel=True,
+    ).eval()
+    with torch.no_grad():
+        rotation.oft_r.fill_(1.0)
+
+    rotation(torch.randn(3, 8), expert_idx=1)
+
+    projected = rotation.oft_r[1]
+    norms = _generator_norms(rotation._template, projected)
+    torch.testing.assert_close(norms, torch.full_like(norms, _COFT_EPS), rtol=1e-5, atol=0.0)
+
+
+@pytest.mark.unit
+def test_grouped_oft_eager_fallback_applies_module_dropout() -> None:
+    rotation = GroupedOFTRotation(
+        num_local_experts=2,
+        in_features=8,
+        block_size=4,
+        module_dropout=1.0,
+        input_is_parallel=True,
+    ).train()
+    with torch.no_grad():
+        rotation.oft_r.fill_(0.2)
+    x = torch.randn(3, 8)
+
+    torch.testing.assert_close(rotation(x, expert_idx=0), x)
 
 
 @pytest.mark.unit
