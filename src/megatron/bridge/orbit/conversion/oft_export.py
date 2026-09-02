@@ -68,8 +68,17 @@ def _is_dsv4_native_expert_oft_base_prefix(global_base_prefix: str) -> bool:
     return _DSV4_NATIVE_EXPERT_OFT_BASE_PREFIX_RE.match(global_base_prefix) is not None
 
 
-def _globalize_dsv4_native_expert_oft_base_prefix(global_base_prefix: str, num_moe_experts: int) -> str:
-    """Map EP-local native DSV4 expert prefixes to global expert IDs for HF export."""
+def _globalize_dsv4_native_expert_oft_base_prefix(
+    global_base_prefix: str,
+    num_moe_experts: int,
+    ep_rank: Optional[int] = None,
+) -> str:
+    """Map EP-local native DSV4 expert prefixes to global expert IDs for HF export.
+
+    ``ep_rank`` names the rank whose local expert this prefix belongs to;
+    ``None`` means this process's own EP rank. The explicit form lets rank 0
+    compute peer ranks' global names when emitting their gathered tensors.
+    """
 
     match = _DSV4_NATIVE_EXPERT_OFT_BASE_PREFIX_RE.match(global_base_prefix)
     if match is None:
@@ -85,8 +94,45 @@ def _globalize_dsv4_native_expert_oft_base_prefix(global_base_prefix: str, num_m
     if expert_id >= num_experts_per_rank:
         return global_base_prefix
 
-    global_expert_id = parallel_state.get_expert_model_parallel_rank() * num_experts_per_rank + expert_id
+    if ep_rank is None:
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+    global_expert_id = ep_rank * num_experts_per_rank + expert_id
     return f"{match.group('head')}{global_expert_id}{match.group('tail')}"
+
+
+def _gather_dsv4_native_expert_variants(
+    global_base_prefix: str,
+    oft_r_tensor: torch.Tensor,
+    num_moe_experts: int,
+) -> list[tuple[str, torch.Tensor]]:
+    """All-gather a native per-expert rotation across the EP group.
+
+    Every rank walks only its own local expert modules, but only rank 0 keeps
+    the yielded tensors for the safetensors file -- so a per-expert rotation
+    that lives on a nonzero EP rank must be brought over before the yield.
+    Renaming the prefix to the global expert id (which this path always did)
+    makes the file *look* complete while every nonzero-rank expert is silently
+    absent from it. Returns one (globalized prefix, tensor) pair per EP rank;
+    all ranks must call this (it is a collective).
+    """
+    ep_size = parallel_state.get_expert_model_parallel_world_size()
+    if ep_size <= 1:
+        return [
+            (
+                _globalize_dsv4_native_expert_oft_base_prefix(global_base_prefix, num_moe_experts),
+                oft_r_tensor,
+            )
+        ]
+
+    gathered = [torch.empty_like(oft_r_tensor) for _ in range(ep_size)]
+    torch.distributed.all_gather(gathered, oft_r_tensor, group=parallel_state.get_expert_model_parallel_group())
+    return [
+        (
+            _globalize_dsv4_native_expert_oft_base_prefix(global_base_prefix, num_moe_experts, ep_rank=peer),
+            gathered[peer],
+        )
+        for peer in range(ep_size)
+    ]
 
 
 @dataclass(frozen=True)
@@ -628,12 +674,17 @@ class OrbitOFTExportMixin:
                 continue
 
             is_dsv4_native_expert = _is_dsv4_native_expert_oft_base_prefix(task.global_base_prefix)
-            export_base_prefix = task.global_base_prefix
             if is_dsv4_native_expert:
-                export_base_prefix = _globalize_dsv4_native_expert_oft_base_prefix(
-                    export_base_prefix,
+                # Collective: every rank contributes its local expert's rotation
+                # and receives every peer's, so rank 0 can emit the full expert
+                # set instead of silently writing only its own EP slice.
+                emit_variants = _gather_dsv4_native_expert_variants(
+                    task.global_base_prefix,
+                    oft_r_tensor,
                     num_moe_experts,
                 )
+            else:
+                emit_variants = [(task.global_base_prefix, oft_r_tensor)]
             # Per-expert tasks already point at a single rotation — skip the
             # legacy shared-R fan-out gather/select path.
             is_grouped_expert = (
@@ -653,52 +704,54 @@ class OrbitOFTExportMixin:
                 base_suffixes = [f".weight{task.expert_idx}"]
 
             # ------------------------------------------------------------------
-            # Step 4: map to HF names and yield
+            # Step 4: map to HF names and yield (once per EP variant for native
+            # per-expert tasks; a single pass otherwise)
             # ------------------------------------------------------------------
-            for base_suffix in base_suffixes:
-                current_oft_r = oft_r_tensor
-                if is_grouped_expert:
-                    expert_idx = int(base_suffix[len(".weight") :])
-                    current_oft_r = self._select_expert_adapter_weight(
-                        oft_r_tensor, expert_oft_r_gathered, expert_idx, num_moe_experts
+            for export_base_prefix, emit_oft_r in emit_variants:
+                for base_suffix in base_suffixes:
+                    current_oft_r = emit_oft_r
+                    if is_grouped_expert:
+                        expert_idx = int(base_suffix[len(".weight") :])
+                        current_oft_r = self._select_expert_adapter_weight(
+                            emit_oft_r, expert_oft_r_gathered, expert_idx, num_moe_experts
+                        )
+
+                    if cpu:
+                        current_oft_r = current_oft_r.cpu()
+
+                    base_hf_weight_names = self._get_base_hf_param_names_for_adapter(
+                        mapping_registry,
+                        export_base_prefix,
+                        None,
+                        base_suffix,
                     )
 
-                if cpu:
-                    current_oft_r = current_oft_r.cpu()
+                    # CanonicalOFT split adapters: each task represents one slice
+                    # (q/k/v/gate/up) and must emit only the matching HF projection.
+                    if task.slice_name is not None:
+                        leaf = _CANONICAL_OFT_SLICE_TO_HF_LEAF[task.slice_name]
+                        base_hf_weight_names = [name for name in base_hf_weight_names if f".{leaf}." in name]
 
-                base_hf_weight_names = self._get_base_hf_param_names_for_adapter(
-                    mapping_registry,
-                    export_base_prefix,
-                    None,
-                    base_suffix,
-                )
+                    # Legacy shared-R OFT on a GROUPED MoE expert fused gate/up:
+                    # the serve side (sglang FusedMoE) stores ONE fused ``w13_oft_r``
+                    # rotation per expert and detects the fused layout as
+                    # ``gate_proj.oft_R`` present + ``up_proj.oft_R`` ABSENT. Emit
+                    # only the gate projection (the shared rotation, applied to the
+                    # fused gate/up input); sending both gate+up would be read as the
+                    # split layout and mis-route to the unregistered w1/w3 buffers.
+                    # Scoped to grouped experts so dense/QKV fan-out is unchanged.
+                    if is_grouped_expert and task.slice_name is None:
+                        _gate_only = [name for name in base_hf_weight_names if ".up_proj." not in name]
+                        if _gate_only:
+                            base_hf_weight_names = _gate_only
 
-                # CanonicalOFT split adapters: each task represents one slice
-                # (q/k/v/gate/up) and must emit only the matching HF projection.
-                if task.slice_name is not None:
-                    leaf = _CANONICAL_OFT_SLICE_TO_HF_LEAF[task.slice_name]
-                    base_hf_weight_names = [name for name in base_hf_weight_names if f".{leaf}." in name]
-
-                # Legacy shared-R OFT on a GROUPED MoE expert fused gate/up:
-                # the serve side (sglang FusedMoE) stores ONE fused ``w13_oft_r``
-                # rotation per expert and detects the fused layout as
-                # ``gate_proj.oft_R`` present + ``up_proj.oft_R`` ABSENT. Emit
-                # only the gate projection (the shared rotation, applied to the
-                # fused gate/up input); sending both gate+up would be read as the
-                # split layout and mis-route to the unregistered w1/w3 buffers.
-                # Scoped to grouped experts so dense/QKV fan-out is unchanged.
-                if is_grouped_expert and task.slice_name is None:
-                    _gate_only = [name for name in base_hf_weight_names if ".up_proj." not in name]
-                    if _gate_only:
-                        base_hf_weight_names = _gate_only
-
-                # For fused Megatron layers (QKV or gate/up) with the legacy
-                # shared-R OFT, the same rotation applies to every
-                # sub-projection – emit oft_r for each.
-                for base_name in base_hf_weight_names:
-                    hf_oft_name = self._make_oft_param_name(base_name)
-                    if hf_oft_name is not None:
-                        yield HFWeightTuple(hf_oft_name, current_oft_r)
+                    # For fused Megatron layers (QKV or gate/up) with the legacy
+                    # shared-R OFT, the same rotation applies to every
+                    # sub-projection – emit oft_r for each.
+                    for base_name in base_hf_weight_names:
+                        hf_oft_name = self._make_oft_param_name(base_name)
+                        if hf_oft_name is not None:
+                            yield HFWeightTuple(hf_oft_name, current_oft_r)
 
     # ------------------------------------------------------------------
     # OFT merge helpers

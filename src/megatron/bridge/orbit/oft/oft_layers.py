@@ -265,7 +265,7 @@ try:
     HAS_TRITON_OFT = True
 except ImportError:
     HAS_TRITON_OFT = False
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
@@ -359,6 +359,73 @@ class MultiplicativeDropoutLayer(nn.Module):
         return x * mask + eye * (1 - mask)
 
 
+def _make_expert_ep_sharded_tensor(
+    tensor: torch.Tensor,
+    key: str,
+    *,
+    ep_new_axis: bool,
+    blocks_local_axis: int,
+    blocks_tp_sharded: bool,
+    sharded_offsets: Tuple = (),
+) -> ShardedTensor:
+    """Build a ShardedTensor for expert ``oft_r`` with EP encoded as a real axis.
+
+    Distributed checkpointing distinguishes tensors two ways: key/offsets say
+    *what data this is*; ``replica_id`` says *who else holds an identical copy*
+    (the all-zero holder is the one that writes). Expert ``oft_r`` is rank-local
+    learned state (``allreduce=False``), so the EP rank is part of the data's
+    identity and must live in the offsets. Encoding it in ``replica_id`` instead
+    marks unique data as skippable duplicates and the default
+    ``keep_only_main_replica`` save silently drops every nonzero-EP-rank
+    rotation. Mirrors ``peft.utils._make_grouped_expert_sharded_tensor`` (the
+    multi-LoRA fix for the same problem) and MCore's own grouped experts.
+
+    Args:
+        tensor: the local ``oft_r``.
+        key: checkpoint key.
+        ep_new_axis: True when the local tensor has no expert axis (one rotation
+            shared across this rank's experts) so EP becomes a new prepended
+            axis of length ``ep_size`` with this rank at index ``ep_rank``.
+            False when local axis 0 already is the packed local-expert axis
+            (``GroupedOFTRotation``'s 3D layout) and EP shards it.
+        blocks_local_axis: local axis holding rotation blocks (0 for 2D, 1 for 3D).
+        blocks_tp_sharded: True when the blocks axis is expert-TP sharded
+            (RowParallel base without ``block_share``); its identity then also
+            goes into the offsets. False means ETP ranks replicate the blocks,
+            which is recorded in ``replica_id``'s TP slot instead.
+        sharded_offsets: offsets prepended by enclosing modules.
+    """
+    prepend_axis_num = len(sharded_offsets)
+    rank_offsets = list(sharded_offsets)
+
+    ep_rank = parallel_state.get_expert_model_parallel_rank() or 0
+    ep_size = parallel_state.get_expert_model_parallel_world_size() or 1
+    etp_rank = parallel_state.get_expert_tensor_parallel_rank() or 0
+    etp_size = parallel_state.get_expert_tensor_parallel_world_size() or 1
+    edp_rank = parallel_state.get_expert_data_parallel_rank() or 0
+
+    # Same tuple either way -- global axis ``prepend_axis_num`` is the EP axis.
+    # With ``ep_new_axis`` it counts as a prepended axis (local tensor lacks it);
+    # otherwise it shards the local expert axis 0 in place.
+    rank_offsets.append((prepend_axis_num, ep_rank, ep_size))
+    if ep_new_axis:
+        prepend_axis_num += 1
+
+    if blocks_tp_sharded and etp_size > 1:
+        rank_offsets.append((prepend_axis_num + blocks_local_axis, etp_rank, etp_size))
+
+    # ETP ranks are true replicas only when the blocks axis is NOT sharded
+    # across them; a sharded axis already gives each ETP rank its own offsets.
+    etp_replica = 0 if blocks_tp_sharded else etp_rank
+    return ShardedTensor.from_rank_offsets(
+        key,
+        tensor,
+        *rank_offsets,
+        replica_id=(0, etp_replica, edp_rank),
+        prepend_axis_num=prepend_axis_num,
+    )
+
+
 class OFTRotationModule(nn.Module):
     """Core OFT module that computes block-diagonal orthogonal transformations.
 
@@ -445,6 +512,13 @@ class OFTRotationModule(nn.Module):
         self.oft_r = nn.Parameter(torch.zeros(num_blocks, n_elements, dtype=dtype, device=device))
         if self.is_expert:
             self.oft_r.allreduce = False
+        # Stamped True by wrappers around grouped expert bases (TEGroupedLinear):
+        # those containers pass no per-expert sharded offsets and rewrite no
+        # replica ids for adapter keys, and this one shared rotation is trained
+        # per EP rank, so sharded_state_dict must encode the EP rank itself as
+        # a prepended axis. Sequential expert containers leave this False --
+        # SequentialMLP handles expert identity for every child key.
+        self.ep_axis_sharded = False
 
         self.dropout = MultiplicativeDropoutLayer(p=module_dropout)
 
@@ -658,6 +732,21 @@ class OFTRotationModule(nn.Module):
         sharded_state_dict = {}
         state_dict = self.state_dict(prefix="", keep_vars=True)
 
+        if getattr(self, "ep_axis_sharded", False):
+            # Per-EP-rank shared rotation on a grouped expert base: the EP rank
+            # is part of the data's identity (see _make_expert_ep_sharded_tensor).
+            key = f"{prefix}oft_r"
+            return {
+                key: _make_expert_ep_sharded_tensor(
+                    state_dict["oft_r"],
+                    key,
+                    ep_new_axis=True,
+                    blocks_local_axis=0,
+                    blocks_tp_sharded=self.input_is_parallel and not self.block_share,
+                    sharded_offsets=sharded_offsets,
+                )
+            }
+
         # Determine TP sharding: when input_is_parallel, oft_r blocks are
         # partitioned across TP ranks (axis 0). Otherwise replicated.
         if self.input_is_parallel and not self.block_share:
@@ -675,16 +764,20 @@ class OFTRotationModule(nn.Module):
         )
 
         if self.is_expert:
-            ep_rank = parallel_state.get_expert_model_parallel_rank()
-            edp_rank = parallel_state.get_expert_data_parallel_rank()
-            dp_size = parallel_state.get_data_parallel_world_size()
-            # TODO: This modification logic is in question and needs further verification.
-            rank = (ep_rank + 1) * (edp_rank + 1) - 1 if dp_size == 1 else ep_rank
-            for sd in [oft_r_sd]:
-                for v in sd.values():
-                    if hasattr(v, "replica_id"):
-                        old_rid = v.replica_id
-                        v.replica_id = (old_rid[0], rank, old_rid[2])
+            # Fix the replica DP slot: adapters on expert layers replicate
+            # across the expert-DP group, not the dense dp_cp group the helper
+            # defaulted to. Everything else is the enclosing module's job --
+            # SequentialMLP hands the global expert index down via
+            # ``sharded_offsets`` and renames prefixes itself. The removed
+            # rewrite here used to push an EP-derived value into the TP slot,
+            # which marked each rank's unique rotations as non-main replicas
+            # and made ``keep_only_main_replica`` saves silently drop every
+            # nonzero-EP-rank rotation.
+            edp_rank = parallel_state.get_expert_data_parallel_rank() or 0
+            for v in oft_r_sd.values():
+                if hasattr(v, "replica_id"):
+                    old_rid = v.replica_id
+                    v.replica_id = (old_rid[0], old_rid[1], edp_rank)
 
         sharded_state_dict.update(oft_r_sd)
         return sharded_state_dict
@@ -736,6 +829,13 @@ class OFTLinear(AdapterWrapper):
         # Standard linears have .weight; grouped expert linears (TEGroupedLinear)
         # have .weight0 ... .weight{num_gemms-1}, one per local expert on this rank.
         num_gemms = getattr(self.to_wrap, "num_gemms", 0)
+        # Grouped expert containers (TEGroupedMLP) neither pass per-expert
+        # sharded offsets to adapter keys nor rewrite their replica ids, and a
+        # shared rotation on a grouped base is trained per EP rank
+        # (allreduce=False) -- unique data per rank. Stamp the adapter so its
+        # sharded_state_dict encodes the EP rank as a real prepended axis.
+        if num_gemms > 0 and getattr(adapter, "is_expert", False):
+            adapter.ep_axis_sharded = True
         if num_gemms > 0:
             self._weight_names = [f"weight{i}" for i in range(num_gemms)]
             first_w = getattr(self.to_wrap, "weight0")

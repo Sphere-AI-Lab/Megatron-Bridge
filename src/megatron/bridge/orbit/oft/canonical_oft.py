@@ -42,6 +42,7 @@ from megatron.bridge.orbit.oft.oft_layers import (
     OFTVocabParallelEmbedding,
     _clear_disabled_bias_parameters,
     _is_direct_fp8_runtime_weight,
+    _make_expert_ep_sharded_tensor,
     _module_bias_enabled,
 )
 from megatron.bridge.orbit.peft_ext.adapter_attrs import get_oft_adapter_attributes_from_linear
@@ -586,13 +587,12 @@ class GroupedOFTRotation(nn.Module):
         Mirrors how ``megatron.core.transformer.moe.experts`` computes the
         EP-axis offset for its own per-expert weights
         (``num_global_experts = ep_size * num_local_experts``,
-        ``local_expert_offset = ep_rank * num_local_experts``), by reusing
-        ``make_tp_sharded_tensor_for_checkpoint`` with the expert-parallel group
-        in place of a TP group — the helper only cares which group's rank/size
-        to shard the given axis across, not what the group represents. That
-        existing per-expert mechanism lives at the MoE container level and only
-        augments keys literally named ``weight{i}``/``bias{i}``, so it never
-        reaches ``oft_r``.
+        ``local_expert_offset = ep_rank * num_local_experts``), via
+        ``_make_expert_ep_sharded_tensor``: EP offset on the packed expert
+        axis, replica tag from the expert-DP group. TEGroupedMLP's own
+        per-expert mechanism only augments keys literally named
+        ``weight{i}``/``bias{i}`` and rewrites no adapter replica ids, so it
+        never reaches ``oft_r``.
 
         Column-parallel fc1 (the only place ``GroupedOFTRotation`` is used) is
         not ``input_is_parallel``, so the other two axes stay TP-replicated
@@ -607,15 +607,20 @@ class GroupedOFTRotation(nn.Module):
         key = f"{prefix}oft_r"
 
         if self.is_expert:
-            from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
-
-            sharded_tensor = make_tp_sharded_tensor_for_checkpoint(
+            # EP shards the packed local-expert axis 0 (that part was already
+            # right when this used make_tp_sharded_tensor_for_checkpoint with
+            # the EP group standing in for TP). What that helper got wrong is
+            # the replica tag: it defaulted to the dense dp_cp rank, but expert
+            # tensors replicate across the expert-DP group. At EP>1 layouts
+            # where those groups differ, nonzero-EP-rank slices were marked
+            # non-main replicas and keep_only_main_replica saves dropped them.
+            sharded_tensor = _make_expert_ep_sharded_tensor(
                 state_dict["oft_r"],
                 key,
-                tp_axis=0,
-                prepend_offsets=sharded_offsets,
-                tp_group=parallel_state.get_expert_model_parallel_group(),
-                dp_cp_group=metadata["dp_cp_group"],
+                ep_new_axis=False,
+                blocks_local_axis=1,
+                blocks_tp_sharded=self.input_is_parallel and not self.block_share,
+                sharded_offsets=sharded_offsets,
             )
         else:
             from megatron.core.utils import make_sharded_tensor_for_checkpoint
