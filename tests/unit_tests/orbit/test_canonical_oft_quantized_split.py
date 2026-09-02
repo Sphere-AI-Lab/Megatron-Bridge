@@ -245,3 +245,182 @@ def test_disabled_adapter_on_quantized_base_is_plain_base_linear() -> None:
 def test_helper_returns_none_for_plain_bf16_base() -> None:
     module = _base_module(torch.randn(_FC1_OUT, _IN))
     assert _dequantize_single_weight_base(module, torch.float32) is None
+
+
+# ---------------------------------------------------------------------------
+# Grouped expert FC1 (OFTLinearGroupedSplitFC1UpGate) on quantized bases
+# ---------------------------------------------------------------------------
+
+_E = 2  # local experts
+_G_OUT = 32  # fused gate+up rows per expert (16 + 16)
+_G_TOKENS = (3, 5)
+
+
+def _grouped_ref_module(expert_weights: dict[int, torch.Tensor]) -> torch.nn.Module:
+    module = torch.nn.Module()
+    module.num_gemms = _E
+    module.config = SimpleNamespace(sequence_parallel=False)
+    for idx, w in expert_weights.items():
+        setattr(module, f"weight{idx}", torch.nn.Parameter(w.clone(), requires_grad=False))
+    return module
+
+
+def _grouped_quantized_module(kind: str) -> tuple[torch.nn.Module, dict[int, torch.Tensor]]:
+    device = "cuda" if kind == "int4" else "cpu"
+    module = torch.nn.Module()
+    module.num_gemms = _E
+    module.config = SimpleNamespace(sequence_parallel=False)
+    reference = {}
+    for idx in range(_E):
+        torch.manual_seed(300 + idx)
+        weight = torch.randn(_G_OUT, _IN, device=device) * 0.1
+        if kind == "fp8_direct":
+            setattr(module, f"weight{idx}", torch.nn.Parameter(weight.clone(), requires_grad=False))
+            setattr(module, f"weight{idx}_scale_inv", torch.ones(1))
+            reference[idx] = fp8_module.dequant_fp8(weight, torch.ones(1), out_dtype=torch.float32)
+        elif kind in ("nvfp4_buffers", "nvfp4_modelopt"):
+            from megatron.bridge.orbit.low_precision.nvfp4 import quantize_to_nvfp4
+
+            packed, scale, double_scale, _shape = quantize_to_nvfp4(weight)
+            reference[idx] = _REAL_DEQUANT_NVFP4(packed, scale, double_scale, (_G_OUT, _IN), dtype=torch.float32)
+            if kind == "nvfp4_buffers":
+                half = _G_OUT // 2
+                setattr(module, f"weight{idx}", torch.nn.Parameter(torch.zeros(1), requires_grad=False))
+                setattr(module, f"weight{idx}_w_packed", packed[:half].clone())
+                setattr(module, f"weight{idx}_v_packed", packed[half:].clone())
+                setattr(module, f"weight_scale{idx}", scale)
+                setattr(module, f"weight_double_scale{idx}", double_scale)
+            else:
+                setattr(module, f"weight{idx}", torch.nn.Parameter(packed, requires_grad=False))
+                quantizer = getattr(module, "weight_quantizer", None) or SimpleNamespace()
+                setattr(quantizer, f"_scale{idx}", scale)
+                setattr(quantizer, f"_double_scale{idx}", double_scale)
+                module.weight_quantizer = quantizer
+        elif kind == "int4":
+            from megatron.bridge.orbit.low_precision.int4 import dequantize_int4, quantize_to_int4
+
+            packed, scale, shape = quantize_to_int4(weight.to(torch.bfloat16))
+            setattr(module, f"weight{idx}", torch.nn.Parameter(torch.zeros(1, device=device), requires_grad=False))
+            setattr(module, f"weight{idx}_packed", packed)
+            setattr(module, f"weight{idx}_scale", scale)
+            setattr(module, f"weight{idx}_shape", shape)
+            reference[idx] = dequantize_int4(packed, scale, shape, device=device).to(torch.bfloat16)
+        else:  # pragma: no cover
+            raise AssertionError(kind)
+    return module, reference
+
+
+def _make_grouped(module) -> "object":
+    from megatron.bridge.orbit.oft.canonical_oft import OFTLinearGroupedSplitFC1UpGate
+
+    # block_size=16: the CUDA fast path routes rotations through the triton
+    # by-expert kernel, whose tl.dot requires K >= 16.
+    return OFTLinearGroupedSplitFC1UpGate(module, in_features=_IN, block_size=16, input_is_parallel=True)
+
+
+_GROUPED_FORMATS = [
+    pytest.param("fp8_direct", id="fp8_direct"),
+    pytest.param("nvfp4_buffers", id="nvfp4_buffers"),
+    pytest.param("nvfp4_modelopt", id="nvfp4_modelopt"),
+    pytest.param(
+        "int4",
+        id="int4",
+        marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="INT4 dequant is triton"),
+    ),
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kind", _GROUPED_FORMATS)
+def test_grouped_split_matches_bf16_grouped_on_dequantized_weights(kind: str) -> None:
+    """Quantized grouped FC1 == the same wrapper over BF16 weights holding the
+    dequantized values: outputs, grad-input, and BOTH per-expert rotation grads.
+    FP8/NVFP4 here used to raise at the first forward; direct-FP8 used to run
+    BF16 math on the raw payload with scales ignored."""
+    module, reference = _grouped_quantized_module(kind)
+    device = reference[0].device
+    dtype = reference[0].dtype
+
+    quant_wrapper = _make_grouped(module).to(device)
+    ref_wrapper = _make_grouped(_grouped_ref_module(reference)).to(device)
+    _randomize_adapters(quant_wrapper, seed=31, dtype=dtype)
+    _copy_adapters(quant_wrapper, ref_wrapper)
+
+    tokens = torch.tensor(_G_TOKENS)
+    x_q = torch.randn(sum(_G_TOKENS), _IN, device=device, dtype=dtype, requires_grad=True)
+    x_r = x_q.detach().clone().requires_grad_(True)
+
+    out_q, _ = quant_wrapper(x_q, tokens)
+    out_r, _ = ref_wrapper(x_r, tokens)
+    torch.testing.assert_close(out_q, out_r)
+
+    grad = torch.randn_like(out_q)
+    out_q.backward(grad)
+    out_r.backward(grad)
+    torch.testing.assert_close(x_q.grad, x_r.grad)
+    for name in ("adapter_gate", "adapter_up"):
+        g_q = getattr(quant_wrapper, name).oft_r.grad
+        g_r = getattr(ref_wrapper, name).oft_r.grad
+        assert g_q is not None and g_r is not None
+        torch.testing.assert_close(g_q, g_r)
+
+
+@pytest.mark.unit
+def test_grouped_nvfp4_halves_released_and_redequantized(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both packed halves are registered: dead after forward, re-dequantized in
+    backward (2 halves x 2 experts each way)."""
+    refs: list[weakref.ref] = []
+    real = nvfp4_module.dequantize_nvfp4
+
+    def spy(*args, **kwargs):
+        out = real(*args, **kwargs)
+        refs.append(weakref.ref(out))
+        return out
+
+    monkeypatch.setattr(nvfp4_module, "dequantize_nvfp4", spy)
+
+    module, _ = _grouped_quantized_module("nvfp4_buffers")
+    wrapper = _make_grouped(module)
+    x = torch.randn(sum(_G_TOKENS), _IN, requires_grad=True)
+
+    out, _ = wrapper(x, torch.tensor(_G_TOKENS))
+    gc.collect()
+    forward_count = len(refs)
+
+    assert forward_count == 4  # gate + up per expert
+    assert all(ref() is None for ref in refs), "dequantized expert halves retained by the graph"
+
+    out.sum().backward()
+    assert len(refs) == 8  # each saved half rebuilt once in backward
+    assert wrapper.adapter_gate.oft_r.grad is not None
+    assert wrapper.adapter_up.oft_r.grad is not None
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="INT4 dequant is triton")
+def test_grouped_int4_backward_redequantizes_both_halves(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression for the up-half leak: the old pack matched only the fused
+    base pointer, so the up view was saved raw and pinned the whole fused BF16
+    buffer -- and backward rebuilt only the gate. Both halves now carry
+    handles: one fused dequant per expert in forward, one PER HALF in backward."""
+    import megatron.bridge.orbit.low_precision.int4 as int4_module
+
+    module, _ = _grouped_quantized_module("int4")  # before the spy: fixture dequants references
+
+    counts = {"n": 0}
+    real = int4_module.dequantize_int4
+
+    def spy(*args, **kwargs):
+        counts["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(int4_module, "dequantize_int4", spy)
+    wrapper = _make_grouped(module).to("cuda")
+    x = torch.randn(sum(_G_TOKENS), _IN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    out, _ = wrapper(x, torch.tensor(_G_TOKENS))
+    forward_count = counts["n"]
+    out.sum().backward()
+
+    assert forward_count == _E  # one fused dequant per expert in forward
+    assert counts["n"] - forward_count == 2 * _E  # gate AND up handles each rebuild in backward
