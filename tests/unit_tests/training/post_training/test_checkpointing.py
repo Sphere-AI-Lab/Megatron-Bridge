@@ -19,7 +19,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from megatron.core.dist_checkpointing.strategies.common import COMMON_STATE_FNAME
+from megatron.core import dist_checkpointing
 
 from megatron.bridge.training.post_training.checkpointing import (
     _get_modelopt_checkpoint_path,
@@ -37,11 +37,29 @@ def mock_model_fixtures():
     return [mock_model_instance]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _single_rank_process_group(tmp_path_factory):
+    """Provide the process group required by the production checkpoint writer."""
+    if torch.distributed.is_initialized():
+        yield
+        return
+
+    store_path = tmp_path_factory.mktemp("modelopt-dist-store") / "store"
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{store_path}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        yield
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 def _write_modelopt_common_state(modelopt_state_dir: Path, states):
-    """Helper to write a common_state file with the given modelopt states."""
-    common_state_file = modelopt_state_dir / COMMON_STATE_FNAME
-    torch.save({"modelopt_state_dict": states}, common_state_file)
-    return common_state_file
+    """Write modelopt state through the same distributed-checkpoint format as production."""
+    dist_checkpointing.save({"modelopt_state_dict": states}, str(modelopt_state_dir))
 
 
 class TestGetModeloptCheckpointPath:
@@ -317,12 +335,12 @@ class TestPostTrainingCheckpointUtilities:
             result = has_modelopt_state(str(checkpoint_path))
             assert result is False
 
-    @patch("megatron.bridge.training.post_training.checkpointing.torch.load")
+    @patch("megatron.bridge.training.post_training.checkpointing.dist_checkpointing.load_common_state_dict")
     @patch("megatron.bridge.training.post_training.checkpointing.os.path.isdir")
-    def test_has_modelopt_state_with_mock(self, mock_isdir, mock_torch_load):
-        """Test has_modelopt_state with mocked os.path.isdir and torch.load."""
+    def test_has_modelopt_state_with_mock(self, mock_isdir, mock_load_common_state):
+        """Test has_modelopt_state with its distributed-checkpoint reader mocked."""
         mock_isdir.return_value = True
-        mock_torch_load.return_value = {"modelopt_state_dict": [("quantization", {"foo": "bar"})]}
+        mock_load_common_state.return_value = {"modelopt_state_dict": [("quantization", {"foo": "bar"})]}
 
         result = has_modelopt_state("/fake/checkpoint/path")
         assert result is True
@@ -388,7 +406,11 @@ class TestPostTrainingCheckpointUtilities:
 
             # Mock the dist_checkpointing.load_common_state_dict
             with patch("megatron.core.dist_checkpointing.load_common_state_dict") as mock_load:
-                mock_load.return_value = {"iteration": 100}
+                mock_load.side_effect = lambda path: (
+                    {"modelopt_state_dict": [("quantization", {"value": 1})]}
+                    if path.endswith("modelopt_state")
+                    else {"iteration": 100}
+                )
 
                 result = has_modelopt_state(str(checkpoint_path))
                 assert result is True
@@ -427,6 +449,8 @@ class TestPostTrainingCheckpointUtilities:
             with patch("megatron.core.dist_checkpointing.load_common_state_dict") as mock_load:
 
                 def load_side_effect(path):
+                    if path.endswith("modelopt_state"):
+                        return {"modelopt_state_dict": [("quantization", {"value": 2})]}
                     if "iter_0000100" in path:
                         return {"iteration": 100}
                     elif "iter_0000200" in path:
@@ -442,7 +466,7 @@ class TestPostTrainingCheckpointUtilities:
 class TestLoadModeloptState:
     """Test load_modelopt_state function."""
 
-    @patch("megatron.bridge.training.post_training.checkpointing.restore_sharded_modelopt_state")
+    @patch("megatron.bridge.orbit.training.modelopt_checkpoint.restore_sharded_modelopt_state_via_common_reader")
     @patch("megatron.bridge.training.post_training.checkpointing.unwrap_model")
     def test_load_modelopt_state_success(self, mock_unwrap_model, mock_restore_state, mock_model_fixtures):
         """Test successful loading of modelopt state."""
@@ -458,7 +482,7 @@ class TestLoadModeloptState:
         mock_unwrap_model.assert_called_once_with(mock_model_fixtures)
         mock_restore_state.assert_called_once_with(unwrapped_model, "/test/checkpoint/path")
 
-    @patch("megatron.bridge.training.post_training.checkpointing.restore_sharded_modelopt_state")
+    @patch("megatron.bridge.orbit.training.modelopt_checkpoint.restore_sharded_modelopt_state_via_common_reader")
     @patch("megatron.bridge.training.post_training.checkpointing.unwrap_model")
     def test_load_modelopt_state_with_exception(self, mock_unwrap_model, mock_restore_state, mock_model_fixtures):
         """Test load_modelopt_state when restore_sharded_modelopt_state raises an exception."""
@@ -475,7 +499,7 @@ class TestLoadModeloptState:
         mock_unwrap_model.assert_called_once_with(mock_model_fixtures)
         mock_restore_state.assert_called_once_with(unwrapped_model, "/test/checkpoint/path")
 
-    @patch("megatron.bridge.training.post_training.checkpointing.restore_sharded_modelopt_state")
+    @patch("megatron.bridge.orbit.training.modelopt_checkpoint.restore_sharded_modelopt_state_via_common_reader")
     @patch("megatron.bridge.training.post_training.checkpointing.unwrap_model")
     def test_load_modelopt_state_empty_model_list(self, mock_unwrap_model, mock_restore_state):
         """Test load_modelopt_state with empty model list."""
@@ -492,7 +516,7 @@ class TestLoadModeloptState:
         mock_unwrap_model.assert_called_once_with(empty_model_list)
         mock_restore_state.assert_called_once_with(unwrapped_model, "/test/checkpoint/path")
 
-    @patch("megatron.bridge.training.post_training.checkpointing.restore_sharded_modelopt_state")
+    @patch("megatron.bridge.orbit.training.modelopt_checkpoint.restore_sharded_modelopt_state_via_common_reader")
     @patch("megatron.bridge.training.post_training.checkpointing.unwrap_model")
     def test_load_modelopt_state_multiple_models(self, mock_unwrap_model, mock_restore_state):
         """Test load_modelopt_state with multiple models."""
@@ -511,7 +535,7 @@ class TestLoadModeloptState:
         mock_unwrap_model.assert_called_once_with(model_list)
         mock_restore_state.assert_called_once_with(unwrapped_models, "/test/checkpoint/path")
 
-    @patch("megatron.bridge.training.post_training.checkpointing.restore_sharded_modelopt_state")
+    @patch("megatron.bridge.orbit.training.modelopt_checkpoint.restore_sharded_modelopt_state_via_common_reader")
     @patch("megatron.bridge.training.post_training.checkpointing.unwrap_model")
     def test_load_modelopt_state_with_empty_string_path(self, mock_unwrap_model, mock_restore_state):
         """Test load_modelopt_state with empty checkpoint path."""
@@ -525,7 +549,7 @@ class TestLoadModeloptState:
         mock_unwrap_model.assert_called_once_with(mock_model)
         mock_restore_state.assert_called_once_with(mock_model, "")
 
-    @patch("megatron.bridge.training.post_training.checkpointing.restore_sharded_modelopt_state")
+    @patch("megatron.bridge.orbit.training.modelopt_checkpoint.restore_sharded_modelopt_state_via_common_reader")
     @patch("megatron.bridge.training.post_training.checkpointing.unwrap_model")
     @patch("megatron.core.dist_checkpointing.load_common_state_dict")
     def test_load_modelopt_state_with_iter_folders(

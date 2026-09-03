@@ -237,6 +237,51 @@ class TestCanonicalLoRA:
         with pytest.raises(AssertionError, match="does not support target 'linear_fc1'"):
             CanonicalLoRA(target_modules=["linear_fc1"])
 
+    @pytest.mark.unit
+    def test_canonical_lora_rejects_attention_output_gate(self):
+        """A distinct query-gate adapter is required before gated QKV is canonical."""
+        model = MegatronStyleModel()
+        model.linear_qkv.config.attention_output_gate = True
+        lora = CanonicalLoRA(target_modules=["linear_q", "linear_k", "linear_v"])
+        attrs = AdapterAttributes(
+            input_is_parallel=False,
+            in_features=512,
+            out_features=1536,
+            disable_tensor_parallel_comm=False,
+            disable_sequence_parallel_comm=True,
+            base_linear_is_parallel=True,
+        )
+
+        with (
+            patch("megatron.bridge.peft.canonical_lora.get_adapter_attributes_from_linear", return_value=attrs),
+            patch("megatron.bridge.peft.canonical_lora.ParallelLinearAdapter", return_value=nn.Identity()),
+            pytest.raises(ValueError, match="attention_output_gate.*not supported yet"),
+        ):
+            lora(model, training=True)
+
+    @pytest.mark.unit
+    def test_canonical_lora_rejects_tensor_parallel_qkv(self):
+        """CanonicalLoRA's current QKV interleaver is only correct at TP=1."""
+        model = MegatronStyleModel()
+        model.linear_qkv.config.attention_output_gate = False
+        lora = CanonicalLoRA(target_modules=["linear_q", "linear_k", "linear_v"])
+        attrs = AdapterAttributes(
+            input_is_parallel=False,
+            in_features=512,
+            out_features=1536,
+            disable_tensor_parallel_comm=False,
+            disable_sequence_parallel_comm=True,
+            base_linear_is_parallel=True,
+        )
+
+        with (
+            patch("megatron.bridge.peft.canonical_lora.get_pg_size", return_value=2),
+            patch("megatron.bridge.peft.canonical_lora.get_adapter_attributes_from_linear", return_value=attrs),
+            patch("megatron.bridge.peft.canonical_lora.ParallelLinearAdapter", return_value=nn.Identity()),
+            pytest.raises(ValueError, match="TP=2.*not supported yet"),
+        ):
+            lora(model, training=True)
+
     def test_canonical_lora_warns_on_unmatched_target_module(self, caplog):
         """Typos in CanonicalLoRA target_modules should surface a warning so misconfigurations
         are visible without breaking recipes that use wider defaults than the model exposes."""

@@ -39,7 +39,9 @@ from megatron.core import parallel_state
 
 import megatron.bridge.orbit.low_precision.nvfp4 as nvfp4_module
 import megatron.bridge.orbit.quant.fp8_utils as fp8_module
+import megatron.bridge.orbit.oft.canonical_oft as canonical_oft_module
 from megatron.bridge.orbit.oft.canonical_oft import (
+    CanonicalOFTMerge,
     OFTLinearSplitFC1UpGate,
     OFTLinearSplitQKV,
     _dequantize_single_weight_base,
@@ -248,7 +250,7 @@ def test_helper_returns_none_for_plain_bf16_base() -> None:
 
 
 @pytest.mark.unit
-def test_gated_q_split_matches_fused_base_at_identity() -> None:
+def test_gated_q_split_owns_independent_gate_adapter() -> None:
     provider = SimpleNamespace(
         num_attention_heads=4,
         num_query_groups=2,
@@ -266,12 +268,202 @@ def test_gated_q_split_matches_fused_base_at_identity() -> None:
         block_size=4,
         input_is_parallel=True,
     )
+
+    assert hasattr(wrapper, "adapter_gate")
+    assert "adapter_gate.oft_r" in dict(wrapper.named_parameters())
+    assert wrapper._qkv_weight_segments(weight.shape[0]) == [
+        ("q", 0, 8),
+        ("gate", 8, 16),
+        ("k", 16, 20),
+        ("v", 20, 24),
+        ("q", 24, 32),
+        ("gate", 32, 40),
+        ("k", 40, 44),
+        ("v", 44, 48),
+    ]
+
+
+@pytest.mark.unit
+def test_gated_q_split_applies_each_logical_adapter() -> None:
+    provider = SimpleNamespace(
+        num_attention_heads=4,
+        num_query_groups=2,
+        kv_channels=4,
+        attention_output_gate=True,
+        sequence_parallel=False,
+    )
+    weight = torch.randn(48, _IN)
+    wrapper = OFTLinearSplitQKV(
+        _base_module(weight),
+        in_features=_IN,
+        provider=provider,
+        block_size=4,
+        input_is_parallel=True,
+    )
+    _randomize_adapters(wrapper, seed=71, dtype=torch.float32)
+    x = torch.randn(5, _IN, requires_grad=True)
+
+    actual, bias = wrapper(x)
+    rotated = {
+        name: getattr(wrapper, f"adapter_{name}")(x)
+        for name in ("q", "gate", "k", "v")
+    }
+    expected = torch.cat(
+        [
+            torch.nn.functional.linear(rotated[name], weight[start:end])
+            for name, start, end in wrapper._segments
+        ],
+        dim=-1,
+    )
+
+    assert bias is None
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    for name in ("q", "gate", "k", "v"):
+        assert getattr(wrapper, f"adapter_{name}").oft_r.grad is not None
+
+
+@pytest.mark.unit
+def test_gated_q_merge_uses_each_logical_adapter() -> None:
+    provider = SimpleNamespace(
+        num_attention_heads=4,
+        num_query_groups=2,
+        kv_channels=4,
+        attention_output_gate=True,
+        sequence_parallel=False,
+    )
+    weight = torch.randn(48, _IN)
+    wrapper = OFTLinearSplitQKV(
+        _base_module(weight.clone()),
+        in_features=_IN,
+        provider=provider,
+        block_size=4,
+        input_is_parallel=True,
+    )
+    _randomize_adapters(wrapper, seed=79, dtype=torch.float32)
+    rotations = {
+        name: getattr(wrapper, f"adapter_{name}").get_delta_weight()
+        for name in ("q", "gate", "k", "v")
+    }
+    expected = weight.clone()
+    for name, start, end in wrapper._segments:
+        expected[start:end] = expected[start:end] @ rotations[name].T
+
+    CanonicalOFTMerge._merge_qkv(wrapper)
+
+    torch.testing.assert_close(wrapper.to_wrap.weight, expected)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("tp_rank", "expected"),
+    [
+        (0, [("q", 0, 16), ("gate", 16, 17)]),
+        (1, [("gate", 0, 15), ("k", 15, 16), ("v", 16, 17)]),
+    ],
+)
+def test_qkv_split_routes_partial_query_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_rank: int,
+    expected: list[tuple[str, int, int]],
+) -> None:
+    provider = SimpleNamespace(
+        num_attention_heads=32,
+        num_query_groups=2,
+        kv_channels=1,
+        attention_output_gate=True,
+        sequence_parallel=False,
+    )
+    local_weight = torch.randn(17, _IN)
+    module = _base_module(local_weight)
+    module.tp_group = object()
+    monkeypatch.setattr(canonical_oft_module, "get_pg_size", lambda group: 4, raising=False)
+    monkeypatch.setattr(canonical_oft_module, "get_pg_rank", lambda group: tp_rank, raising=False)
+
+    wrapper = OFTLinearSplitQKV(
+        module,
+        in_features=_IN,
+        provider=provider,
+        block_size=4,
+        input_is_parallel=True,
+    )
+
+    assert wrapper._qkv_weight_segments(local_weight.shape[0]) == expected
+
+
+@pytest.mark.unit
+def test_qkv_split_allows_tp_aligned_query_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        num_attention_heads=32,
+        num_query_groups=8,
+        kv_channels=1,
+        attention_output_gate=False,
+        sequence_parallel=False,
+    )
+    tp_rank = 2
+    local_weight = torch.randn(48, _IN).chunk(4, dim=0)[tp_rank].contiguous()
+    module = _base_module(local_weight)
+    module.tp_group = object()
+    monkeypatch.setattr(canonical_oft_module, "get_pg_size", lambda group: 4)
+    monkeypatch.setattr(canonical_oft_module, "get_pg_rank", lambda group: tp_rank)
+    wrapper = OFTLinearSplitQKV(
+        module,
+        in_features=_IN,
+        provider=provider,
+        block_size=4,
+        input_is_parallel=True,
+    )
     x = torch.randn(3, _IN)
 
     actual, bias = wrapper(x)
 
     assert bias is None
-    torch.testing.assert_close(actual, torch.nn.functional.linear(x, weight))
+    torch.testing.assert_close(actual, torch.nn.functional.linear(x, local_weight))
+
+
+@pytest.mark.unit
+def test_quantized_qkv_releases_actual_gemm_weight_tensors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Derived Q and KV operands must not survive the forward autograd graph."""
+    provider = SimpleNamespace(
+        num_attention_heads=4,
+        num_query_groups=2,
+        kv_channels=4,
+        attention_output_gate=False,
+        sequence_parallel=False,
+    )
+    refs: list[weakref.ref] = []
+    real_linear = canonical_oft_module.F.linear
+    real_batched_linear = canonical_oft_module._batched_equal_output_linear_with_bias
+
+    def linear_spy(input_tensor, weight, bias=None):
+        if weight.ndim == 2 and weight.shape[-1] == _IN:
+            refs.append(weakref.ref(weight))
+        return real_linear(input_tensor, weight, bias)
+
+    def batched_linear_spy(x_stack, weight_stack, bias_stack):
+        refs.append(weakref.ref(weight_stack))
+        return real_batched_linear(x_stack, weight_stack, bias_stack)
+
+    monkeypatch.setattr(canonical_oft_module.F, "linear", linear_spy)
+    monkeypatch.setattr(canonical_oft_module, "_batched_equal_output_linear_with_bias", batched_linear_spy)
+
+    module, _ = _quantized_module("fp8_direct", 32)
+    wrapper = OFTLinearSplitQKV(
+        module,
+        in_features=_IN,
+        provider=provider,
+        block_size=4,
+        input_is_parallel=True,
+    )
+    x = torch.randn(4, _IN, requires_grad=True)
+
+    out, _ = wrapper(x)
+    gc.collect()
+
+    assert refs, "expected to observe the weights passed to the Q/K/V GEMMs"
+    assert all(ref() is None for ref in refs), "a transient Q/K/V GEMM weight was retained by autograd"
+    out.sum().backward()
+    assert wrapper.adapter_q.oft_r.grad is not None
 
 
 # ---------------------------------------------------------------------------

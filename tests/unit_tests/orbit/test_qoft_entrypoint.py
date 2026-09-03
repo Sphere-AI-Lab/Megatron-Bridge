@@ -364,21 +364,15 @@ def _build_oft(entrypoint, tmp_path: Path, arch: str, quant: str, *extra: str):
 
 
 @pytest.mark.unit
-def test_qoft_defaults_to_canonical_oft_with_split_targets(tmp_path: Path) -> None:
-    """Without --oft-type the entrypoint builds CanonicalOFT, not legacy shared-R OFT.
-
-    Regression test: both launchers used to hardcode ``OFT``, so Q/K/V shared one
-    rotation on the fused linear_qkv and CanonicalOFT was unreachable.
-    """
-    from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
+def test_qoft_defaults_to_vanilla_oft_with_fused_targets(tmp_path: Path) -> None:
+    """Without --oft-type the entrypoint selects the safe fused-layer adapter."""
+    from megatron.bridge.orbit.oft.oft import OFT
 
     entrypoint = _load_qoft_entrypoint()
     peft = _build_oft(entrypoint, tmp_path, "Qwen3MoeForCausalLM", "int4")
 
-    assert isinstance(peft, CanonicalOFT)
-    # CanonicalOFT rejects the fused leaves outright; assert the resolved list is split.
-    assert not any(target.endswith(("linear_qkv", "linear_fc1")) for target in peft.target_modules)
-    assert {"linear_q", "linear_k", "linear_v"}.issubset(set(peft.target_modules))
+    assert isinstance(peft, OFT)
+    assert peft.target_modules == list(entrypoint.QWEN3_MOE_OFT_TARGET_MODULES)
 
 
 @pytest.mark.unit
@@ -395,6 +389,8 @@ def test_qoft_translates_architecture_fused_targets_to_split_names(tmp_path: Pat
         "nvfp4",
         "--target-modules",
         "linear_qkv,linear_proj",
+        "--oft-type",
+        "canonical_oft",
     )
 
     assert isinstance(peft, CanonicalOFT)
@@ -402,10 +398,9 @@ def test_qoft_translates_architecture_fused_targets_to_split_names(tmp_path: Pat
 
 
 @pytest.mark.unit
-def test_qoft_oft_type_oft_opts_back_into_legacy_shared_r(tmp_path: Path) -> None:
-    """--oft-type oft is the explicit opt-in to the legacy one-rotation class."""
+def test_qoft_oft_type_canonical_oft_opts_into_split_adapters(tmp_path: Path) -> None:
+    """--oft-type canonical_oft explicitly selects split logical adapters."""
     from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
-    from megatron.bridge.orbit.oft.oft import OFT
 
     entrypoint = _load_qoft_entrypoint()
     peft = _build_oft(
@@ -414,33 +409,36 @@ def test_qoft_oft_type_oft_opts_back_into_legacy_shared_r(tmp_path: Path) -> Non
         "Qwen3MoeForCausalLM",
         "nvfp4",
         "--oft-type",
-        "oft",
+        "canonical_oft",
     )
 
-    assert isinstance(peft, OFT)
-    assert not isinstance(peft, CanonicalOFT)
-    # Legacy targets are passed through unchanged, fused leaves included.
-    assert peft.target_modules == list(entrypoint.QWEN3_MOE_OFT_TARGET_MODULES)
+    assert isinstance(peft, CanonicalOFT)
+    assert not any(target.endswith(("linear_qkv", "linear_fc1")) for target in peft.target_modules)
+    assert {"linear_q", "linear_k", "linear_v"}.issubset(set(peft.target_modules))
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("quant", ["fp8", "nvfp4"])
 def test_qoft_canonical_allowed_on_fp8_and_nvfp4_grouped_experts(tmp_path: Path, quant: str) -> None:
     """Grouped expert FC1 now has real split GEMMs for every quantized kind, so
-    the former launch-time rejection is gone and canonical stays the default."""
+    the former launch-time rejection is gone when canonical mode is requested."""
     from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
 
     entrypoint = _load_qoft_entrypoint()
-    assert isinstance(_build_oft(entrypoint, tmp_path, "Qwen3MoeForCausalLM", quant), CanonicalOFT)
+    assert isinstance(
+        _build_oft(entrypoint, tmp_path, "Qwen3MoeForCausalLM", quant, "--oft-type", "canonical_oft"), CanonicalOFT
+    )
 
 
 @pytest.mark.unit
 def test_qoft_canonical_allowed_on_int4_grouped_experts(tmp_path: Path) -> None:
-    """INT4 grouped FC1 is implemented, so canonical stays the default there."""
+    """INT4 grouped FC1 is implemented, so canonical remains available as an opt-in."""
     from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
 
     entrypoint = _load_qoft_entrypoint()
-    assert isinstance(_build_oft(entrypoint, tmp_path, "DeepseekV3ForCausalLM", "int4"), CanonicalOFT)
+    assert isinstance(
+        _build_oft(entrypoint, tmp_path, "DeepseekV3ForCausalLM", "int4", "--oft-type", "canonical_oft"), CanonicalOFT
+    )
 
 
 @pytest.mark.unit
@@ -456,6 +454,8 @@ def test_qoft_canonical_allowed_on_nvfp4_when_fc1_is_not_targeted(tmp_path: Path
         "nvfp4",
         "--target-modules",
         "linear_qkv,linear_proj,linear_fc2",
+        "--oft-type",
+        "canonical_oft",
     )
 
     assert isinstance(peft, CanonicalOFT)
@@ -468,7 +468,9 @@ def test_qoft_canonical_allowed_on_dense_architecture(tmp_path: Path) -> None:
     from megatron.bridge.orbit.oft.canonical_oft import CanonicalOFT
 
     entrypoint = _load_qoft_entrypoint()
-    assert isinstance(_build_oft(entrypoint, tmp_path, "Qwen3ForCausalLM", "fp8"), CanonicalOFT)
+    assert isinstance(
+        _build_oft(entrypoint, tmp_path, "Qwen3ForCausalLM", "fp8", "--oft-type", "canonical_oft"), CanonicalOFT
+    )
 
 
 @pytest.mark.unit
@@ -481,7 +483,7 @@ def test_qoft_rejects_unknown_oft_type(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_qoft_launcher_forwards_oft_type(tmp_path: Path) -> None:
-    """OFT_TYPE reaches the entrypoint, so legacy OFT is selectable from the launcher."""
+    """OFT_TYPE reaches the entrypoint, so either implementation is selectable."""
     capture_path = tmp_path / "torchrun-args.txt"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

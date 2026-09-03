@@ -17,6 +17,7 @@ import itertools
 import math
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, TypeVar, Union
 
 import torch
@@ -177,6 +178,30 @@ _CANONICAL_OFT_SLICE_TO_CHILD_WRAPPER = {
 }
 
 _CANONICAL_OFT_SLICE_SORT_ORDER = {slice_name: index for index, slice_name in enumerate(("q", "k", "v", "gate", "up"))}
+
+
+class OFTExportFormat(StrEnum):
+    """Consumer-specific layouts for exported OFT adapter weights."""
+
+    SGLANG = "sglang"
+    HF_PEFT = "hf_peft"
+
+
+def _filter_legacy_grouped_oft_weight_names(
+    base_hf_weight_names: list[str],
+    *,
+    export_format: OFTExportFormat,
+) -> list[str]:
+    """Choose the legacy grouped-MoE gate/up naming convention for a target.
+
+    SGLang recognizes one shared fused ``w13_oft_r`` from a gate key with no up
+    key. HF PEFT instead attaches OFT independently to both unfused projections,
+    so its adapter directory needs both names even though the tensors are equal.
+    """
+    if export_format is OFTExportFormat.HF_PEFT:
+        return base_hf_weight_names
+    gate_only = [name for name in base_hf_weight_names if ".up_proj." not in name]
+    return gate_only or base_hf_weight_names
 
 
 def _canonical_oft_export_base_prefix(global_base_prefix: str, slice_name: Optional[str]) -> str:
@@ -505,6 +530,7 @@ class OrbitOFTExportMixin:
         megatron_model: Union[MegatronModel, List[MegatronModel]],
         cpu: bool = True,
         show_progress: bool = True,
+        export_format: OFTExportFormat = OFTExportFormat.SGLANG,
     ) -> Iterable["HFWeightTuple"]:
         """Stream OFT adapter weights (``oft_r``) from Megatron to HuggingFace format.
 
@@ -524,6 +550,8 @@ class OrbitOFTExportMixin:
             megatron_model: The Megatron model (or list of VP chunks).
             cpu: Move tensors to CPU before yielding. Default ``True``.
             show_progress: Display a progress bar. Default ``True``.
+            export_format: Consumer-specific adapter layout. SGLang uses one
+                fused gate key; HF PEFT needs equal gate and up keys.
 
         Yields:
             ``HFWeightTuple`` with the HF adapter parameter name (e.g.
@@ -741,9 +769,10 @@ class OrbitOFTExportMixin:
                     # split layout and mis-route to the unregistered w1/w3 buffers.
                     # Scoped to grouped experts so dense/QKV fan-out is unchanged.
                     if is_grouped_expert and task.slice_name is None:
-                        _gate_only = [name for name in base_hf_weight_names if ".up_proj." not in name]
-                        if _gate_only:
-                            base_hf_weight_names = _gate_only
+                        base_hf_weight_names = _filter_legacy_grouped_oft_weight_names(
+                            base_hf_weight_names,
+                            export_format=export_format,
+                        )
 
                     # For fused Megatron layers (QKV or gate/up) with the legacy
                     # shared-R OFT, the same rotation applies to every
@@ -885,7 +914,13 @@ def oft_export_bridge_for(auto_bridge) -> "MegatronModule":
     return bridge
 
 
-def export_oft_adapter_weights(auto_bridge, model, cpu: bool = False, show_progress: bool = True):
+def export_oft_adapter_weights(
+    auto_bridge,
+    model,
+    cpu: bool = False,
+    show_progress: bool = True,
+    export_format: OFTExportFormat = OFTExportFormat.SGLANG,
+):
     """Export only OFT adapter weights from a Megatron model in HuggingFace format.
 
     Unlike LoRA's ``lora_A``/``lora_B`` matrices, OFT adapters consist of a
@@ -897,7 +932,12 @@ def export_oft_adapter_weights(auto_bridge, model, cpu: bool = False, show_progr
         HFWeightTuple: ``(param_name, weight_tensor)`` for OFT adapter parameters.
     """
     bridge = oft_export_bridge_for(auto_bridge)
-    return bridge.stream_oft_adapter_weights_megatron_to_hf(model, cpu=cpu, show_progress=show_progress)
+    return bridge.stream_oft_adapter_weights_megatron_to_hf(
+        model,
+        cpu=cpu,
+        show_progress=show_progress,
+        export_format=export_format,
+    )
 
 
 def infer_oft_target_modules(adapter_weight_names: Iterable[str]) -> List[str]:
@@ -994,7 +1034,13 @@ def save_hf_oft_adapter(
     # it relies on collective broadcasts; non-rank0 ranks must still consume
     # the generator to participate in the TP/PP/EP collectives.
     adapter_state: Dict[str, torch.Tensor] = {}
-    for name, tensor in export_oft_adapter_weights(auto_bridge, model, cpu=False, show_progress=show_progress):
+    for name, tensor in export_oft_adapter_weights(
+        auto_bridge,
+        model,
+        cpu=False,
+        show_progress=show_progress,
+        export_format=OFTExportFormat.HF_PEFT,
+    ):
         if is_rank0:
             adapter_state[f"base_model.model.{name}"] = tensor.detach().cpu()
 

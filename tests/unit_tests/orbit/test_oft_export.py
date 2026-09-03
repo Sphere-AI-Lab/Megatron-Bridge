@@ -86,12 +86,84 @@ def test_infer_oft_target_modules_ignores_non_adapter_weights() -> None:
 
 
 @pytest.mark.unit
+def test_legacy_grouped_export_distinguishes_serving_from_hf_peft() -> None:
+    names = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.0.up_proj.weight",
+    ]
+
+    serving_names = oft_export._filter_legacy_grouped_oft_weight_names(
+        names,
+        export_format=oft_export.OFTExportFormat.SGLANG,
+    )
+    peft_names = oft_export._filter_legacy_grouped_oft_weight_names(
+        names,
+        export_format=oft_export.OFTExportFormat.HF_PEFT,
+    )
+
+    assert serving_names == [names[0]]
+    assert peft_names == names
+
+
+@pytest.mark.unit
+def test_legacy_grouped_hf_export_matches_fused_serving_output() -> None:
+    """Duplicating the shared rotation must preserve fused gate/up behavior."""
+    names = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.0.up_proj.weight",
+    ]
+    serving_names = oft_export._filter_legacy_grouped_oft_weight_names(
+        names,
+        export_format=oft_export.OFTExportFormat.SGLANG,
+    )
+    hf_names = oft_export._filter_legacy_grouped_oft_weight_names(
+        names,
+        export_format=oft_export.OFTExportFormat.HF_PEFT,
+    )
+
+    oft_r = torch.tensor([[0.25], [-0.4]], dtype=torch.float32)
+    rotation = oft_export.OrbitOFTExportMixin._compute_oft_rotation_matrix(
+        oft_r,
+        block_size=2,
+        in_features=4,
+        block_share=False,
+    )
+    gate_weight = torch.tensor([[1.0, 2.0, -1.0, 0.5], [0.0, -2.0, 3.0, 1.0]])
+    up_weight = torch.tensor([[4.0, -1.0, 0.5, 2.0], [-3.0, 1.0, 2.0, -0.5]])
+    inputs = torch.tensor([[0.5, -1.0, 2.0, 3.0], [-2.0, 0.25, 1.0, -1.5]])
+
+    serving_uses_shared_rotation = names[0] in serving_names and names[1] not in serving_names
+    serving_rotation = rotation if serving_uses_shared_rotation else torch.eye(4)
+    fused_weight = torch.cat((gate_weight, up_weight), dim=0) @ serving_rotation
+    serving_output = torch.nn.functional.linear(inputs, fused_weight)
+
+    exported_names = set(hf_names)
+    hf_gate_rotation = rotation if names[0] in exported_names else torch.eye(4)
+    hf_up_rotation = rotation if names[1] in exported_names else torch.eye(4)
+    hf_output = torch.cat(
+        (
+            torch.nn.functional.linear(inputs, gate_weight @ hf_gate_rotation),
+            torch.nn.functional.linear(inputs, up_weight @ hf_up_rotation),
+        ),
+        dim=-1,
+    )
+
+    torch.testing.assert_close(hf_output, serving_output)
+
+
+@pytest.mark.unit
 def test_save_hf_oft_adapter_writes_loadable_peft_directory(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     weights = [
         ("model.layers.0.self_attn.q_proj.oft_R.weight", torch.arange(6, dtype=torch.float32).reshape(2, 3)),
         ("model.layers.0.mlp.gate_proj.oft_R.weight", torch.ones(2, 3)),
     ]
-    monkeypatch.setattr(oft_export, "export_oft_adapter_weights", lambda *args, **kwargs: iter(weights))
+    export_calls = []
+
+    def fake_export(*args, **kwargs):
+        export_calls.append(kwargs)
+        return iter(weights)
+
+    monkeypatch.setattr(oft_export, "export_oft_adapter_weights", fake_export)
     auto_bridge = SimpleNamespace(hf_pretrained=SimpleNamespace(model_name_or_path="radixark/base-model"))
 
     oft_export.save_hf_oft_adapter(
@@ -111,6 +183,13 @@ def test_save_hf_oft_adapter_writes_loadable_peft_directory(tmp_path, monkeypatc
         "base_model.model.model.layers.0.self_attn.q_proj.oft_R.weight",
     }
     assert torch.equal(saved["base_model.model.model.layers.0.self_attn.q_proj.oft_R.weight"], weights[0][1])
+    assert export_calls == [
+        {
+            "cpu": False,
+            "show_progress": False,
+            "export_format": oft_export.OFTExportFormat.HF_PEFT,
+        }
+    ]
 
 
 @pytest.mark.unit

@@ -19,6 +19,7 @@ from typing import Any, List, Literal, Optional, Tuple
 import torch
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.utils import get_pg_size
 from torch import nn
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
@@ -328,6 +329,21 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 return LinearAdapter(
                     m, dim=self.dim, alpha=self.alpha, dropout=self.dropout, lora_A_init_method=self.lora_A_init_method
                 )
+
+            if name == "linear_qkv":
+                if getattr(m.config, "attention_output_gate", False):
+                    raise ValueError(
+                        "CanonicalLoRA linear_qkv with attention_output_gate=True is not supported yet; "
+                        "the query gate needs its own adapter_gate. Use LoRA for this layer for now."
+                    )
+                tp_group = getattr(m, "tp_group", None) or getattr(m, "_tp_group", None)
+                tp_size = get_pg_size(tp_group)
+                if tp_size > 1:
+                    raise ValueError(
+                        f"CanonicalLoRA linear_qkv with TP={tp_size} is not supported yet; "
+                        "the current QKV interleaver assumes unsharded output rows. "
+                        "Use LoRA for this layer for now."
+                    )
 
             is_expert = is_expert_linear(full_name)
             attrs = get_adapter_attributes_from_linear(m, is_expert=is_expert)

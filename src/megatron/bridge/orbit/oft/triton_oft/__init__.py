@@ -18,6 +18,10 @@ from megatron.bridge.orbit.oft.triton_oft.cayley_neumann import (
 )
 from megatron.bridge.orbit.oft.triton_oft.dequant_fp8 import dequant_fp8_block_triton
 from megatron.bridge.orbit.oft.triton_oft.oft_rotation import OFTRotationFunction, oft_rotation
+from megatron.bridge.orbit.oft.triton_oft.segmented_oft_linear import (
+    segmented_oft_linear,
+    segmented_oft_linear_reference,
+)
 from megatron.bridge.orbit.oft.triton_oft.sgemm_oft_r import sgemm_oft_r_fwd
 from megatron.bridge.orbit.oft.triton_oft.sgemm_oft_r_bwd import sgemm_oft_r_grad_R
 from megatron.bridge.orbit.oft.triton_oft.sgemm_oft_r_by_expert import (
