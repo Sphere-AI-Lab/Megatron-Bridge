@@ -18,6 +18,7 @@ import contextlib
 import inspect
 import os
 import random
+import re
 import shutil
 import sys
 import threading
@@ -34,7 +35,13 @@ import torch
 import torch.nn.functional as F
 from megatron.core import dist_checkpointing, tensor_parallel
 from megatron.core.dist_checkpointing import serialization as dist_checkpointing_serialization
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, ShardedTensor
+from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
+    ShardedObject,
+    ShardedStateDict,
+    ShardedTensor,
+    ShardedTensorFactory,
+)
 from megatron.core.dist_checkpointing.serialization import StateDict
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
@@ -56,7 +63,6 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import MegatronModule
 from megatron.core.utils import get_pg_size, unwrap_model
 from modelopt.torch.opt.plugins import (
-    restore_modelopt_state,
     save_modelopt_state,
     save_sharded_modelopt_state,
 )
@@ -185,6 +191,9 @@ _CHECKPOINT_VERSION = None
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = "non_persistent"
 _DIRECT_ITERATION_DIR_SENTINEL = -2
+_OPTIMIZER_TENSOR_KEY = re.compile(
+    r"^(?:optimizer\.|chained_\d+\.optimizer\.|mimo\.[^.]+\.(?:chained_\d+\.)?optimizer\.)"
+)
 
 
 # ============================================================================
@@ -1771,8 +1780,9 @@ def _load_model_weights_from_checkpoint(
     print_rank_0(f"sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}")
     model_sd_kwargs = dict(metadata=sharded_sd_metadata)
 
-    # [ModelOpt]: Restore state
-    restore_modelopt_state(model, state_dict)
+    # [ModelOpt]: Restore sidecar or legacy embedded state before schema
+    # generation so quantizer keys exist for weights-only loads too.
+    _restore_modelopt_state_before_sharded_schema(model, checkpoint_path, state_dict)
 
     model = unwrap_model(model)
     pg_collection = get_pg_collection(model)
@@ -2022,8 +2032,19 @@ def _process_state_dict_for_glu_interleaving(
     return processed_state_dict
 
 
-def _load_model_state_dict(module: torch.nn.Module, state_dict: dict[str, Any], strict: bool):
-    """Helper function to load state dict with fallback for missing extra states."""
+def _load_model_state_dict(
+    module: torch.nn.Module,
+    state_dict: dict[str, Any],
+    strict: bool,
+    *,
+    adapter_only: bool = False,
+):
+    """Load model state, exposing explicit adapter-resume intent to patched loaders.
+
+    The base implementation does not need different mechanics for adapter-only
+    state. Orbit's quantized QOFT loaders replace this seam and use the signal to
+    avoid meta-materializing assignment during PEFT run-checkpoint resume.
+    """
     if HAVE_MEGATRON_FSDP and isinstance(module, MegatronFSDP):
         # Because the state dictionary was generated from the nested module of Megatron-FSDP,
         # but MegatronFSDP.load_state_dict() is called at MegatronFSDP(torch.nn.Module).
@@ -2339,9 +2360,23 @@ def _load_checkpoint_from_path(
         and not cfg.checkpoint.finetune
     )
     if is_peft_resume and "sharded_state_dict" in load_kwargs:
-        load_kwargs["sharded_state_dict"] = apply_peft_adapter_filter_to_state_dict(
-            load_kwargs["sharded_state_dict"], cfg.peft
-        )
+        full_sharded_state_dict = load_kwargs["sharded_state_dict"]
+        adapter_sharded_state_dict = apply_peft_adapter_filter_to_state_dict(full_sharded_state_dict, cfg.peft)
+        # Local and FSDP checkpoints use format-native load validation; only
+        # global torch-dist checkpoints expose the DCP metadata schema below.
+        if ckpt_format == "torch_dist":
+            if ckpt_type is None:
+                raise RuntimeError("Resolved checkpoint type is unavailable for PEFT run-resume validation")
+            if ckpt_type == CheckpointType.GLOBAL:
+                _validate_peft_run_resume_tensor_schema(
+                    full_sharded_state_dict,
+                    adapter_sharded_state_dict,
+                    checkpoint_name,
+                    ckpt_type,
+                    ckpt_format,
+                    common_state_dict=state_dict,
+                )
+        load_kwargs["sharded_state_dict"] = adapter_sharded_state_dict
 
     # Load the checkpoint
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
@@ -2443,13 +2478,23 @@ def _load_checkpoint_from_path(
         load_strict = False if is_peft_resume else strict
 
         if len(model) == 1:
-            _load_model_state_dict(model[0], state_dict["model"], load_strict)
+            _load_model_state_dict(
+                model[0],
+                state_dict["model"],
+                load_strict,
+                adapter_only=is_peft_resume,
+            )
         else:
             for i in range(len(model)):
                 model_key = "model%d" % i
                 if model_key not in state_dict:
                     continue
-                _load_model_state_dict(model[i], state_dict[model_key], load_strict)
+                _load_model_state_dict(
+                    model[i],
+                    state_dict[model_key],
+                    load_strict,
+                    adapter_only=is_peft_resume,
+                )
 
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f" checkpoint version {checkpoint_version}")
@@ -2651,6 +2696,341 @@ def init_checkpointing_context(checkpoint_config: CheckpointConfig) -> dict[str,
         )
     }
     return checkpointing_context
+
+
+_TensorDescriptor = tuple[tuple[int, ...], str]
+_TensorDescriptorMap = dict[str, _TensorDescriptor]
+_ObjectIdentifierSet = set[str]
+
+
+def _sharded_tensor_descriptor(tensor: ShardedTensor) -> _TensorDescriptor:
+    """Convert a sharded tensor's global metadata to process-safe primitives."""
+    return tuple(int(dimension) for dimension in tensor.global_shape), str(tensor.dtype)
+
+
+def _merge_tensor_descriptors(
+    destination: _TensorDescriptorMap,
+    incoming: _TensorDescriptorMap,
+    *,
+    owner: str,
+) -> None:
+    """Merge tensor descriptors while rejecting inconsistent shard metadata."""
+    for key, descriptor in incoming.items():
+        previous = destination.get(key)
+        if previous is not None and previous != descriptor:
+            raise RuntimeError(
+                f"Inconsistent {owner} descriptor for {key!r}: found both {previous!r} and {descriptor!r}"
+            )
+        destination[key] = descriptor
+
+
+def _collect_sharded_tensor_descriptors(
+    value: Any,
+    *,
+    owner: str,
+    require_sharded_leaves: bool = True,
+) -> _TensorDescriptorMap:
+    """Collect physical DCP tensor keys without modifying a live sharded schema."""
+    descriptors: _TensorDescriptorMap = {}
+
+    def visit(node: Any, path: tuple[str, ...]) -> None:
+        if isinstance(node, ShardedTensor):
+            _merge_tensor_descriptors(
+                descriptors,
+                {node.key: _sharded_tensor_descriptor(node)},
+                owner=owner,
+            )
+            return
+        if isinstance(node, ShardedTensorFactory):
+            try:
+                built = node.build()
+            except Exception as error:
+                location = ".".join(path) or node.key
+                raise RuntimeError(f"Failed to expand ShardedTensorFactory at {location!r}: {error}") from error
+            visit(built, path + ("<factory>",))
+            return
+        if isinstance(node, (ShardedObject, LocalNonpersistentObject)):
+            return
+        if isinstance(node, dict):
+            for child_key, child in node.items():
+                child_name = str(child_key)
+                if "_extra_state" in child_name:
+                    continue
+                visit(child, path + (child_name,))
+            return
+        if isinstance(node, (list, tuple)):
+            for index, child in enumerate(node):
+                visit(child, path + (str(index),))
+            return
+        if not require_sharded_leaves:
+            return
+
+        location = ".".join(path) or "<root>"
+        raise RuntimeError(
+            f"Cannot validate {owner} tensor schema: unsupported leaf {type(node).__name__} at {location!r}"
+        )
+
+    visit(value, ())
+    return descriptors
+
+
+def _collect_sharded_object_identifiers(value: Any) -> _ObjectIdentifierSet:
+    """Collect physical DCP object identifiers from a sharded schema."""
+    identifiers: _ObjectIdentifierSet = set()
+
+    def visit(node: Any) -> None:
+        if isinstance(node, ShardedObject):
+            identifiers.add(node.unique_key)
+            return
+        if isinstance(node, (ShardedTensor, ShardedTensorFactory, LocalNonpersistentObject)):
+            return
+        if isinstance(node, dict):
+            for child in node.values():
+                visit(child)
+            return
+        if isinstance(node, (list, tuple)):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return identifiers
+
+
+def _common_value_is_nonempty(value: Any) -> bool:
+    """Return whether a common-state subtree contains any persisted leaf."""
+    if isinstance(value, dict):
+        return any(_common_value_is_nonempty(child) for child in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_common_value_is_nonempty(child) for child in value)
+    return True
+
+
+def _validate_common_model_state(common_state_dict: dict[str, Any] | None) -> None:
+    """Reject model payloads that DCP would merge outside the sharded request."""
+    if common_state_dict is None:
+        return
+
+    populated_sections = sorted(
+        str(section_name)
+        for section_name, section in common_state_dict.items()
+        if _is_model_section(str(section_name)) and _common_value_is_nonempty(section)
+    )
+    if populated_sections:
+        raise RuntimeError(
+            "common checkpoint contains forbidden model state in sections: " + ", ".join(populated_sections)
+        )
+
+
+def _local_peft_schema_descriptors(
+    full_sharded_state_dict: dict[str, Any],
+    adapter_sharded_state_dict: dict[str, Any],
+    common_state_dict: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract this rank's full-model, adapter, and optimizer descriptors."""
+    _validate_common_model_state(common_state_dict)
+    full_model: _TensorDescriptorMap = {}
+    adapters: _TensorDescriptorMap = {}
+
+    for section_name, section in full_sharded_state_dict.items():
+        if _is_model_section(section_name):
+            _merge_tensor_descriptors(
+                full_model,
+                _collect_sharded_tensor_descriptors(section, owner=f"full model section {section_name}"),
+                owner="full model",
+            )
+
+    for section_name, section in adapter_sharded_state_dict.items():
+        if _is_model_section(section_name):
+            _merge_tensor_descriptors(
+                adapters,
+                _collect_sharded_tensor_descriptors(section, owner=f"adapter section {section_name}"),
+                owner="adapter",
+            )
+
+    optimizer = _collect_sharded_tensor_descriptors(
+        full_sharded_state_dict.get("optimizer", {}),
+        owner="optimizer",
+        require_sharded_leaves=False,
+    )
+    optimizer_objects = _collect_sharded_object_identifiers(full_sharded_state_dict.get("optimizer", {}))
+    return {
+        "model": full_model,
+        "adapter": adapters,
+        "optimizer": optimizer,
+        "optimizer_objects": optimizer_objects,
+        "optimizer_requested": "optimizer" in full_sharded_state_dict,
+    }
+
+
+def _gather_peft_schema_descriptors(
+    full_sharded_state_dict: dict[str, Any],
+    adapter_sharded_state_dict: dict[str, Any],
+    common_state_dict: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Gather global PP/TP schema descriptors and coordinate local failures."""
+    distributed = torch.distributed.is_initialized()
+    rank = torch.distributed.get_rank() if distributed else 0
+    try:
+        local_payload: dict[str, Any] = {
+            "error": None,
+            **_local_peft_schema_descriptors(
+                full_sharded_state_dict,
+                adapter_sharded_state_dict,
+                common_state_dict,
+            ),
+        }
+    except Exception as error:
+        local_payload = {"error": f"rank {rank}: {error}"}
+
+    if distributed:
+        gathered_payloads: list[dict[str, Any] | None] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered_payloads, local_payload)
+    else:
+        gathered_payloads = [local_payload]
+
+    errors = [payload["error"] for payload in gathered_payloads if payload is not None and payload.get("error")]
+    if errors:
+        raise RuntimeError("PEFT run-resume schema extraction failed: " + "; ".join(errors))
+
+    gathered: dict[str, Any] = {
+        "model": {},
+        "adapter": {},
+        "optimizer": {},
+        "optimizer_objects": set(),
+        "optimizer_requested": False,
+    }
+    for payload in gathered_payloads:
+        if payload is None:
+            raise RuntimeError("PEFT run-resume schema extraction received an empty rank payload")
+        for owner in ("model", "adapter", "optimizer"):
+            _merge_tensor_descriptors(gathered[owner], payload[owner], owner=owner)
+        gathered["optimizer_objects"].update(payload["optimizer_objects"])
+        gathered["optimizer_requested"] = gathered["optimizer_requested"] or payload["optimizer_requested"]
+    return gathered
+
+
+def _load_global_sharded_metadata(checkpoint_name: str, *, include_objects: bool) -> dict[str, Any]:
+    """Read required DCP metadata on rank zero and broadcast data or failure."""
+    distributed = torch.distributed.is_initialized()
+    rank = torch.distributed.get_rank() if distributed else 0
+    payload: dict[str, Any] | None = None
+    if rank == 0:
+        try:
+            metadata = (
+                dist_checkpointing_serialization.load_sharded_metadata(checkpoint_name)
+                if include_objects
+                else dist_checkpointing.load_tensors_metadata(checkpoint_name)
+            )
+            tensors: _TensorDescriptorMap = {}
+            objects: _ObjectIdentifierSet = set()
+            invalid: list[str] = []
+            for key, value in metadata.items():
+                if isinstance(value, ShardedTensor):
+                    tensors[str(key)] = _sharded_tensor_descriptor(value)
+                elif isinstance(value, ShardedObject):
+                    objects.add(value.unique_key)
+                else:
+                    invalid.append(str(key))
+            if invalid:
+                raise RuntimeError(f"Unsupported entries in sharded metadata: {sorted(invalid)}")
+            payload = {
+                "error": None,
+                "tensors": tensors,
+                "objects": objects,
+            }
+        except Exception as error:
+            payload = {"error": f"rank 0 metadata read failed: {error}"}
+
+    if distributed:
+        broadcast_payload = [payload]
+        torch.distributed.broadcast_object_list(broadcast_payload, src=0)
+        payload = broadcast_payload[0]
+
+    if payload is None:
+        raise RuntimeError("PEFT run-resume metadata broadcast returned no payload")
+    if payload.get("error"):
+        raise RuntimeError(f"PEFT run-resume sharded metadata validation failed: {payload['error']}")
+    return payload
+
+
+def _validate_peft_run_resume_tensor_schema(
+    full_sharded_state_dict: dict[str, Any],
+    adapter_sharded_state_dict: dict[str, Any],
+    checkpoint_name: str | os.PathLike[str],
+    checkpoint_type: CheckpointType,
+    checkpoint_format: str,
+    *,
+    common_state_dict: dict[str, Any] | None = None,
+) -> None:
+    """Validate an adapter-only torch-dist payload before DCP loads state."""
+    if checkpoint_type != CheckpointType.GLOBAL or checkpoint_format != "torch_dist":
+        raise NotImplementedError(
+            "PEFT run-resume tensor validation supports only global torch_dist checkpoints; "
+            f"got checkpoint type {checkpoint_type!r} and format {checkpoint_format!r}"
+        )
+    if not isinstance(checkpoint_name, (str, os.PathLike)):
+        raise NotImplementedError(
+            "PEFT run-resume tensor validation requires a resolved global checkpoint directory path"
+        )
+
+    requested = _gather_peft_schema_descriptors(
+        full_sharded_state_dict,
+        adapter_sharded_state_dict,
+        common_state_dict,
+    )
+    if not requested["adapter"]:
+        raise RuntimeError("PEFT run-resume schema contains no adapter tensor descriptors")
+
+    actual_metadata = _load_global_sharded_metadata(
+        str(checkpoint_name),
+        include_objects=bool(requested["optimizer_requested"]),
+    )
+    actual: _TensorDescriptorMap = actual_metadata["tensors"]
+    actual_objects: _ObjectIdentifierSet = actual_metadata["objects"]
+    errors: list[str] = []
+    for key, expected in sorted(requested["adapter"].items()):
+        found = actual.get(key)
+        if found is None:
+            errors.append(f"missing adapter tensor {key!r}")
+            continue
+        if found[0] != expected[0]:
+            errors.append(f"adapter tensor {key!r} shape mismatch: expected {expected[0]!r}, found {found[0]!r}")
+        if found[1] != expected[1]:
+            errors.append(f"adapter tensor {key!r} dtype mismatch: expected {expected[1]!r}, found {found[1]!r}")
+
+    for key, expected in sorted(requested["optimizer"].items()):
+        found = actual.get(key)
+        if found is None:
+            errors.append(f"missing optimizer tensor {key!r}")
+        elif found != expected:
+            errors.append(f"optimizer tensor {key!r} mismatch: expected {expected!r}, found {found!r}")
+
+    for identifier in sorted(requested["optimizer_objects"]):
+        if identifier not in actual_objects:
+            errors.append(f"missing optimizer object {identifier!r}")
+
+    for key, found in sorted(actual.items()):
+        if key in requested["adapter"]:
+            continue
+        if key in requested["model"]:
+            errors.append(f"checkpoint contains forbidden frozen/base model tensor {key!r}")
+            continue
+        if key in requested["optimizer"]:
+            continue
+        if _OPTIMIZER_TENSOR_KEY.match(key):
+            if requested["optimizer_requested"]:
+                errors.append(f"checkpoint contains unrequested optimizer tensor {key!r}")
+            continue
+        errors.append(f"checkpoint contains unexpected non-adapter tensor {key!r}")
+
+    for identifier in sorted(actual_objects):
+        if identifier in requested["optimizer_objects"]:
+            continue
+        if _OPTIMIZER_TENSOR_KEY.match(identifier) and requested["optimizer_requested"]:
+            errors.append(f"checkpoint contains unrequested optimizer object {identifier!r}")
+
+    if errors:
+        raise RuntimeError("Invalid PEFT run-resume sharded payload: " + "; ".join(errors))
 
 
 def apply_peft_adapter_filter_to_state_dict(state_dict: dict[str, Any], peft_config: PEFT) -> dict[str, Any]:

@@ -3,17 +3,23 @@
 """ModelOpt checkpoint save/restore extensions (orbit fork).
 
 Extracted from ``megatron.bridge.training.checkpointing``; the shared module
-keeps two marked call-site seams. See ``docs/orbit/UPSTREAM_SEAMS.md``.
+keeps two marked call-site seams. See ``docs/orbit/UPSTREAM-SEAMS.md``.
 """
 
+import inspect
+import logging
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from megatron.core import dist_checkpointing
 from megatron.core.transformer import MegatronModule
+from megatron.core.utils import unwrap_model
 from modelopt.torch.opt.plugins import restore_modelopt_state, save_sharded_modelopt_state
+
+
+logger = logging.getLogger(__name__)
 
 
 def _save_sharded_modelopt_state_with_async_strategy(
@@ -68,11 +74,15 @@ def _save_sharded_modelopt_state_with_async_strategy(
 
     modelopt_state = copy.deepcopy(mto.modelopt_state(model[0]))
     remove_per_module_state(modelopt_state)
+    save_params = set(inspect.signature(dist_checkpointing.save).parameters)
+    save_optional_kwargs: dict[str, Any] = {}
+    if "async_strategy" in save_params:
+        save_optional_kwargs["async_strategy"] = async_strategy
     dist_checkpointing.save(
         modelopt_state,
         modelopt_checkpoint_name,
         sharded_strategy,
-        async_strategy=async_strategy,
+        **save_optional_kwargs,
     )
 
 
@@ -80,19 +90,18 @@ def restore_sharded_modelopt_state_via_common_reader(
     model: list[MegatronModule],
     checkpoint_name: str | Path,
     prefix: str = "",
-    metadata: Optional[dict[str, Any]] = None,
-) -> None:
+    metadata: dict[str, Any] | None = None,
+) -> bool:
     """Restore sharded ModelOpt state, reading common state with MCore's reader.
 
-    Mirrors the pinned ModelOpt ``restore_sharded_modelopt_state`` except for one
-    line: the common modelopt state is loaded through
-    ``dist_checkpointing.load_common_state_dict()`` instead of a direct
-    ``common.pt`` read. The pinned MCore's ``dist_checkpointing.save()`` embeds
-    common data as a ``ShardedObject("common_state")`` inside the torch-dist
-    files and never writes ``common.pt``, so ModelOpt's own restore raises
-    FileNotFoundError on every modelopt_state this repo saves. MCore's reader
-    understands that layout (and reads rank-locally: torch-dist load with
-    ``no_dist=True``).
+    Mirrors the pinned ModelOpt ``restore_sharded_modelopt_state`` except that
+    common ModelOpt state is loaded through MCore's layout-aware
+    ``dist_checkpointing.load_common_state_dict()`` instead of opening a
+    private common-state filename. This supports both the standalone and
+    torch-distributed common-state layouts used by compatible MCore revisions.
+
+    Returns:
+        Whether the sidecar was restored into the model.
     """
     import modelopt.torch.opt as mto
 
@@ -107,37 +116,47 @@ def restore_sharded_modelopt_state_via_common_reader(
 
     modelopt_checkpoint_name = f"{checkpoint_name}/modelopt_state"
     if not os.path.exists(modelopt_checkpoint_name) or mto.ModeloptStateManager.is_converted(model[0]):
-        return
+        return False
 
     common_modelopt_state = dist_checkpointing.load_common_state_dict(modelopt_checkpoint_name)
-    print(f"nvidia-modelopt ckpt version: {common_modelopt_state.get('modelopt_version')}")
+    logger.info("nvidia-modelopt ckpt version: %s", common_modelopt_state.get("modelopt_version"))
 
     model[0] = mto.restore_from_modelopt_state(model[0], common_modelopt_state)
     _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name, prefix, metadata=metadata)
+    return True
 
 
 def _maybe_restore_modelopt_state_for_sharded_load(
     model: list[MegatronModule],
-    checkpoint_path: Optional[str],
-    common_state_dict: Optional[dict[str, Any]],
+    checkpoint_path: str | None,
+    common_state_dict: dict[str, Any] | None,
 ) -> bool:
-    """Restore ModelOpt state before generating a sharded load schema."""
+    """Restore ModelOpt state before schema generation.
 
-    if checkpoint_path is None or common_state_dict is None:
+    Returns ``True`` only when the sidecar was restored. The legacy embedded
+    fallback may run successfully while this function returns ``False``.
+    """
+
+    if checkpoint_path is None:
         return False
 
-    from megatron.bridge.training.post_training.checkpointing import has_modelopt_state
+    from megatron.bridge.training.post_training.checkpointing import has_modelopt_state, load_modelopt_state
 
-    if not has_modelopt_state(checkpoint_path):
+    if has_modelopt_state(checkpoint_path):
+        return load_modelopt_state(model, checkpoint_path)
+
+    if common_state_dict is None:
         return False
 
-    # ModelOpt's restore replays the saved mode list, which contains
-    # ``real_quantize`` once a prior run has been through ``mtq.compress``.
-    # Replaying that mode walks grouped expert linears (``weight0..weightN``,
-    # no ``.weight``) through unpatched ModelOpt code, so the guards must be in
-    # place before the replay -- not only in the packed-restore path.
-    from megatron.bridge.orbit.training.modelopt_packed_restore import _patch_modelopt_pack_for_grouped_moe
+    from megatron.bridge.orbit.training.modelopt_packed_restore import (
+        _maybe_compress_restored_modelopt_model,
+        _patch_modelopt_pack_for_grouped_moe,
+    )
 
     _patch_modelopt_pack_for_grouped_moe()
     restore_modelopt_state(model, common_state_dict)
-    return True
+
+    # Packed layouts need the same post-restore compression phase after the
+    # legacy embedded-state fallback.
+    _maybe_compress_restored_modelopt_model(unwrap_model(model), checkpoint_path)
+    return False

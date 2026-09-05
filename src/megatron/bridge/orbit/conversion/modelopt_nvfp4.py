@@ -74,19 +74,48 @@ class ModelOptNVFP4DequantMixin:
         hf_state_dict: Mapping[str, torch.Tensor],
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Load HF weights, dequantizing ModelOpt NVFP4 bundles when present."""
+        from megatron.bridge.orbit.low_precision.nvfp4 import (
+            extract_nvfp4_weight_bundle_if_present,
+            preflight_nvfp4_source_families,
+        )
+
+        if getattr(self, "_nvfp4_preflighted_state", None) is not hf_state_dict:
+            preflight_nvfp4_source_families(
+                hf_state_dict,
+                require_input_scale=False,
+            )
+            self._nvfp4_preflighted_state = hf_state_dict
+
+        source_keys = tuple(hf_param.values()) if isinstance(hf_param, dict) else (hf_param,)
+        bundles = {}
+        for source_key in source_keys:
+            if source_key.endswith(".weight"):
+                bundle = extract_nvfp4_weight_bundle_if_present(
+                    source_key,
+                    hf_state_dict,
+                    require_input_scale=False,
+                )
+                if bundle is not None:
+                    bundles[source_key] = bundle
+
         if isinstance(hf_param, dict):
-            return {role: self._maybe_dequant_nvfp4(key, hf_state_dict) for role, key in hf_param.items()}
-        return self._maybe_dequant_nvfp4(hf_param, hf_state_dict)
+            return {
+                role: self._maybe_dequant_nvfp4(key, hf_state_dict, bundle=bundles.get(key))
+                for role, key in hf_param.items()
+            }
+        return self._maybe_dequant_nvfp4(hf_param, hf_state_dict, bundle=bundles.get(hf_param))
 
     def _maybe_dequant_nvfp4(
         self,
         hf_key: str,
         hf_state_dict: Mapping[str, torch.Tensor],
+        *,
+        bundle: Mapping[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        if is_nvfp4_bundle_key(hf_key, hf_state_dict):
+        if bundle is not None:
             from megatron.bridge.orbit.low_precision.nvfp4 import dequantize_nvfp4
 
-            packed = hf_state_dict[hf_key]
+            packed = bundle["weight"]
             shape = torch.tensor(
                 [packed.shape[0], packed.shape[1] * 2],
                 dtype=torch.int64,
@@ -94,8 +123,8 @@ class ModelOptNVFP4DequantMixin:
             )
             weight = dequantize_nvfp4(
                 packed,
-                hf_state_dict[f"{hf_key}_scale"],
-                hf_state_dict[f"{hf_key}_scale_2"],
+                bundle["weight_scale"],
+                bundle["weight_scale_2"],
                 shape,
                 dtype=torch.bfloat16,
                 device=packed.device,

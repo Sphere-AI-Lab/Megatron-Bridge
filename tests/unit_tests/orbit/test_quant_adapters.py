@@ -14,9 +14,13 @@
 
 """Unit tests for the FP8/NVFP4 quant adapters and adapter chaining."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+import torch.nn as nn
 
+from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping, QKVMapping, RowParallelMapping
 from megatron.bridge.orbit.conversion.bridge_compose import quant_bridge_class_for
 from megatron.bridge.orbit.conversion.compressed_tensors_int4 import (
     CompressedTensorsINT4DequantMixin,
@@ -47,6 +51,23 @@ class _PlusOneBridge:
         if isinstance(hf_param, str):
             return hf_state_dict[hf_param] + 1
         return {k: hf_state_dict[v] + 1 for k, v in hf_param.items()}
+
+
+class _FP8LoadBridge(BlockFP8PreserveMixin):
+    def __init__(self, task):
+        self.task = task
+
+    def build_conversion_tasks(self, _hf, _model):
+        return [self.task]
+
+    def _with_progress_tracking(self, tasks, _description):
+        return tasks
+
+    def maybe_modify_loaded_hf_weight(self, hf_param, hf_state):
+        return {role: hf_state[key] for role, key in hf_param.items()}
+
+    def _broadcast_shared_embeddings(self, _model):
+        return None
 
 
 class TestSharedComposition:
@@ -145,19 +166,246 @@ class TestFP8Helpers:
         bf16 = torch.zeros(2, 2, dtype=torch.bfloat16)
         assert _is_fp8(fp8)
         assert not _is_fp8(bf16)
-        assert _is_fp8({"q": bf16, "k": fp8})
+        with pytest.raises(ValueError, match="mixes E4M3FN and non-FP8"):
+            _is_fp8({"q": bf16, "k": fp8})
         assert not _is_fp8({"q": bf16})
+        with pytest.raises(TypeError, match="must be tensors"):
+            _is_fp8({"q": fp8, "metadata": None})
 
     def test_load_scale_prefers_scale_inv_then_reciprocal(self):
-        state = {"a.weight_scale_inv": torch.tensor([2.0]), "b.weight_scale": torch.tensor([4.0])}
-        assert torch.equal(_load_scale("a.weight", state), torch.tensor([2.0]))
-        assert torch.equal(_load_scale("b.weight", state), torch.tensor([0.25]))
+        state = {
+            "a.weight": torch.ones((2, 2)).to(torch.float8_e4m3fn),
+            "a.weight_scale_inv": torch.tensor([2.0]),
+            "b.weight": torch.ones((2, 2)).to(torch.float8_e4m3fn),
+            "b.weight_scale": torch.tensor([4.0]),
+        }
+        assert torch.equal(_load_scale("a.weight", state), torch.tensor([[2.0]]))
+        assert torch.equal(_load_scale("b.weight", state), torch.tensor([[0.25]]))
         assert _load_scale("c.weight", state) is None
+
+    @pytest.mark.parametrize("scale", [torch.tensor([0.0]), torch.tensor([float("inf")])])
+    def test_load_scale_rejects_nonpositive_or_nonfinite_reciprocal(self, scale: torch.Tensor):
+        state = {
+            "a.weight": torch.ones((2, 2)).to(torch.float8_e4m3fn),
+            "a.weight_scale": scale,
+        }
+
+        with pytest.raises(ValueError, match="finite and positive"):
+            _load_scale("a.weight", state)
 
     def test_tp_chunk(self):
         t = torch.arange(8.0).reshape(2, 4)
         assert torch.equal(_tp_chunk(t, 1, 0, dim=0), t)
         assert torch.equal(_tp_chunk(t, 2, 1, dim=1), t[:, 2:])
+
+    def test_store_scale_inv_is_persistent_model_state(self):
+        """A converted FP8 scale must survive ordinary state_dict/save paths."""
+        module = nn.Linear(4, 3, bias=False)
+        task = SimpleNamespace(
+            mapping=SimpleNamespace(hf_param="hf.weight", tp_rank=0, tp_size=1),
+            megatron_module=module,
+            param_name="weight",
+            param_weight=module.weight,
+        )
+        scale = torch.tensor([[0.5]])
+
+        BlockFP8PreserveMixin()._store_scale_inv(
+            task,
+            {
+                "hf.weight": torch.ones((3, 4)).to(torch.float8_e4m3fn),
+                "hf.weight_scale_inv": scale,
+            },
+        )
+
+        assert "weight_scale_inv" in module.state_dict()
+        assert torch.equal(module.state_dict()["weight_scale_inv"], scale)
+
+    def test_store_scale_inv_uses_indexed_grouped_expert_buffer_name(self):
+        module = nn.Module()
+        module.register_parameter("weight0", nn.Parameter(torch.empty((128, 128), dtype=torch.bfloat16)))
+        task = SimpleNamespace(
+            mapping=SimpleNamespace(hf_param="hf.weight", tp_rank=0, tp_size=1),
+            megatron_module=module,
+            param_name="weight0",
+            param_weight=module.weight0,
+        )
+        scale = torch.tensor([[0.5]])
+
+        BlockFP8PreserveMixin()._store_scale_inv(
+            task,
+            {
+                "hf.weight": torch.ones((128, 128)).to(torch.float8_e4m3fn),
+                "hf.weight_scale_inv": scale,
+            },
+        )
+
+        assert "weight0_scale_inv" in module.state_dict()
+        assert "weight_scale_inv" not in module.state_dict()
+        assert torch.equal(module.state_dict()["weight0_scale_inv"], scale)
+
+    @pytest.mark.parametrize("sharded_dim", [0, 1], ids=["column", "row"])
+    def test_store_scale_inv_rejects_tp_cut_inside_128_element_block(self, sharded_dim: int):
+        local_shape = [256, 256]
+        local_shape[sharded_dim] = 192
+        global_shape = list(local_shape)
+        global_shape[sharded_dim] *= 2
+        scale_shape = tuple((size + 127) // 128 for size in global_shape)
+        module = nn.Linear(local_shape[1], local_shape[0], bias=False)
+        inner_mapping = RowParallelMapping.__new__(RowParallelMapping) if sharded_dim == 1 else None
+        mapping = SimpleNamespace(
+            hf_param="hf.weight",
+            tp_rank=0,
+            tp_size=2,
+            _mapping=inner_mapping,
+        )
+        task = SimpleNamespace(
+            mapping=mapping,
+            megatron_module=module,
+            param_name="weight",
+            param_weight=module.weight,
+        )
+
+        with pytest.raises(ValueError, match="128-element FP8 block"):
+            BlockFP8PreserveMixin()._store_scale_inv(
+                task,
+                {
+                    "hf.weight": torch.ones(global_shape).to(torch.float8_e4m3fn),
+                    "hf.weight_scale_inv": torch.ones(scale_shape),
+                },
+            )
+
+    @pytest.mark.parametrize("sharded_dim", [0, 1], ids=["column", "row"])
+    def test_store_scale_inv_accepts_block_aligned_tp_cut(self, sharded_dim: int):
+        local_shape = [256, 256]
+        global_shape = list(local_shape)
+        global_shape[sharded_dim] *= 2
+        scale_shape = tuple(size // 128 for size in global_shape)
+        source_scale = torch.arange(1.0, float(scale_shape[0] * scale_shape[1]) + 1.0).reshape(scale_shape)
+        module = nn.Linear(local_shape[1], local_shape[0], bias=False)
+        inner_mapping = RowParallelMapping.__new__(RowParallelMapping) if sharded_dim == 1 else None
+        mapping = SimpleNamespace(
+            hf_param="hf.weight",
+            tp_rank=1,
+            tp_size=2,
+            _mapping=inner_mapping,
+        )
+        task = SimpleNamespace(
+            mapping=mapping,
+            megatron_module=module,
+            param_name="weight",
+            param_weight=module.weight,
+        )
+
+        BlockFP8PreserveMixin()._store_scale_inv(
+            task,
+            {
+                "hf.weight": torch.ones(global_shape).to(torch.float8_e4m3fn),
+                "hf.weight_scale_inv": source_scale,
+            },
+        )
+
+        expected = torch.chunk(source_scale, 2, dim=sharded_dim)[1]
+        assert torch.equal(module.weight_scale_inv, expected)
+
+    @pytest.mark.parametrize(
+        ("mapping", "missing_key"),
+        [
+            (
+                GatedMLPMapping("linear_fc1.weight", "gate.weight", "up.weight"),
+                "up.weight_scale_inv",
+            ),
+            (
+                QKVMapping("linear_qkv.weight", "q.weight", "k.weight", "v.weight"),
+                "k.weight_scale_inv",
+            ),
+            (
+                QKVMapping("linear_qkv.weight", "q.weight", "k.weight", "v.weight"),
+                "v.weight_scale_inv",
+            ),
+        ],
+        ids=["gated-up", "qkv-k", "qkv-v"],
+    )
+    def test_load_preflight_rejects_incomplete_fp8_family_before_mutating_target(
+        self,
+        mapping,
+        missing_key: str,
+    ):
+        module = nn.Linear(128, 256, bias=False, dtype=torch.bfloat16)
+        task = SimpleNamespace(
+            mapping=mapping,
+            megatron_module=module,
+            param_name=mapping.megatron_param,
+            param_weight=module.weight,
+        )
+        state = {}
+        for source_key in mapping.hf_param.values():
+            state[source_key] = torch.ones((128, 128)).to(torch.float8_e4m3fn)
+            state[f"{source_key}_scale_inv"] = torch.ones((1, 1))
+        state.pop(missing_key)
+
+        hf_pretrained = SimpleNamespace(
+            state=state,
+            model_name_or_path="test",
+        )
+
+        with pytest.raises(ValueError, match=missing_key):
+            _FP8LoadBridge(task).load_weights_hf_to_megatron(hf_pretrained, module)
+
+        assert module.weight.dtype == torch.bfloat16
+
+    def test_load_preflight_rejects_mixed_fused_family_before_mutating_target(self):
+        mapping = GatedMLPMapping("linear_fc1.weight", "gate.weight", "up.weight")
+        module = nn.Linear(128, 256, bias=False, dtype=torch.bfloat16)
+        task = SimpleNamespace(
+            mapping=mapping,
+            megatron_module=module,
+            param_name=mapping.megatron_param,
+            param_weight=module.weight,
+        )
+        state = {
+            "gate.weight": torch.ones((128, 128)).to(torch.float8_e4m3fn),
+            "gate.weight_scale_inv": torch.ones((1, 1)),
+            "up.weight": torch.ones((128, 128), dtype=torch.bfloat16),
+        }
+
+        hf_pretrained = SimpleNamespace(state=state, model_name_or_path="test")
+
+        with pytest.raises(ValueError, match="mixes E4M3FN and non-FP8"):
+            _FP8LoadBridge(task).load_weights_hf_to_megatron(hf_pretrained, module)
+
+        assert module.weight.dtype == torch.bfloat16
+
+    def test_load_preserves_complete_gated_fp8_family_and_scale(self):
+        mapping = GatedMLPMapping("linear_fc1.weight", "gate.weight", "up.weight")
+        model = nn.Module()
+        model.add_module("linear_fc1", nn.Linear(128, 256, bias=False, dtype=torch.bfloat16))
+        task = SimpleNamespace(
+            mapping=mapping,
+            megatron_module=model,
+            param_name=mapping.megatron_param,
+            param_weight=model.linear_fc1.weight,
+        )
+        gate = torch.full((128, 128), 1.0).to(torch.float8_e4m3fn)
+        up = torch.full((128, 128), 2.0).to(torch.float8_e4m3fn)
+        state = {
+            "gate.weight": gate,
+            "gate.weight_scale_inv": torch.full((1, 1), 3.0),
+            "up.weight": up,
+            "up.weight_scale_inv": torch.full((1, 1), 4.0),
+        }
+
+        result = _FP8LoadBridge(task).load_weights_hf_to_megatron(
+            SimpleNamespace(state=state, model_name_or_path="test"),
+            model,
+        )
+
+        assert result == [model]
+        assert model.linear_fc1.weight.dtype == torch.float8_e4m3fn
+        torch.testing.assert_close(model.linear_fc1.weight, torch.cat([gate, up], dim=0))
+        torch.testing.assert_close(
+            model.linear_fc1.weight_scale_inv,
+            torch.tensor([[3.0], [4.0]]),
+        )
 
 
 class TestNamedBridgesUseGenericMixins:

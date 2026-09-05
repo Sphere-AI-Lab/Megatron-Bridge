@@ -89,6 +89,79 @@ def test_packed_layout_detection_accepts_entry_and_properties_dtype(monkeypatch:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("with_swiglu_v", [False, True])
+def test_packed_layout_detection_accepts_direct_fp8_weight_bundle(
+    monkeypatch: pytest.MonkeyPatch, with_swiglu_v: bool
+) -> None:
+    metadata = {
+        "model.layer.weight_w": SimpleNamespace(dtype=torch.float8_e4m3fn),
+        "model.layer.weight_scale_inv": SimpleNamespace(properties=SimpleNamespace(dtype=torch.float32)),
+    }
+    if with_swiglu_v:
+        metadata["model.layer.weight_v"] = SimpleNamespace(dtype=torch.float8_e4m3fn)
+    monkeypatch.setattr(modelopt_packed_restore.dist_checkpointing, "load_tensors_metadata", lambda path: metadata)
+
+    assert modelopt_packed_restore._checkpoint_uses_packed_main_weight_layout("checkpoint")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("swiglu", [False, True])
+def test_packed_layout_detection_accepts_grouped_expert_fp8_weight_bundle(
+    monkeypatch: pytest.MonkeyPatch, swiglu: bool
+) -> None:
+    linear_name = "linear_fc1" if swiglu else "linear_fc2"
+    weight_key = f"model.layer.mlp.experts.{linear_name}.weight0"
+    metadata = {
+        f"{weight_key}_scale_inv": SimpleNamespace(dtype=torch.float32),
+    }
+    if swiglu:
+        metadata[f"{weight_key}_w"] = SimpleNamespace(dtype=torch.float8_e4m3fn)
+        metadata[f"{weight_key}_v"] = SimpleNamespace(dtype=torch.float8_e4m3fn)
+    else:
+        metadata[weight_key] = SimpleNamespace(dtype=torch.float8_e4m3fn)
+    monkeypatch.setattr(modelopt_packed_restore.dist_checkpointing, "load_tensors_metadata", lambda path: metadata)
+
+    assert modelopt_packed_restore._checkpoint_uses_packed_main_weight_layout("checkpoint")
+
+
+@pytest.mark.unit
+def test_packed_layout_detection_rejects_unsupported_dense_same_key_fp8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = {
+        "model.layer.linear_fc2.weight": SimpleNamespace(dtype=torch.float8_e4m3fn),
+        "model.layer.linear_fc2.weight_scale_inv": SimpleNamespace(dtype=torch.float32),
+    }
+    monkeypatch.setattr(modelopt_packed_restore.dist_checkpointing, "load_tensors_metadata", lambda path: metadata)
+
+    assert not modelopt_packed_restore._checkpoint_uses_packed_main_weight_layout("checkpoint")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"model.layer.weight_w": SimpleNamespace(dtype=torch.float8_e4m3fn)},
+        {
+            "model.layer.weight_w": SimpleNamespace(dtype=torch.bfloat16),
+            "model.layer.weight_scale_inv": SimpleNamespace(dtype=torch.float32),
+        },
+        {
+            "model.layer.weight_w": SimpleNamespace(dtype=torch.float8_e4m3fn),
+            "model.layer.weight_v": SimpleNamespace(dtype=torch.bfloat16),
+            "model.layer.weight_scale_inv": SimpleNamespace(dtype=torch.float32),
+        },
+    ],
+)
+def test_packed_layout_detection_rejects_incomplete_or_non_fp8_weight_bundle(
+    monkeypatch: pytest.MonkeyPatch, metadata: dict[str, SimpleNamespace]
+) -> None:
+    monkeypatch.setattr(modelopt_packed_restore.dist_checkpointing, "load_tensors_metadata", lambda path: metadata)
+
+    assert not modelopt_packed_restore._checkpoint_uses_packed_main_weight_layout("checkpoint")
+
+
+@pytest.mark.unit
 def test_packed_layout_detection_ignores_uint8_non_weight_and_load_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         modelopt_packed_restore.dist_checkpointing,

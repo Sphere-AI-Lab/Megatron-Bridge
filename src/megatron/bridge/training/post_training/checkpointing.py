@@ -83,11 +83,9 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
     if not os.path.isdir(modelopt_state_path):
         return False
 
-    # orbit-seam(modelopt): the pinned MCore's dist_checkpointing.save() embeds
-    # common data as a ShardedObject("common_state") inside the torch-dist files
-    # and writes no common.pt, so a direct torch.load of that file name raised
-    # FileNotFoundError for every checkpoint this repo saves. MCore's own reader
-    # handles the layout and reads rank-locally (no process group needed).
+    # orbit-seam(modelopt): use MCore's common-state reader so detection remains
+    # independent of the physical common-state layout used by the pinned
+    # revision.
     modelopt_state = dist_checkpointing.load_common_state_dict(modelopt_state_path)
     modes = modelopt_state["modelopt_state_dict"]
     if len(modes) == 1 and modes[0][0] == "kd_loss":
@@ -97,11 +95,15 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
     return len(modes) > 0
 
 
-def load_modelopt_state(model: list[MegatronModule], checkpoint_path: str) -> None:
+def load_modelopt_state(model: list[MegatronModule], checkpoint_path: str) -> bool:
     """Load modelopt_state from a checkpoint.
+
     Args:
         model: The model to load the modelopt_state into
         checkpoint_path: Path to the checkpoint directory
+
+    Returns:
+        Whether a ModelOpt sidecar was restored.
     """
     # orbit-seam(modelopt): install the grouped-MoE ``.weight`` guards BEFORE
     # the restore below, not after it. The restore replays the checkpoint's
@@ -120,14 +122,16 @@ def load_modelopt_state(model: list[MegatronModule], checkpoint_path: str) -> No
     modelopt_checkpoint_path = _get_modelopt_checkpoint_path(checkpoint_path)
     unwrapped_model = unwrap_model(model)
 
-    # orbit-seam(modelopt): restore through the orbit reader -- the pinned MCore
-    # writes no common.pt, which ModelOpt's own restore reads by literal name.
+    # orbit-seam(modelopt): restore through the Orbit reader so this path does
+    # not depend on a private MCore common-state filename.
     from megatron.bridge.orbit.training.modelopt_checkpoint import (
         restore_sharded_modelopt_state_via_common_reader,
     )
 
-    restore_sharded_modelopt_state_via_common_reader(unwrapped_model, modelopt_checkpoint_path)
+    restored = restore_sharded_modelopt_state_via_common_reader(unwrapped_model, modelopt_checkpoint_path)
 
     # orbit-seam(modelopt): compress packed low-precision checkpoints once
     # ModelOpt state is restored.
-    _maybe_compress_restored_modelopt_model(unwrapped_model, modelopt_checkpoint_path)
+    if restored:
+        _maybe_compress_restored_modelopt_model(unwrapped_model, modelopt_checkpoint_path)
+    return restored

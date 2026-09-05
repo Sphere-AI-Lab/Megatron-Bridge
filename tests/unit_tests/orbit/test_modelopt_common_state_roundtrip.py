@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real filesystem roundtrip for the modelopt common-state layout.
+"""Real filesystem roundtrips for ModelOpt common state.
 
-The pinned MCore's ``dist_checkpointing.save()`` embeds all common (non-sharded)
-data as a ``ShardedObject("common_state")`` inside the torch-dist files and
-writes no ``common.pt``. Detection (``has_modelopt_state``) and restore used to
-open ``common.pt`` by literal filename, so every checkpoint saved by this repo
-raised FileNotFoundError on the next resume. These tests save through the real
-``dist_checkpointing.save`` -- exactly what both branches of
-``_save_sharded_modelopt_state_with_async_strategy`` call -- and read back
-through the fixed code paths. No mocks on the save/detect path.
+Megatron Core has used more than one physical common-state layout. These tests
+save through the real ``dist_checkpointing.save`` -- exactly what both branches
+of ``_save_sharded_modelopt_state_with_async_strategy`` call -- and read back
+through the layout-aware public reader. No test prescribes a private filename.
 """
 
 from pathlib import Path
@@ -66,19 +62,19 @@ def _save_modelopt_state(tmp_path: Path, modes: list) -> Path:
 
 
 @pytest.mark.unit
-def test_pinned_mcore_save_writes_no_common_pt(single_rank_process_group, tmp_path: Path) -> None:
-    """The premise of the bug: the production save call produces no common.pt."""
-    checkpoint_dir = _save_modelopt_state(tmp_path, [("quantize", {"quant_cfg": "dummy"})])
+def test_mcore_common_state_roundtrips_through_layout_aware_reader(single_rank_process_group, tmp_path: Path) -> None:
+    modes = [("quantize", {"quant_cfg": "dummy"})]
+    checkpoint_dir = _save_modelopt_state(tmp_path, modes)
 
-    assert not (checkpoint_dir / "modelopt_state" / "common.pt").exists()
+    restored = dist_checkpointing.load_common_state_dict(str(checkpoint_dir / "modelopt_state"))
+
+    assert restored["modelopt_state_dict"] == modes
+    assert restored["modelopt_version"] == "pinned-test"
 
 
 @pytest.mark.unit
-def test_detection_reads_torch_dist_embedded_common_state(single_rank_process_group, tmp_path: Path) -> None:
-    """save -> detect roundtrip on the real filesystem layout.
-
-    Under the old torch.load(common.pt) detection this raised FileNotFoundError;
-    with MCore's layout-aware reader it must simply answer True."""
+def test_detection_reads_common_state_via_mcore_reader(single_rank_process_group, tmp_path: Path) -> None:
+    """The save -> detect path remains independent of MCore's physical layout."""
     checkpoint_dir = _save_modelopt_state(tmp_path, [("quantize", {"quant_cfg": "dummy"})])
 
     assert has_modelopt_state(str(checkpoint_dir)) is True
@@ -100,7 +96,7 @@ def test_detection_returns_false_without_modelopt_state_dir(tmp_path: Path) -> N
 @pytest.mark.unit
 def test_common_reader_restore_returns_quietly_when_dir_missing(tmp_path: Path) -> None:
     """Parity with ModelOpt's own guard: no modelopt_state dir -> no-op."""
-    restore_sharded_modelopt_state_via_common_reader([torch.nn.Linear(2, 2)], str(tmp_path))
+    assert restore_sharded_modelopt_state_via_common_reader([torch.nn.Linear(2, 2)], str(tmp_path)) is False
 
 
 @pytest.mark.unit
@@ -153,12 +149,9 @@ def test_real_modelopt_quantize_compress_save_detect_restore_roundtrip(
     (real_quantize mode) is saved, detected, and restored through the fixed
     reader, and a fresh model recovers the converted + real-quantized state.
 
-    This is the reviewer's requested save -> detect -> restore filesystem
-    roundtrip. It exercises exactly what the fix changed: the pinned MCore's
-    save writes no common.pt (asserted), has_modelopt_state reads the embedded
-    common state anyway, and restore_sharded_modelopt_state_via_common_reader
-    loads common state through load_common_state_dict rather than a literal
-    common.pt open (which is what ModelOpt's own restore still does).
+    This exercises the complete save -> detect -> restore filesystem path.
+    Detection and restore load common state through MCore's layout-aware reader
+    rather than opening a private common-state filename.
     """
     import copy
 
@@ -185,12 +178,13 @@ def test_real_modelopt_quantize_compress_save_detect_restore_roundtrip(
     remove_per_module_state(modelopt_state)
     dist_checkpointing.save(modelopt_state, str(state_dir))
 
-    assert not (state_dir / "common.pt").exists(), "pinned MCore must write no common.pt"
+    saved_common_state = dist_checkpointing.load_common_state_dict(str(state_dir))
+    assert "modelopt_state_dict" in saved_common_state
     assert has_modelopt_state(str(checkpoint_dir)) is True
 
     fresh = _TinyModeloptModel()
     assert not mto.ModeloptStateManager.is_converted(fresh)
-    restore_sharded_modelopt_state_via_common_reader([fresh], str(checkpoint_dir))
+    assert restore_sharded_modelopt_state_via_common_reader([fresh], str(checkpoint_dir)) is True
 
     assert mto.ModeloptStateManager.is_converted(fresh)
     assert is_real_quantized(fresh), "restore must recover the real_quantize mode"

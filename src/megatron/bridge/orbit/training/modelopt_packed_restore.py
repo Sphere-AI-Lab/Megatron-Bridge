@@ -4,8 +4,11 @@
 
 Extracted from ``megatron.bridge.training.post_training.checkpointing``; the
 shared module keeps a marked hook in ``load_modelopt_state``. See
-``docs/orbit/UPSTREAM_SEAMS.md``.
+``docs/orbit/UPSTREAM-SEAMS.md``.
 """
+
+import logging
+import re
 
 import torch
 from megatron.core import dist_checkpointing
@@ -14,13 +17,23 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.bridge.training.post_training.checkpointing import _get_modelopt_checkpoint_path
 
 
+logger = logging.getLogger(__name__)
+
+_FP8_SPLIT_WEIGHT_RE = re.compile(r"^(?P<base>.+\.(?:weight|weight\d+))_w$")
+_GROUPED_FP8_WEIGHT_RE = re.compile(r"^(?P<base>.+\.experts\.linear_fc[12]\.weight\d+)$")
+
+
 def _checkpoint_uses_packed_main_weight_layout(checkpoint_path: str) -> bool:
     """Return whether the main checkpoint stores packed low-precision weights.
 
     Direct NVFP4 conversion writes packed ``uint8`` tensors under regular
-    ``*.weight`` keys. Those checkpoints need the restored ModelOpt module tree
-    to be compressed before DCP shape validation runs; otherwise the model still
-    emits dense BF16 ``*.weight`` entries.
+    ``*.weight`` keys. Direct FP8 conversion writes ``float8_e4m3fn`` tensors
+    under ModelOpt's ``*.weight_w`` key, with a sibling
+    ``*.weight_scale_inv`` entry (and ``*.weight_v`` for split SwiGLU).
+    Grouped-expert linears use indexed ``*.weightN`` keys, with SwiGLU FC1
+    represented as ``*.weightN_w`` and ``*.weightN_v``. Those checkpoints need
+    the restored ModelOpt module tree to be compressed before DCP shape
+    validation runs; otherwise the model still emits dense BF16 entries.
     """
     checkpoint_path = _get_modelopt_checkpoint_path(checkpoint_path)
     try:
@@ -28,12 +41,35 @@ def _checkpoint_uses_packed_main_weight_layout(checkpoint_path: str) -> bool:
     except Exception:
         return False
 
+    tensor_dtypes = {}
     for key, entry in tensors_metadata.items():
         entry_dtype = getattr(entry, "dtype", None)
         if entry_dtype is None:
             entry_dtype = getattr(getattr(entry, "properties", None), "dtype", None)
-        if str(key).endswith(".weight") and entry_dtype == torch.uint8:
+        tensor_dtypes[str(key)] = entry_dtype
+
+    for key, entry_dtype in tensor_dtypes.items():
+        if key.endswith(".weight") and entry_dtype == torch.uint8:
             return True
+
+        if entry_dtype != torch.float8_e4m3fn:
+            continue
+
+        split_match = _FP8_SPLIT_WEIGHT_RE.fullmatch(key)
+        grouped_match = _GROUPED_FP8_WEIGHT_RE.fullmatch(key)
+        if split_match is not None:
+            weight_key = split_match.group("base")
+        elif grouped_match is not None:
+            weight_key = grouped_match.group("base")
+        else:
+            continue
+        if f"{weight_key}_scale_inv" not in tensor_dtypes:
+            continue
+
+        weight_v_key = f"{weight_key}_v"
+        if weight_v_key in tensor_dtypes and tensor_dtypes[weight_v_key] != torch.float8_e4m3fn:
+            continue
+        return True
 
     return False
 
@@ -254,7 +290,7 @@ def _maybe_compress_restored_modelopt_model(
     if is_real_quantized(model[0]):
         return
 
-    print(
+    logger.info(
         "Detected packed low-precision main checkpoint layout; "
         "compressing restored ModelOpt modules before distributed weight load."
     )

@@ -80,6 +80,30 @@ class BlockFP8PreserveMixin:
             hf_to_megatron_tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
 
         hf_state_dict: Mapping[str, torch.Tensor] = hf_pretrained.state if hasattr(hf_pretrained, "state") else {}
+        from megatron.bridge.orbit.low_precision.fp8 import preflight_fp8_conversion_tasks
+
+        fp8_plan = preflight_fp8_conversion_tasks(hf_to_megatron_tasks, hf_state_dict)
+        source_shapes = {}
+        for task in hf_to_megatron_tasks:
+            if task is None:
+                continue
+            hf_param = task.mapping.hf_param
+            source_keys = (hf_param,) if isinstance(hf_param, str) else tuple(hf_param.values())
+            for source_key in source_keys:
+                source_shape = fp8_plan.source_shape(source_key)
+                if source_shape is not None:
+                    source_shapes[source_key] = source_shape
+        prevalidated_scales = {}
+        for task in hf_to_megatron_tasks:
+            if task is None or id(task) not in fp8_plan.fp8_task_ids:
+                continue
+            if task.param_weight is None:
+                raise RuntimeError(f"FP8 conversion task {task.param_name!r} has no target parameter")
+            prevalidated_scales[id(task)] = _prepare_scale_inv(
+                task,
+                hf_state_dict,
+                source_shapes=source_shapes,
+            )
 
         description = f"Loading FP8 from {hf_pretrained.model_name_or_path}"
         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
@@ -89,8 +113,13 @@ class BlockFP8PreserveMixin:
             # 1) Fetch source tensor(s)
             hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
 
-            # 2) Detect FP8
-            is_fp8 = _is_fp8(hf_weights)
+            # 2) Enforce the preflight family classification after bridge hooks.
+            is_fp8 = id(task) in fp8_plan.fp8_task_ids
+            loaded_is_fp8 = _is_fp8(hf_weights)
+            if loaded_is_fp8 != is_fp8:
+                raise TypeError(
+                    f"Loaded dtype for {task.param_name!r} disagrees with the prevalidated FP8 source family"
+                )
 
             if is_fp8 and task.param_weight is not None:
                 # --- FP8 path: set target param to FP8 so mapping won't cast ---
@@ -114,83 +143,104 @@ class BlockFP8PreserveMixin:
                     )
 
                 if is_fp8:
+                    if converted_weights.dtype != torch.float8_e4m3fn:
+                        raise TypeError(
+                            f"FP8 source family for {task.param_name!r} converted to {converted_weights.dtype}"
+                        )
                     # Direct assignment — no .copy_() which would cast.
                     task.param_weight.data = converted_weights
                     # Load + transform the associated scale_inv.
-                    self._store_scale_inv(task, hf_state_dict)
+                    self._store_scale_inv(
+                        task,
+                        hf_state_dict,
+                        source_shapes=source_shapes,
+                        prevalidated_scale=prevalidated_scales[id(task)],
+                    )
                 else:
+                    if converted_weights.dtype == torch.float8_e4m3fn:
+                        raise TypeError(f"Non-FP8 source family for {task.param_name!r} unexpectedly converted to FP8")
                     task.param_weight.data.copy_(converted_weights)
 
         self._broadcast_shared_embeddings(megatron_model)
         return megatron_model
 
-    def _store_scale_inv(self, task, hf_state_dict: Mapping[str, torch.Tensor]) -> None:
+    def _store_scale_inv(
+        self,
+        task,
+        hf_state_dict: Mapping[str, torch.Tensor],
+        *,
+        source_shapes: Mapping[str, tuple[int, ...]] | None = None,
+        prevalidated_scale: torch.Tensor | None = None,
+    ) -> None:
         """Load, merge/split, and register ``weight_scale_inv`` for one task."""
-        from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping, QKVMapping, RowParallelMapping
         from megatron.bridge.models.conversion.utils import get_module_and_param_from_name
-        from megatron.bridge.orbit.quant.fp8_utils import merge_gated_mlp_scale_inv, merge_qkv_scale_inv
 
-        mapping = task.mapping
-        tp_rank = mapping.tp_rank
-        tp_size = mapping.tp_size
-        hf_param = mapping.hf_param
-
-        # --- Load raw scale_inv(s) from HF state dict ---
-        if isinstance(mapping, QKVMapping):
-            q_s = _load_scale(hf_param["q"], hf_state_dict)
-            k_s = _load_scale(hf_param["k"], hf_state_dict)
-            v_s = _load_scale(hf_param["v"], hf_state_dict)
-            if q_s is None:
-                return
-            config = mapping._get_config(task.megatron_module)
-            merged = merge_qkv_scale_inv(config, q_s, k_s, v_s)
-            # QKV is ColumnParallel -> split dim 0
-            scale = _tp_chunk(merged, tp_size, tp_rank, dim=0)
-
-        elif isinstance(mapping, GatedMLPMapping):
-            gate_s = _load_scale(hf_param["gate"], hf_state_dict)
-            up_s = _load_scale(hf_param["up"], hf_state_dict)
-            if gate_s is None:
-                return
-            merged = merge_gated_mlp_scale_inv(gate_s, up_s)
-            # GatedMLP is ColumnParallel -> split dim 0
-            scale = _tp_chunk(merged, tp_size, tp_rank, dim=0)
-
-        elif isinstance(hf_param, str):
-            raw = _load_scale(hf_param, hf_state_dict)
-            if raw is None:
-                return
-            if isinstance(mapping, RowParallelMapping) or _is_row_parallel(mapping):
-                scale = _tp_chunk(raw, tp_size, tp_rank, dim=1)
-            else:
-                # ColumnParallel / Replicated
-                scale = _tp_chunk(raw, tp_size, tp_rank, dim=0)
-        else:
-            return
+        scale = prevalidated_scale
+        if scale is None:
+            scale = _prepare_scale_inv(task, hf_state_dict, source_shapes=source_shapes)
+        scale = scale.to(device=task.param_weight.device)
 
         # --- Register buffer on the owning module ---
         module, _ = get_module_and_param_from_name(task.megatron_module, task.param_name)
-        module.register_buffer("weight_scale_inv", scale.contiguous(), persistent=False)
-        logger.debug("Registered weight_scale_inv on %s: shape=%s", task.param_name, list(scale.shape))
+        weight_name = task.param_name.rsplit(".", 1)[-1]
+        scale_name = f"{weight_name}_scale_inv"
+        module.register_buffer(scale_name, scale.contiguous(), persistent=True)
+        logger.debug("Registered %s on %s: shape=%s", scale_name, task.param_name, list(scale.shape))
+
+
+def _prepare_scale_inv(
+    task,
+    hf_state_dict: Mapping[str, torch.Tensor],
+    *,
+    source_shapes: Mapping[str, tuple[int, ...]] | None = None,
+) -> torch.Tensor:
+    """Build and validate one task's rank-local FP8 scale before loading weights."""
+    from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping, QKVMapping, RowParallelMapping
+    from megatron.bridge.orbit.low_precision.fp8 import (
+        _canonicalize_merged_scale_inv,
+        build_merged_scale_inv_for_task,
+    )
+
+    mapping = task.mapping
+    tp_rank = mapping.tp_rank
+    tp_size = mapping.tp_size
+    merged = build_merged_scale_inv_for_task(
+        task,
+        hf_state_dict,
+        source_shapes=source_shapes,
+    )
+
+    if isinstance(mapping, (QKVMapping, GatedMLPMapping)):
+        shard_dim = 0
+    elif isinstance(mapping.hf_param, str):
+        shard_dim = 1 if isinstance(mapping, RowParallelMapping) or _is_row_parallel(mapping) else 0
+    else:
+        raise RuntimeError(f"Unsupported FP8 scale mapping for {task.param_name!r}")
+
+    _validate_tp_scale_chunk(task, tp_size, tp_rank, dim=shard_dim)
+    scale = _tp_chunk(merged, tp_size, tp_rank, dim=shard_dim)
+    return _canonicalize_merged_scale_inv(task, task.param_weight, scale)
 
 
 def _is_fp8(hf_weights) -> bool:
     """Check if the loaded HF weight(s) are FP8."""
     if isinstance(hf_weights, dict):
-        return any(w.dtype == torch.float8_e4m3fn for w in hf_weights.values())
+        if not all(isinstance(weight, torch.Tensor) for weight in hf_weights.values()):
+            raise TypeError("All members of a fused FP8 source family must be tensors")
+        source_is_fp8 = [weight.dtype == torch.float8_e4m3fn for weight in hf_weights.values()]
+        if any(source_is_fp8) and not all(source_is_fp8):
+            raise ValueError("FP8 source family mixes E4M3FN and non-FP8 tensors")
+        return bool(source_is_fp8) and all(source_is_fp8)
+    if not isinstance(hf_weights, torch.Tensor):
+        raise TypeError(f"FP8 source weight must be a tensor, got {type(hf_weights).__name__}")
     return hf_weights.dtype == torch.float8_e4m3fn
 
 
 def _load_scale(weight_key: str, hf_state_dict: Mapping[str, torch.Tensor]) -> torch.Tensor | None:
-    """Load ``weight_scale_inv`` for a given weight key, or ``None``."""
-    key = weight_key + "_scale_inv"
-    if key in hf_state_dict:
-        return hf_state_dict[key]
-    # Some checkpoints use weight_scale instead of weight_scale_inv
-    key2 = weight_key + "_scale"
-    if key2 in hf_state_dict:
-        return 1.0 / hf_state_dict[key2].float()
-    return None
+    """Load and validate ``weight_scale_inv`` for a given weight key."""
+    from megatron.bridge.orbit.low_precision.fp8 import _load_scale as _load_validated_scale
+
+    return _load_validated_scale(weight_key, hf_state_dict)
 
 
 def _tp_chunk(tensor: torch.Tensor, tp_size: int, tp_rank: int, dim: int) -> torch.Tensor:
@@ -198,6 +248,34 @@ def _tp_chunk(tensor: torch.Tensor, tp_size: int, tp_rank: int, dim: int) -> tor
     if tp_size <= 1:
         return tensor
     return torch.chunk(tensor, tp_size, dim=dim)[tp_rank]
+
+
+def _validate_tp_scale_chunk(task, tp_size: int, tp_rank: int, dim: int) -> None:
+    """Reject TP weight shards whose boundary bisects a 128-value FP8 block."""
+    if tp_size <= 1:
+        return
+
+    from megatron.bridge.orbit.quant.fp8_utils import (
+        FP8_WEIGHT_BLOCK_SIZE,
+        _validate_fp8_scale_shard_boundaries,
+    )
+
+    local_shape = tuple(int(size) for size in task.param_weight.shape)
+    if dim >= len(local_shape):
+        raise ValueError(f"Cannot shard FP8 weight with shape {local_shape} along dimension {dim}")
+    global_shape = list(local_shape)
+    global_shape[dim] *= tp_size
+    global_offset = [0] * len(local_shape)
+    global_offset[dim] = local_shape[dim] * tp_rank
+    axis_fragmentations = [1] * len(local_shape)
+    axis_fragmentations[dim] = tp_size
+    _validate_fp8_scale_shard_boundaries(
+        local_shape,
+        tuple(global_shape),
+        tuple(global_offset),
+        tuple(axis_fragmentations),
+        FP8_WEIGHT_BLOCK_SIZE,
+    )
 
 
 def _is_row_parallel(mapping) -> bool:
