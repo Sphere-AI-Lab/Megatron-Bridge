@@ -16,14 +16,17 @@
 # Generic quantized-base QOFT launcher for FP8, INT4, and NVFP4 checkpoints.
 # The architecture is detected from HF_MODEL_PATH. Run from any directory.
 #
-# Required: QUANT, HF_MODEL_PATH, MEGATRON_CKPT
-# Common: NUM_GPUS, TP, EP, PP, SP, TRAIN_ITERS, GLOBAL_BATCH_SIZE,
+# Required: QUANT, HF_MODEL_PATH, MEGATRON_CKPT, NUM_GPUS
+# Common: TP, EP, PP, SP, TRAIN_ITERS, GLOBAL_BATCH_SIZE,
 # MICRO_BATCH_SIZE, SEQ_LENGTH, OUTPUT_DIR, OFT_TYPE, BLOCK_SIZE, TARGET_MODULES
 # Advanced: DISTRIBUTED_TIMEOUT_MINUTES, LOG_INTERVAL, COFT, EPS, BLOCK_SHARE,
 # MODULE_DROPOUT, GROUP_SIZE, INT4_ACTIVE_EXPERT_CHUNK_SIZE,
 # INT4_GROUPED_CHUNK_BACKEND, SAVE_CHECKPOINTS, SAVE_INTERVAL, SKIP_TRAIN,
 # SKIP_EVAL, PROFILE_MEMORY, PROFILE_MEMORY_STEPS, DEBUG_NAN, DEBUG_NAN_STEPS,
-# MEMORY_SMOKE_TEST, EXTRA_ARGS
+# MEMORY_SMOKE_TEST
+#
+# Pass extra entrypoint arguments after an optional `--`, for example:
+#   bash scripts/orbit/run_qoft_finetune.sh -- --output-dir "/runs/INT4 smoke test"
 
 set -euo pipefail
 
@@ -49,8 +52,17 @@ export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 : "${QUANT:?set QUANT=fp8|int4|nvfp4}"
 : "${HF_MODEL_PATH:?set HF_MODEL_PATH to the HF model directory or id}"
 : "${MEGATRON_CKPT:?set MEGATRON_CKPT to the converted Megatron checkpoint}"
+: "${NUM_GPUS:?set NUM_GPUS to the positive number of local launcher processes}"
 
-NUM_GPUS="${NUM_GPUS:-4}"
+if [[ ! "${NUM_GPUS}" =~ ^0*[1-9][0-9]*$ ]]; then
+    echo "NUM_GPUS must be a positive integer; received '${NUM_GPUS}'." >&2
+    exit 1
+fi
+if [[ -n "${EXTRA_ARGS:-}" ]]; then
+    echo "EXTRA_ARGS cannot preserve shell argument boundaries; pass extra arguments after -- instead." >&2
+    exit 1
+fi
+[[ "${1:-}" == "--" ]] && shift
 
 is_true() {
     case "$1" in
@@ -112,11 +124,6 @@ if is_true "${DEBUG_NAN:-0}"; then
 fi
 is_true "${MEMORY_SMOKE_TEST:-0}" && args+=(--memory-smoke-test)
 
-if [[ -n "${EXTRA_ARGS:-}" ]]; then
-    read -r -a extra_args <<<"${EXTRA_ARGS}"
-    args+=("${extra_args[@]}")
-fi
-
 echo "======================================"
 echo "QOFT finetuning (${QUANT})"
 echo "  HF model:   ${HF_MODEL_PATH}"
@@ -124,4 +131,5 @@ echo "  checkpoint: ${MEGATRON_CKPT}"
 echo "  GPUs:       ${NUM_GPUS}"
 echo "======================================"
 
-torchrun --nproc_per_node="${NUM_GPUS}" scripts/orbit/finetune_qoft.py "${args[@]}"
+exec uv run --project "${REPO_ROOT}" python -m torch.distributed.run \
+    --nproc_per_node="${NUM_GPUS}" scripts/orbit/finetune_qoft.py "${args[@]}" "$@"

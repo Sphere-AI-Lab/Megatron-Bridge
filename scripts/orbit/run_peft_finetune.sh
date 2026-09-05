@@ -32,10 +32,13 @@
 #   HF_MODEL       - HF model id or local path           (default: meta-llama/Llama-3.2-1B)
 #   MEGATRON_CKPT  - Megatron checkpoint to finetune from
 #                    (default: ./checkpoints/<basename of HF_MODEL>)
-#   NUM_GPUS       - torchrun --nproc_per_node           (default: 1)
+#   NUM_GPUS       - local distributed process count     (default: 1)
 #   TP / PP / EP / CP - parallelism sizes                (default: 1)
 #   OUTPUT_DIR     - run directory                       (default: chosen by the entrypoint)
-#   EXTRA_ARGS     - appended verbatim to the python command
+#
+# Pass extra entrypoint arguments after an optional `--`, for example:
+#   bash scripts/orbit/run_peft_finetune.sh -- --train-iters 20 \
+#       --output-dir "/runs/OFT smoke test"
 #
 # INT4 is not covered here: its direct-checkpoint runtime needs the Orbit
 # load-patch stack. Use run_qoft_finetune.sh with QUANT=int4.
@@ -67,6 +70,16 @@ MEGATRON_CKPT="${MEGATRON_CKPT:-./checkpoints/$(basename "${HF_MODEL}")}"
 NUM_GPUS="${NUM_GPUS:-1}"
 TP="${TP:-1}"; PP="${PP:-1}"; EP="${EP:-1}"; CP="${CP:-1}"
 
+if [[ ! "${NUM_GPUS}" =~ ^0*[1-9][0-9]*$ ]]; then
+    echo "NUM_GPUS must be a positive integer; received '${NUM_GPUS}'." >&2
+    exit 1
+fi
+if [[ -n "${EXTRA_ARGS:-}" ]]; then
+    echo "EXTRA_ARGS cannot preserve shell argument boundaries; pass extra arguments after -- instead." >&2
+    exit 1
+fi
+[[ "${1:-}" == "--" ]] && shift
+
 args=(
     --model-path "${HF_MODEL}"
     --pretrained-checkpoint "${MEGATRON_CKPT}"
@@ -78,10 +91,12 @@ if [[ -n "${OUTPUT_DIR:-}" ]]; then
     args+=(--output-dir "${OUTPUT_DIR}")
 fi
 
-echo "Starting ${PEFT^^} finetuning of ${HF_MODEL} (quant=${QUANT}) on ${NUM_GPUS} GPU(s)..."
+echo "Starting ${PEFT} finetuning of ${HF_MODEL} (quant=${QUANT}) on ${NUM_GPUS} GPU(s)..."
 echo "  checkpoint: ${MEGATRON_CKPT}"
 echo "  TP=${TP} PP=${PP} EP=${EP} CP=${CP}"
 
-torchrun --nproc_per_node="${NUM_GPUS}" \
+exec uv run --project "${REPO_ROOT}" python -m torch.distributed.run \
+    --nproc_per_node="${NUM_GPUS}" \
     scripts/orbit/finetune_peft.py \
-    "${args[@]}" ${EXTRA_ARGS:-}
+    "${args[@]}" \
+    "$@"

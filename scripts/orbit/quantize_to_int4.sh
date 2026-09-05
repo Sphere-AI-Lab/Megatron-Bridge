@@ -16,13 +16,15 @@
 # Quantize a BF16 HuggingFace model's expert weights to Kimi-K2 native INT4 format.
 #
 # Usage:
-#   bash quantize_to_int4.sh <input_model> [output_model]
+#   bash quantize_to_int4.sh <input_model> [output_model] [group_size]
 #
 # Examples:
 #   bash quantize_to_int4.sh ${HF_MODEL_ROOT:-${HOME}/hf_models}/Moonlight-16B-A3B
 #   bash quantize_to_int4.sh /path/to/model /path/to/model-INT4
 
 set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # CUDA setup
 if command -v module >/dev/null 2>&1; then
@@ -40,13 +42,15 @@ if [[ -n "${CUDNN_HOME:-}" ]]; then
     export LD_LIBRARY_PATH="${CUDNN_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
-if [ $# -lt 1 ]; then
-    echo "Usage: bash quantize_to_int4.sh <input_model> [output_model]"
+if [ $# -lt 1 ] || [ $# -gt 3 ]; then
+    echo "Usage: bash quantize_to_int4.sh <input_model> [output_model] [group_size]"
     echo ""
     echo "Quantizes expert MLP weights to INT4 (Kimi-K2 native format)."
     echo "Non-expert weights (attention, norms, embeddings) stay in BF16."
     exit 1
 fi
+
+GROUP_SIZE="${3:-}"
 
 INPUT="$1"
 
@@ -63,14 +67,20 @@ echo "Input:  ${INPUT}"
 echo "Output: ${OUTPUT}"
 echo "======================================"
 
-python scripts/orbit/conversion/quantize_to_int4.py \
-    --input "${INPUT}" \
+quantize_args=(
+    run --project "${REPO_ROOT}" python "${REPO_ROOT}/scripts/orbit/conversion/quantize_to_int4.py"
+    --input "${INPUT}"
     --output "${OUTPUT}"
+)
+if [[ -n "${GROUP_SIZE}" ]]; then
+    quantize_args+=(--group-size "${GROUP_SIZE}")
+fi
+uv "${quantize_args[@]}"
 
 echo "======================================"
 echo "Done. INT4 model saved to: ${OUTPUT}"
 echo ""
 echo "Next: convert to Megatron format:"
-echo "  python scripts/orbit/conversion/convert_int4_checkpoint_direct.py \\"
-echo "      --hf-model-path ${OUTPUT} --megatron-path ./checkpoints/<name>"
+echo "  uv run --project \"${REPO_ROOT}\" python \"${REPO_ROOT}/scripts/orbit/conversion/convert_int4_checkpoint_direct.py\" \\"
+echo "      --hf-model-path \"${OUTPUT}\" --megatron-path \"./checkpoints/<name>\""
 echo "======================================"
