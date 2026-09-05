@@ -37,6 +37,7 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.orbit.low_precision.common import (
     TensorSpillManager,
+    _validate_single_rank_direct_conversion_tasks,
     add_tensor_entry,
     prepare_empty_model_state,
 )
@@ -44,6 +45,12 @@ from megatron.bridge.orbit.quant.int4_utils import (
     INT4_PACKED_SUFFIX,
     INT4_SCALE_SUFFIX,
     INT4_SHAPE_SUFFIX,
+)
+from megatron.bridge.orbit.quantized_geometry import (
+    reconstruct_swiglu_factory_geometry,
+    resolve_dense_layer_index,
+    rewrite_dense_layer_key,
+    validate_quantized_shard_geometry,
 )
 
 
@@ -66,6 +73,119 @@ class _Int4Triplet:
     packed: torch.Tensor
     scale: torch.Tensor
     shape: torch.Tensor
+
+
+def _validate_int4_triplet(triplet: _Int4Triplet, *, group_size: int, key: str) -> None:
+    """Validate one packed INT4 tensor family against its declared logical grid."""
+
+    def fail(detail: str) -> None:
+        raise ValueError(f"Invalid INT4 triplet for {key!r}: {detail}")
+
+    if group_size <= 0:
+        fail(f"group_size must be positive, got group_size={group_size}")
+    if triplet.packed.dtype != torch.int32:
+        fail(f"weight_packed dtype must be torch.int32, got {triplet.packed.dtype}")
+    if not triplet.scale.dtype.is_floating_point:
+        fail(f"weight_scale must be floating, got {triplet.scale.dtype}")
+    if not bool(torch.all(torch.isfinite(triplet.scale) & (triplet.scale > 0)).item()):
+        fail("weight_scale must be finite and positive")
+    if triplet.shape.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+        fail(f"weight_shape dtype must be integral, got {triplet.shape.dtype}")
+    if triplet.shape.dim() != 1 or triplet.shape.numel() != 2:
+        fail(f"weight_shape must be a rank-1 tensor with two values, got {tuple(triplet.shape.shape)}")
+
+    logical_dimensions: list[int] = []
+    for name, raw_value in zip(("output rows", "input width"), triplet.shape.tolist()):
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError, OverflowError):
+            fail(f"weight_shape {name} must be a positive integer, got {raw_value!r}")
+        if raw_value != value or value <= 0:
+            fail(f"weight_shape {name} must be a positive integer, got {raw_value!r}")
+        logical_dimensions.append(value)
+    logical_rows, logical_width = logical_dimensions
+
+    if triplet.packed.dim() != 2:
+        fail(f"weight_packed must be rank 2, got shape {tuple(triplet.packed.shape)}")
+    if triplet.scale.dim() != 2:
+        fail(f"weight_scale must be rank 2, got shape {tuple(triplet.scale.shape)}")
+    if logical_width % 8 != 0:
+        fail(f"logical input width {logical_width} must be divisible by 8 for INT4 packing")
+    if logical_width % group_size != 0:
+        fail(f"logical input width {logical_width} must be divisible by group_size={group_size}")
+
+    expected_packed_shape = (logical_rows, logical_width // 8)
+    if tuple(triplet.packed.shape) != expected_packed_shape:
+        fail(
+            f"weight_packed shape {tuple(triplet.packed.shape)} does not match "
+            f"logical weight_shape={(logical_rows, logical_width)}; expected {expected_packed_shape}"
+        )
+
+    expected_scale_shape = (logical_rows, logical_width // group_size)
+    if tuple(triplet.scale.shape) != expected_scale_shape:
+        fail(
+            f"weight_scale shape {tuple(triplet.scale.shape)} does not match "
+            f"logical weight_shape={(logical_rows, logical_width)} and group_size={group_size}; "
+            f"expected {expected_scale_shape}"
+        )
+
+
+def _canonicalize_int4_triplet(
+    triplet: _Int4Triplet,
+    *,
+    group_size: int,
+    scale_dtype: torch.dtype,
+    key: str,
+) -> _Int4Triplet:
+    """Return a triplet matching the strict DCP load schema exactly."""
+    if scale_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"Invalid INT4 output scale dtype for {key!r}: expected torch.float16 or torch.bfloat16, got {scale_dtype}"
+        )
+    _validate_int4_triplet(triplet, group_size=group_size, key=key)
+
+    logical_dimensions = [int(value) for value in triplet.shape.tolist()]
+    int32_max = torch.iinfo(torch.int32).max
+    if any(value > int32_max for value in logical_dimensions):
+        raise ValueError(
+            f"Invalid INT4 triplet for {key!r}: weight_shape values must fit torch.int32, got {logical_dimensions}"
+        )
+
+    canonical_scale = triplet.scale.to(dtype=scale_dtype)
+    if not bool(torch.all(torch.isfinite(canonical_scale) & (canonical_scale > 0)).item()):
+        raise ValueError(
+            f"Invalid INT4 triplet for {key!r}: weight_scale cannot be represented as "
+            f"finite positive {scale_dtype} values"
+        )
+    return _Int4Triplet(
+        packed=triplet.packed.contiguous(),
+        scale=canonical_scale.contiguous(),
+        shape=triplet.shape.to(dtype=torch.int32).contiguous(),
+    )
+
+
+def _validate_hf_int4_triplets(
+    hf_param: Any,
+    hf_triplets: Any,
+    *,
+    group_size: int,
+    fallback_key: str,
+) -> None:
+    """Validate source triplets individually, including QKV and gated inputs."""
+    if isinstance(hf_triplets, _Int4Triplet):
+        key = hf_param if isinstance(hf_param, str) else fallback_key
+        _validate_int4_triplet(hf_triplets, group_size=group_size, key=key)
+        return
+    if isinstance(hf_triplets, dict):
+        for role, triplet in hf_triplets.items():
+            source_param = hf_param.get(role) if isinstance(hf_param, dict) else None
+            source_key = source_param if isinstance(source_param, str) else f"{fallback_key}[{role}]"
+            _validate_hf_int4_triplets(
+                source_param,
+                triplet,
+                group_size=group_size,
+                fallback_key=source_key,
+            )
 
 
 def dequantize_int4(
@@ -184,6 +304,8 @@ def requantize_int4_with_scales(
     out_features, in_features = weight.shape
     if scale.dim() != 2 or scale.shape[0] != out_features or in_features % scale.shape[1] != 0:
         raise ValueError(f"scale shape {tuple(scale.shape)} does not tile weight shape {tuple(weight.shape)}")
+    if in_features % 8 != 0:
+        raise ValueError(f"in_features must be divisible by 8, got {in_features}")
     num_groups = scale.shape[1]
     group_size = in_features // num_groups
     weight_shape = torch.tensor([out_features, in_features], dtype=torch.int32)
@@ -193,7 +315,6 @@ def requantize_int4_with_scales(
     w_q = torch.round(w_grouped / s).clamp(-8, 7).view(out_features, -1)
     w_q = (w_q + 8).to(torch.uint8)
 
-    assert in_features % 8 == 0, f"in_features must be divisible by 8, got {in_features}"
     w_q_grouped = w_q.view(out_features, in_features // 8, 8).to(torch.int32)
     packed = torch.zeros(out_features, in_features // 8, dtype=torch.int32, device=weight.device)
     for i in range(8):
@@ -205,8 +326,10 @@ def requantize_int4_with_scales(
 def hf_weight_has_int4_triplet(weight_key: str, hf_state_dict: Mapping[str, torch.Tensor]) -> bool:
     if not weight_key.endswith(".weight"):
         return False
-    base = weight_key[: -len(".weight")]
-    return f"{base}.weight_packed" in hf_state_dict
+    return any(
+        f"{weight_key}{suffix}" in hf_state_dict
+        for suffix in (INT4_PACKED_SUFFIX, INT4_SCALE_SUFFIX, INT4_SHAPE_SUFFIX)
+    )
 
 
 def hf_param_uses_int4(hf_param: Any, hf_state_dict: Mapping[str, torch.Tensor]) -> bool:
@@ -274,8 +397,13 @@ def _load_hf_int4_triplet(weight_key: str, hf_state_dict: Mapping[str, torch.Ten
     packed_key = base + ".weight_packed"
     scale_key = base + ".weight_scale"
     shape_key = base + ".weight_shape"
-    if packed_key not in hf_state_dict or scale_key not in hf_state_dict or shape_key not in hf_state_dict:
+    family_keys = (packed_key, scale_key, shape_key)
+    present = [key in hf_state_dict for key in family_keys]
+    if not any(present):
         return None
+    if not all(present):
+        missing = ", ".join(key for key, is_present in zip(family_keys, present) if not is_present)
+        raise ValueError(f"Incomplete INT4 triplet for {weight_key!r}; missing: {missing}")
     return _Int4Triplet(
         packed=hf_state_dict[packed_key],
         scale=hf_state_dict[scale_key],
@@ -397,14 +525,19 @@ def build_int4_direct_model_state_dict(
     model_template: dict[str, Any],
     *,
     group_size: int,
+    scale_dtype: torch.dtype,
     spill_manager: TensorSpillManager | None = None,
 ) -> dict[str, Any]:
     """Create the prebuilt ``state_dict['model']`` for direct INT4 checkpoint save."""
     if len(meta_model) != 1:
         raise ValueError("Direct INT4 converter currently supports a single Megatron model chunk (no VP stages).")
+    if group_size <= 0:
+        raise ValueError(f"group_size must be positive, got group_size={group_size}")
+
+    conversion_tasks = int4_bridge.build_conversion_tasks(hf_pretrained, meta_model)
+    _validate_single_rank_direct_conversion_tasks(conversion_tasks, format_name="INT4")
 
     model_state = prepare_empty_model_state(model_template)
-    conversion_tasks = int4_bridge.build_conversion_tasks(hf_pretrained, meta_model)
     hf_state_dict: Mapping[str, torch.Tensor] = hf_pretrained.state
 
     num_regular = 0
@@ -414,11 +547,14 @@ def build_int4_direct_model_state_dict(
     t_start = time.monotonic()
 
     for i, task in enumerate(conversion_tasks):
-        if task is None or task.megatron_module is None:
-            continue
-
         if hf_param_uses_int4(task.mapping.hf_param, hf_state_dict):
             hf_triplets = _load_hf_int4_triplets(task.mapping.hf_param, hf_state_dict)
+            _validate_hf_int4_triplets(
+                task.mapping.hf_param,
+                hf_triplets,
+                group_size=group_size,
+                fallback_key=task.param_name,
+            )
             converted_triplet = _convert_hf_int4_triplet_for_direct_save(task, hf_triplets)
             if converted_triplet is None:
                 raise RuntimeError(
@@ -428,6 +564,12 @@ def build_int4_direct_model_state_dict(
                     f"hf_param={task.mapping.hf_param!r}. "
                     "Add a packed/scale/shape-preserving handler for this mapping."
                 )
+            converted_triplet = _canonicalize_int4_triplet(
+                converted_triplet,
+                group_size=group_size,
+                scale_dtype=scale_dtype,
+                key=task.param_name,
+            )
 
             packed = converted_triplet.packed
             scale = converted_triplet.scale
@@ -469,6 +611,8 @@ def build_int4_direct_model_state_dict(
         num_regular,
         num_int4,
     )
+    if num_int4 == 0:
+        raise RuntimeError("Direct INT4 conversion found no complete INT4 mappings in the source checkpoint")
     return model_state
 
 
@@ -553,6 +697,8 @@ def transform_sharded_state_dict_for_int4_dense(
 
     if scale_dtype is None:
         scale_dtype = torch.bfloat16
+    if group_size <= 0:
+        raise ValueError(f"INT4 group_size must be positive, got {group_size}")
 
     def _numel(shape: tuple[int, ...]) -> int:
         total = 1
@@ -584,76 +730,28 @@ def transform_sharded_state_dict_for_int4_dense(
             continue
 
         if isinstance(value, ShardedTensorFactory):
-            built_sub = value.build()
-            if isinstance(built_sub, list):
-                sub_sh_ten = built_sub[0]
-                sub_sh_tens = built_sub
-            else:
-                sub_sh_ten = next(iter(built_sub.values()))
-                sub_sh_tens = list(built_sub.values())
-
-            # Restore fused SwiGLU metadata so the checkpoint loader sees the
-            # original linear_fc1 tensor rather than the gate/up split halves.
-            sh_ten = sub_sh_ten
-            fused_local_out = value.data.shape[0]
-            split_local_out = sh_ten.local_shape[-2]
-            if split_local_out == 0 or fused_local_out % split_local_out != 0:
-                raise ValueError(
-                    f"Unexpected SwiGLU factory shapes for {key}: "
-                    f"fused local out={fused_local_out}, split local out={split_local_out}"
-                )
-            split_factor = fused_local_out // split_local_out
-            out_axis = sh_ten.prepend_axis_num
-            rank_offset = sh_ten.global_offset[out_axis] // split_local_out
-
-            axis_fragmentations_override = list(sh_ten.axis_fragmentations)
-            if all(sub.key == value.key for sub in sub_sh_tens):
-                if axis_fragmentations_override[out_axis] % split_factor != 0:
-                    raise ValueError(
-                        f"Unexpected SwiGLU factory fragmentation for {key}: "
-                        f"{axis_fragmentations_override[out_axis]} not divisible by {split_factor}"
-                    )
-                axis_fragmentations_override[out_axis] //= split_factor
-                global_out_override = sh_ten.global_shape[out_axis]
-            else:
-                global_out_override = sh_ten.global_shape[out_axis] * split_factor
-
-            local_out_override = fused_local_out
-            out_offset_override = rank_offset * fused_local_out
-            axis_fragmentations_override = tuple(axis_fragmentations_override)
+            geometry = reconstruct_swiglu_factory_geometry(value, key=key)
+            sh_ten = geometry.sharded_tensor
+            local_out_override = geometry.local_out
+            global_out_override = geometry.global_out
+            out_offset_override = geometry.out_offset
+            axis_fragmentations_override = geometry.axis_fragmentations
         else:
             sh_ten = value
             local_out_override = None
             global_out_override = None
             out_offset_override = None
             axis_fragmentations_override = sh_ten.axis_fragmentations
-        # Megatron emits linear weights in one of two layouts:
-        #   - stacked: key like "decoder.layers.self_attention.linear_proj.weight"
-        #     with prepend_axis_num=1, global_shape=(num_layers, out, in),
-        #     local_shape=(num_local_layers, out, in). One entry covers every
-        #     layer on this rank.
-        #   - per-layer: key like "decoder.layers.0.self_attention.linear_proj.weight"
-        #     with prepend_axis_num=0, global_shape=(out, in).
-        # The converter writes per-layer triplets on disk, so the stacked
-        # template has to be unrolled into one triplet set per layer index
-        # (analogous to how the expert transform unrolls the EP axis).
+        # Homogeneous TransformerBlock checkpointing keeps one local 2-D
+        # tensor per layer but prepends its global layer coordinate to DCP
+        # metadata. The converter writes per-layer triplets, so that global
+        # coordinate must replace the enclosing module's local layer index.
         prepend = sh_ten.prepend_axis_num
+        global_layer_idx = resolve_dense_layer_index(sh_ten, key=key)
         local_out = local_out_override if local_out_override is not None else sh_ten.local_shape[-2]
         local_in = sh_ten.local_shape[-1]
         global_out = global_out_override if global_out_override is not None else sh_ten.global_shape[-2]
         global_in = sh_ten.global_shape[-1]
-
-        if local_in % 8 != 0:
-            raise ValueError(f"INT4 requires in-features divisible by 8, got {local_in} for {key}")
-        if local_in % group_size != 0:
-            raise ValueError(
-                f"INT4 requires in-features divisible by group_size={group_size}, got {local_in} for {key}"
-            )
-
-        packed_in = local_in // 8
-        global_packed_in = global_in // 8
-        num_groups = local_in // group_size
-        global_num_groups = global_in // group_size
 
         weight_axis_fragmentations = tuple(axis_fragmentations_override[prepend:])
         out_offset_full = (
@@ -662,78 +760,77 @@ def transform_sharded_state_dict_for_int4_dense(
             else (sh_ten.global_offset[prepend] if len(sh_ten.global_offset) > prepend else 0)
         )
         in_offset_full = sh_ten.global_offset[prepend + 1] if len(sh_ten.global_offset) > prepend + 1 else 0
+        validate_quantized_shard_geometry(
+            key=key,
+            local_shape=(local_out, local_in),
+            global_shape=(global_out, global_in),
+            global_offset=(out_offset_full, in_offset_full),
+            axis_fragmentations=weight_axis_fragmentations,
+            packing_factor=8,
+            group_size=group_size,
+        )
 
-        has_explicit_layer_idx = _EXPLICIT_LAYER_KEY_RE.search(key) is not None
-        if prepend > 0 and not has_explicit_layer_idx:
-            # Stacked layers: emit one per-layer triplet set per local layer slot.
-            num_local_layers = sh_ten.local_shape[0]
-            layer_start = sh_ten.global_offset[prepend - 1]
-            layer_indices = [layer_start + i for i in range(num_local_layers)]
-        else:
-            layer_indices = [None]
+        packed_in = local_in // 8
+        global_packed_in = global_in // 8
+        num_groups = local_in // group_size
+        global_num_groups = global_in // group_size
 
-        for global_layer_idx in layer_indices:
-            if global_layer_idx is None:
-                ckpt_key = key
-            else:
-                ckpt_key = re.sub(r"(^|\.)layers\.", rf"\1layers.{global_layer_idx}.", key, count=1)
+        ckpt_key = rewrite_dense_layer_key(key, global_layer_idx)
+        triplets = [
+            (
+                INT4_PACKED_SUFFIX,
+                (local_out, packed_in),
+                (global_out, global_packed_in),
+                (out_offset_full, in_offset_full // 8),
+                torch.int32,
+            ),
+            (
+                INT4_SCALE_SUFFIX,
+                (local_out, num_groups),
+                (global_out, global_num_groups),
+                (out_offset_full, in_offset_full // group_size),
+                scale_dtype,
+            ),
+            (INT4_SHAPE_SUFFIX, (2,), (2,), (0,), torch.int32),
+        ]
 
-            triplets = [
-                (
-                    INT4_PACKED_SUFFIX,
-                    (local_out, packed_in),
-                    (global_out, global_packed_in),
-                    (out_offset_full, in_offset_full // 8),
-                    torch.int32,
+        for suffix, local_sh, global_sh, off, dtype in triplets:
+            alloc_bytes = _numel(local_sh) * torch.tensor(0, dtype=dtype).element_size()
+            try:
+                data = torch.empty(local_sh, dtype=dtype, device="cpu")
+            except RuntimeError as exc:
+                original_device = getattr(getattr(sh_ten, "data", None), "device", None)
+                original_device = getattr(original_device, "type", original_device)
+                raise RuntimeError(
+                    "INT4 dense transform allocation failed: "
+                    f"key={ckpt_key + suffix} "
+                    f"original_key={key} "
+                    f"local_shape={local_sh} "
+                    f"global_shape={global_sh} "
+                    f"dtype={dtype} "
+                    f"alloc_bytes={alloc_bytes} "
+                    f"cumulative_bytes_before={cumulative_allocated_bytes} "
+                    f"cumulative_bytes_with_current={cumulative_allocated_bytes + alloc_bytes} "
+                    f"original_dense_data_device={original_device}"
+                ) from exc
+            cumulative_allocated_bytes += alloc_bytes
+            axis_frags = weight_axis_fragmentations if suffix != INT4_SHAPE_SUFFIX else (1,)
+            new_sd[key + suffix] = ShardedTensor(
+                key=ckpt_key + suffix,
+                data=data,
+                dtype=dtype,
+                local_shape=local_sh,
+                global_shape=global_sh,
+                global_offset=off,
+                axis_fragmentations=axis_frags,
+                replica_id=(
+                    _replica_id_with_current_tp_rank(sh_ten.replica_id)
+                    if suffix == INT4_SHAPE_SUFFIX
+                    else sh_ten.replica_id
                 ),
-                (
-                    INT4_SCALE_SUFFIX,
-                    (local_out, num_groups),
-                    (global_out, global_num_groups),
-                    (out_offset_full, in_offset_full // group_size),
-                    scale_dtype,
-                ),
-                (INT4_SHAPE_SUFFIX, (2,), (2,), (0,), torch.int64),
-            ]
-
-            for suffix, local_sh, global_sh, off, dtype in triplets:
-                alloc_bytes = _numel(local_sh) * torch.tensor(0, dtype=dtype).element_size()
-                try:
-                    data = torch.empty(local_sh, dtype=dtype, device="cpu")
-                except RuntimeError as exc:
-                    original_device = getattr(getattr(sh_ten, "data", None), "device", None)
-                    original_device = getattr(original_device, "type", original_device)
-                    raise RuntimeError(
-                        "INT4 dense transform allocation failed: "
-                        f"key={ckpt_key + suffix} "
-                        f"original_key={key} "
-                        f"local_shape={local_sh} "
-                        f"global_shape={global_sh} "
-                        f"dtype={dtype} "
-                        f"alloc_bytes={alloc_bytes} "
-                        f"cumulative_bytes_before={cumulative_allocated_bytes} "
-                        f"cumulative_bytes_with_current={cumulative_allocated_bytes + alloc_bytes} "
-                        f"original_dense_data_device={original_device}"
-                    ) from exc
-                cumulative_allocated_bytes += alloc_bytes
-                axis_frags = weight_axis_fragmentations if suffix != INT4_SHAPE_SUFFIX else (1,)
-                new_sd[ckpt_key + suffix] = ShardedTensor(
-                    key=ckpt_key + suffix,
-                    data=data,
-                    dtype=dtype,
-                    local_shape=local_sh,
-                    global_shape=global_sh,
-                    global_offset=off,
-                    axis_fragmentations=axis_frags,
-                    replica_id=(
-                        _replica_id_with_current_tp_rank(sh_ten.replica_id)
-                        if suffix == INT4_SHAPE_SUFFIX
-                        else sh_ten.replica_id
-                    ),
-                    prepend_axis_num=0,
-                    allow_shape_mismatch=(suffix == INT4_SHAPE_SUFFIX),
-                )
-            replaced += 1
+                prepend_axis_num=0,
+            )
+        replaced += 1
 
     logger.info(
         "[INT4 dense transform] Replaced %s dense linear weight entries with INT4 triplets "

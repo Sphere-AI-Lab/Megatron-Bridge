@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,13 +17,25 @@
 These helpers operate on the canonical Kimi-K2 native INT4 triplet format:
     weight_packed:  [out, in // 8]   int32
     weight_scale:   [out, in // 32]  float16
-    weight_shape:   [2]              int64
+    weight_shape:   [2]              int32
 """
 
+import logging
 import re
 from typing import Any, Dict
 
 import torch
+
+from megatron.bridge.orbit.quantized_geometry import (
+    reconstruct_swiglu_factory_geometry,
+    resolve_expert_layer_index,
+    rewrite_dense_layer_key,
+    validate_quantized_shard_geometry,
+    validate_sharded_weight_metadata,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 # Canonical INT4 checkpoint triplet suffixes. All Orbit INT4 checkpoint
@@ -96,10 +108,13 @@ def transform_sharded_state_dict_for_int4(
     #   `weight96`, and the expected checkpoint tensor shapes remain 2D / 1D:
     #     weight96_packed: local (7168, 256), global (7168, 256), int32
     #     weight96_scale:  local (7168, 64),  global (7168, 64),  fp16
-    #     weight96_shape:  local (2,),        global (2,),         int64
+    #     weight96_shape:  local (2,),        global (2,),         int32
     #
     #   Where 256 = 2048/8 (8 INT4 values per int32), 64 = 2048/32 (one scale per group)
     from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+
+    if group_size <= 0:
+        raise ValueError(f"INT4 group_size must be positive, got {group_size}")
 
     canonical_keys = {_canonicalize_expert_key_for_checkpoint(k) for k in sharded_state_dict.keys()}
     new_sd: Dict[str, Any] = {}
@@ -141,58 +156,16 @@ def transform_sharded_state_dict_for_int4(
         # The checkpoint stores the fused gate+up weight, so we need the FUSED
         # shape — we get this from the factory's data tensor.
         if isinstance(value, ShardedTensorFactory):
-            # build() splits the fused weight into gate/up halves as ShardedTensors.
-            # We grab one to extract EP sharding metadata (prepend, offsets, etc.).
-            built_sub = value.build()
-            if isinstance(built_sub, list):
-                sub_sh_ten = built_sub[0]  # gate half
-                sub_sh_tens = built_sub
-            else:
-                sub_sh_ten = next(iter(built_sub.values()))
-                sub_sh_tens = list(built_sub.values())
-
-            # The factory sub-shards split the fused SwiGLU weight into gate/up halves.
-            # For the INT4 checkpoint we need metadata for the original fused tensor, not
-            # the split sub-shards. In the common non-singleton path, the sub-shards:
-            # - halve the local out-dimension
-            # - double the out-axis fragmentation
-            # - use out offsets in the split-tensor grid
-            #
-            # So we restore the fused local out-dimension, fused out offset, and fused
-            # out-axis fragmentation here before constructing INT4 triplets.
-            sh_ten = sub_sh_ten
-            fused_local_out = value.data.shape[0]  # fused gate+up dim
-            split_local_out = sh_ten.local_shape[-2]
-            if split_local_out == 0 or fused_local_out % split_local_out != 0:
-                raise ValueError(
-                    f"Unexpected SwiGLU factory shapes for {key}: "
-                    f"fused local out={fused_local_out}, split local out={split_local_out}"
-                )
-            split_factor = fused_local_out // split_local_out
-            out_axis = sh_ten.prepend_axis_num
-            rank_offset = sh_ten.global_offset[out_axis] // split_local_out
-
-            axis_fragmentations_override = list(sh_ten.axis_fragmentations)
-            if all(sub.key == value.key for sub in sub_sh_tens):
-                # singleton_local_shards=False: sub-shards tile the fused tensor grid.
-                if axis_fragmentations_override[out_axis] % split_factor != 0:
-                    raise ValueError(
-                        f"Unexpected SwiGLU factory fragmentation for {key}: "
-                        f"{axis_fragmentations_override[out_axis]} not divisible by {split_factor}"
-                    )
-                axis_fragmentations_override[out_axis] //= split_factor
-                fused_global_out = sh_ten.global_shape[out_axis]
-            else:
-                # singleton_local_shards=True: keys are split, so rebuild the fused grid.
-                fused_global_out = sh_ten.global_shape[out_axis] * split_factor
-
-            local_out_override = fused_local_out
-            global_out_override = fused_global_out
-            out_offset_override = rank_offset * fused_local_out
-            axis_fragmentations_override = tuple(axis_fragmentations_override)
+            geometry = reconstruct_swiglu_factory_geometry(value, key=key)
+            sh_ten = geometry.sharded_tensor
+            local_out_override = geometry.local_out
+            global_out_override = geometry.global_out
+            out_offset_override = geometry.out_offset
+            axis_fragmentations_override = geometry.axis_fragmentations
             local_in = sh_ten.local_shape[-1]
         elif isinstance(value, ShardedTensor):
             sh_ten = value
+            validate_sharded_weight_metadata(sh_ten, key=key)
             local_out_override = None
             global_out_override = None
             out_offset_override = None
@@ -210,13 +183,6 @@ def transform_sharded_state_dict_for_int4(
         global_out = global_out_override if global_out_override is not None else sh_ten.global_shape[-2]
         global_in = sh_ten.global_shape[-1]
 
-        # INT4 packed: 8 INT4 values packed into one int32 along in-features dim
-        packed_in = local_in // 8  # e.g. 2048 / 8 = 256
-        global_packed_in = global_in // 8
-        # Scale: one fp16 scale value per group of `group_size` elements
-        num_groups = local_in // group_size  # e.g. 2048 / 32 = 64
-        global_num_groups = global_in // group_size
-
         # Weight dim offsets (after any prepended axes). Usually 0 for TP=1.
         out_offset = out_offset_override if out_offset_override is not None else sh_ten.global_offset[prepend]
         in_offset = sh_ten.global_offset[prepend + 1] if len(sh_ten.global_offset) > prepend + 1 else 0
@@ -226,8 +192,25 @@ def transform_sharded_state_dict_for_int4(
         # 1. drop the prepended expert axis from shapes/fragmentations/offsets
         # 2. rewrite the checkpoint key to the global expert index on this rank
         weight_axis_fragmentations = axis_fragmentations_override[prepend:]
+        validate_quantized_shard_geometry(
+            key=key,
+            local_shape=(local_out, local_in),
+            global_shape=(global_out, global_in),
+            global_offset=(out_offset, in_offset),
+            axis_fragmentations=weight_axis_fragmentations,
+            packing_factor=8,
+            group_size=group_size,
+        )
+
+        # INT4 packed: 8 INT4 values packed into one int32 along in-features dim.
+        packed_in = local_in // 8
+        global_packed_in = global_in // 8
+        num_groups = local_in // group_size
+        global_num_groups = global_in // group_size
         expert_global_idx = sh_ten.global_offset[prepend - 1] if prepend > 0 else int(m.group(2))
-        ckpt_key = re.sub(r"weight\d+$", f"weight{expert_global_idx}", canonical_key)
+        global_layer_idx = resolve_expert_layer_index(sh_ten, key=canonical_key)
+        checkpoint_base_key = rewrite_dense_layer_key(canonical_key, global_layer_idx)
+        ckpt_key = re.sub(r"weight\d+$", f"weight{expert_global_idx}", checkpoint_base_key)
 
         # Build (suffix, local_shape, global_shape, global_offset, dtype) for each triplet.
         # local_shape is 2D (or 1D for shape), and global_shape matches the
@@ -251,8 +234,8 @@ def transform_sharded_state_dict_for_int4(
                 weight_axis_fragmentations,
                 scale_dtype,
             ),
-            # weight_shape: [2] int64 — original (out, in) dimensions
-            (INT4_SHAPE_SUFFIX, (2,), (2,), (0,), (1,), torch.int64),
+            # weight_shape: [2] int32 — original (out, in) dimensions
+            (INT4_SHAPE_SUFFIX, (2,), (2,), (0,), (1,), torch.int32),
         ]
 
         for suffix, local_sh, global_sh, off, axis_frags, dtype in triplets:
@@ -270,7 +253,6 @@ def transform_sharded_state_dict_for_int4(
                 axis_fragmentations=axis_frags,
                 replica_id=sh_ten.replica_id,
                 prepend_axis_num=0,
-                allow_shape_mismatch=True,  # shape tensor (2,) vs global (384, 2)
             )
             new_sd[canonical_key + suffix] = new_sh_ten
 
@@ -349,4 +331,8 @@ def register_int4_buffers_after_load(
         if base_w is not None and hasattr(base_w, "data"):
             base_w.data = _empty_storage_view(base_w.data)
 
-    print(f"Registered INT4 buffers for {registered} expert weights, freed {len(freed_modules)} base weight tensors")
+    logger.info(
+        "Registered INT4 buffers for %d expert weights, freed %d base weight tensors",
+        registered,
+        len(freed_modules),
+    )

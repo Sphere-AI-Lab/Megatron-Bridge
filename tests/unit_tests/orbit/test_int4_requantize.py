@@ -62,6 +62,13 @@ class TestScaleReuseRoundTrip:
         with pytest.raises(ValueError, match="does not tile"):
             requantize_int4_with_scales(w, torch.ones(4, 2, dtype=torch.bfloat16))
 
+    def test_pack_width_validation_is_not_an_optimized_away_assert(self):
+        weight = torch.randn(2, 10, dtype=torch.bfloat16)
+        scale = torch.ones(2, 2, dtype=torch.bfloat16)
+
+        with pytest.raises(ValueError, match="in_features must be divisible by 8, got 10"):
+            requantize_int4_with_scales(weight, scale)
+
     def test_group128_layout(self):
         packed, scale, shape, _ = _triplet_with_full_range(out_f=8, in_f=512, group=128)
         deq = dequantize_int4(packed, scale, shape)

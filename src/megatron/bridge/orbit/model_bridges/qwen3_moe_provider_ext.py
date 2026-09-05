@@ -11,23 +11,26 @@ of editing the upstream base class.
 """
 
 
+def apply_qwen3_moe_orbit_provider_settings(provider, hf_config):
+    """Apply Orbit's Qwen3-MoE runtime layout to an actual model provider."""
+    provider.moe_router_dtype = "fp32"
+
+    decoder_sparse_step = getattr(hf_config, "decoder_sparse_step", 1) or 0
+    mlp_only_layers = set(getattr(hf_config, "mlp_only_layers", []) or [])
+    if getattr(hf_config, "num_experts", 0) > 0 and decoder_sparse_step > 0:
+        provider.moe_layer_freq = [
+            1 if (layer_idx not in mlp_only_layers) and (layer_idx + 1) % decoder_sparse_step == 0 else 0
+            for layer_idx in range(hf_config.num_hidden_layers)
+        ]
+    else:
+        provider.moe_layer_freq = [0] * hf_config.num_hidden_layers
+
+    return provider
+
+
 class Qwen3MoEOrbitProviderMixin:
     """Mixed in before ``Qwen3MoEBridge`` to adjust the generated provider."""
 
     def provider_bridge(self, hf_pretrained):
         provider = super().provider_bridge(hf_pretrained)
-        hf_config = hf_pretrained.config
-
-        provider.moe_router_dtype = "fp32"
-
-        decoder_sparse_step = getattr(hf_config, "decoder_sparse_step", 1) or 0
-        mlp_only_layers = set(getattr(hf_config, "mlp_only_layers", []) or [])
-        if getattr(hf_config, "num_experts", 0) > 0 and decoder_sparse_step > 0:
-            provider.moe_layer_freq = [
-                1 if (layer_idx not in mlp_only_layers) and (layer_idx + 1) % decoder_sparse_step == 0 else 0
-                for layer_idx in range(hf_config.num_hidden_layers)
-            ]
-        else:
-            provider.moe_layer_freq = [0] * hf_config.num_hidden_layers
-
-        return provider
+        return apply_qwen3_moe_orbit_provider_settings(provider, hf_pretrained.config)

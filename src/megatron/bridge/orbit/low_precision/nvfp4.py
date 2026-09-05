@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import re
 import time
 from copy import deepcopy
@@ -38,18 +39,26 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.orbit.low_precision.common import (
     TensorSpillManager,
+    _validate_single_rank_direct_conversion_tasks,
     add_tensor_entry,
     prepare_empty_model_state,
 )
 
 # INT4 is the structural reference for the NVFP4 dist-ckpt load path; reuse the
-# byte-identical helpers (replica-id tag, payload extractor) and the
-# per-layer-key regex so the two paths stay in lockstep.
+# byte-identical replica-id and loaded-payload helpers.
 from megatron.bridge.orbit.low_precision.int4 import (
-    _EXPLICIT_LAYER_KEY_RE,
     _loaded_tensor_payload,
     _replica_id_with_current_tp_rank,
 )
+from megatron.bridge.orbit.quantized_geometry import (
+    reconstruct_swiglu_factory_geometry,
+    resolve_dense_layer_index,
+    rewrite_dense_layer_key,
+    validate_quantized_shard_geometry,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -61,6 +70,7 @@ __all__ = [
     "collect_nvfp4_target_module_names",
     "dequantize_nvfp4",
     "extract_nvfp4_weight_bundle",
+    "extract_nvfp4_weight_bundle_if_present",
     "hf_param_uses_nvfp4",
     "is_nvfp4_source",
     "is_nvfp4_weight_mapping",
@@ -68,11 +78,20 @@ __all__ = [
     "quantize_to_nvfp4",
     "register_nvfp4_buffers_after_load_dense",
     "scale_to_amax",
+    "preflight_nvfp4_source_families",
     "transform_sharded_state_dict_for_nvfp4_dense",
+    "validate_nvfp4_weight_bundle",
 ]
 
 NVFP4_GROUP_SIZE = 16
 NVFP4_AMAX_SCALE = 6.0 * 448.0
+_NVFP4_FP8_MIN_POSITIVE = 2.0**-9
+_NVFP4_FP32_MIN_POSITIVE = torch.finfo(torch.float32).tiny
+# E4M3 has three explicit mantissa bits. Round-to-nearest therefore has a
+# maximum normal-range relative error of half an ULP, 2**-(3 + 1) = 6.25%.
+# Fixed packed weights cannot tolerate a larger scale change: their decoded
+# values are multiplied directly by weight_scale * weight_scale_2.
+_NVFP4_FP8_MAX_RELATIVE_ERROR = 2.0**-4
 _MEGATRON_WEIGHT_KEY_RE = re.compile(r"^(?P<prefix>.+)\.weight(?P<expert_idx>\d+)?$")
 _SPLIT_SWIGLU_LAYOUT_FACTORY = "factory"
 _SPLIT_SWIGLU_LAYOUT_SPLIT_KEYS = "split_keys"
@@ -85,6 +104,185 @@ _DENSE_NVFP4_WEIGHT_RE = re.compile(r"^(?P<module>.+)\.weight$")
 # narrower semantics: this one matches `experts.linear_fc1.weight` (no digit),
 # `experts.linear_fc2.weight0`, `experts.linear_fc1.weight5_w`, etc.
 _EXPERT_KEY_EXCLUDE_RE = re.compile(r"\.experts\.linear_fc[12]\.weight\d*(_[wv])?$")
+
+
+def _nvfp4_source_bundle_keys(weight_key: str, *, require_input_scale: bool) -> dict[str, str]:
+    if not weight_key.endswith(".weight"):
+        raise ValueError(f"Expected an NVFP4 weight key ending in '.weight', got {weight_key!r}")
+    module_prefix = weight_key[: -len(".weight")]
+    keys = {
+        "weight": weight_key,
+        "weight_scale": f"{weight_key}_scale",
+        "weight_scale_2": f"{weight_key}_scale_2",
+    }
+    if require_input_scale:
+        keys["input_scale"] = f"{module_prefix}.input_scale"
+    return keys
+
+
+def _validate_nvfp4_scale_grid(
+    scale: torch.Tensor,
+    *,
+    key: str,
+    packed_rows: int,
+    packed_columns: int,
+) -> None:
+    if scale.dtype != torch.float8_e4m3fn:
+        raise TypeError(
+            f"Invalid NVFP4 bundle for {key!r}: weight_scale must have dtype float8_e4m3fn, got {scale.dtype}"
+        )
+    if scale.ndim != 2:
+        raise ValueError(f"Invalid NVFP4 bundle for {key!r}: weight_scale must have rank 2, got {tuple(scale.shape)}")
+    if scale.shape[0] <= 0 or scale.shape[1] <= 0:
+        raise ValueError(
+            f"Invalid NVFP4 bundle for {key!r}: weight_scale dimensions must be positive, got {tuple(scale.shape)}"
+        )
+    if packed_rows != scale.shape[0]:
+        raise ValueError(
+            f"Invalid NVFP4 bundle for {key!r}: packed and scale rows differ ({packed_rows} != {scale.shape[0]})"
+        )
+    if packed_columns != scale.shape[1] * (NVFP4_GROUP_SIZE // 2):
+        raise ValueError(
+            f"Invalid NVFP4 bundle for {key!r}: packed columns {packed_columns} must equal "
+            f"weight_scale columns {scale.shape[1]} * 8"
+        )
+    scale_f32 = scale.float()
+    if not bool(torch.all(torch.isfinite(scale_f32)).item()):
+        raise ValueError(f"Invalid NVFP4 bundle for {key!r}: weight_scale values must be finite")
+    if not bool(torch.all(scale_f32 > 0).item()):
+        raise ValueError(f"Invalid NVFP4 bundle for {key!r}: weight_scale values must be positive")
+
+
+def validate_nvfp4_weight_bundle(
+    bundle: Mapping[str, torch.Tensor],
+    *,
+    key: str,
+    require_input_scale: bool,
+) -> None:
+    """Validate the canonical ModelOpt NVFP4 tensor family."""
+
+    required = {"weight", "weight_scale", "weight_scale_2"}
+    if require_input_scale:
+        required.add("input_scale")
+    missing = sorted(required.difference(bundle))
+    if missing:
+        raise ValueError(f"Incomplete NVFP4 bundle for {key!r}; missing fields: {', '.join(missing)}")
+
+    for field in required:
+        if not isinstance(bundle[field], torch.Tensor):
+            raise TypeError(
+                f"Invalid NVFP4 bundle for {key!r}: {field} must be a torch.Tensor, got {type(bundle[field]).__name__}"
+            )
+
+    packed = bundle["weight"]
+    scale = bundle["weight_scale"]
+    if packed.dtype != torch.uint8:
+        raise TypeError(f"Invalid NVFP4 bundle for {key!r}: weight must have dtype uint8, got {packed.dtype}")
+    if packed.ndim != 2:
+        raise ValueError(f"Invalid NVFP4 bundle for {key!r}: weight must have rank 2, got {tuple(packed.shape)}")
+    if packed.shape[0] <= 0 or packed.shape[1] <= 0:
+        raise ValueError(
+            f"Invalid NVFP4 bundle for {key!r}: weight dimensions must be positive, got {tuple(packed.shape)}"
+        )
+
+    _validate_nvfp4_scale_grid(
+        scale,
+        key=key,
+        packed_rows=packed.shape[0],
+        packed_columns=packed.shape[1],
+    )
+
+    scalar_fields = ["weight_scale_2"]
+    if require_input_scale or "input_scale" in bundle:
+        scalar_fields.append("input_scale")
+    for field in scalar_fields:
+        scalar = bundle[field]
+        if not isinstance(scalar, torch.Tensor):
+            raise TypeError(f"Invalid NVFP4 bundle for {key!r}: {field} must be a torch.Tensor")
+        if scalar.dtype != torch.float32:
+            raise TypeError(f"Invalid NVFP4 bundle for {key!r}: {field} must have dtype float32, got {scalar.dtype}")
+        if scalar.ndim != 0:
+            raise ValueError(
+                f"Invalid NVFP4 bundle for {key!r}: {field} must be exactly scalar, got {tuple(scalar.shape)}"
+            )
+        value = float(scalar.item())
+        if not torch.isfinite(scalar).item():
+            raise ValueError(f"Invalid NVFP4 bundle for {key!r}: {field} must be finite, got {value}")
+        if value <= 0.0:
+            raise ValueError(f"Invalid NVFP4 bundle for {key!r}: {field} must be positive, got {value}")
+
+
+def _classify_nvfp4_weight_family(
+    weight_key: str,
+    hf_state_dict: Mapping[str, torch.Tensor],
+    *,
+    available_keys: set[str] | None,
+    require_input_scale: bool,
+    inspect_packed_dtype: bool,
+) -> bool:
+    """Return whether a family is complete, raising for every partial family."""
+
+    expected = _nvfp4_source_bundle_keys(weight_key, require_input_scale=require_input_scale)
+    keys = set(hf_state_dict.keys()) if available_keys is None else available_keys
+    present = {field: source_key in keys for field, source_key in expected.items()}
+    has_quantized_marker = (
+        present["weight_scale"] or present["weight_scale_2"] or (require_input_scale and present["input_scale"])
+    )
+    if not has_quantized_marker and present["weight"] and inspect_packed_dtype:
+        has_quantized_marker = _source_weight_is_uint8(hf_state_dict, weight_key)
+    if not has_quantized_marker:
+        return False
+    missing = [expected[field] for field, is_present in present.items() if not is_present]
+    if missing:
+        raise ValueError(f"Incomplete NVFP4 bundle for {weight_key!r}; missing: {', '.join(missing)}")
+    return True
+
+
+def _source_weight_is_uint8(hf_state_dict: Mapping[str, torch.Tensor], weight_key: str) -> bool:
+    """Read safetensors dtype metadata without materializing a potentially huge weight."""
+
+    source = getattr(hf_state_dict, "source", None)
+    from megatron.bridge.models.hf_pretrained.state import SafeTensorsStateSource
+
+    if isinstance(source, SafeTensorsStateSource):
+        from safetensors import safe_open
+
+        filename = source.key_to_filename_map.get(weight_key)
+        if filename is not None:
+            with safe_open(source.path / filename, framework="pt", device="cpu") as handle:
+                dtype_name = handle.get_slice(weight_key).get_dtype()
+            return dtype_name in {"U8", "uint8", "torch.uint8"}
+    return hf_state_dict[weight_key].dtype == torch.uint8
+
+
+def preflight_nvfp4_source_families(
+    hf_state_dict: Mapping[str, torch.Tensor],
+    *,
+    require_input_scale: bool,
+) -> None:
+    """Reject every partial NVFP4 family before conversion mutates a model."""
+
+    keys = set(hf_state_dict.keys())
+    candidates = {key for key in keys if key.endswith(".weight")}
+    candidates.update(key[: -len("_scale")] for key in keys if key.endswith(".weight_scale"))
+    candidates.update(key[: -len("_scale_2")] for key in keys if key.endswith(".weight_scale_2"))
+    if require_input_scale:
+        candidates.update(f"{key[: -len('.input_scale')]}.weight" for key in keys if key.endswith(".input_scale"))
+    for weight_key in sorted(candidates):
+        if not _classify_nvfp4_weight_family(
+            weight_key,
+            hf_state_dict,
+            available_keys=keys,
+            require_input_scale=require_input_scale,
+            inspect_packed_dtype=True,
+        ):
+            continue
+        extract_nvfp4_weight_bundle(
+            weight_key,
+            hf_state_dict,
+            available_keys=keys,
+            require_input_scale=require_input_scale,
+        )
 
 
 # NVFP4 dequant: e2m1 lookup (matches NVIDIA's standard NVFP4 / e2m1 encoding).
@@ -188,43 +386,69 @@ def quantize_to_nvfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor,
 
     from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
 
+    # ModelOpt uses this scale as a divisor.  An all-zero weight has a true
+    # scale of zero, but zero is neither a valid divisor nor a loadable
+    # canonical NVFP4 scalar.  The smallest positive normal FP32 value keeps
+    # the zero-weight dequantization exact without coarsening nonzero weights.
     scale_2 = (weight.float().abs().amax() / NVFP4_AMAX_SCALE).to(torch.float32)
-    try:
-        qt, scale, scale_2 = NVFP4QTensor.quantize(
-            weight,
-            block_size=NVFP4_GROUP_SIZE,
-            weights_scaling_factor_2=scale_2,
-        )
-    except TypeError:
-        qt, scale = NVFP4QTensor.quantize(
-            weight,
-            block_sizes={-1: NVFP4_GROUP_SIZE},
-            weights_scaling_factor_2=scale_2,
-        )
-    packed = qt._quantized_data
+    scale_2 = scale_2.clamp_min(_NVFP4_FP32_MIN_POSITIVE)
+    if weight.is_cuda:
+        try:
+            qt, scale, scale_2 = NVFP4QTensor.quantize(
+                weight,
+                block_size=NVFP4_GROUP_SIZE,
+                weights_scaling_factor_2=scale_2,
+            )
+        except TypeError:
+            qt, scale = NVFP4QTensor.quantize(
+                weight,
+                block_sizes={-1: NVFP4_GROUP_SIZE},
+                weights_scaling_factor_2=scale_2,
+            )
+        packed = qt._quantized_data
+    else:
+        # ModelOpt 0.44 probes CUDA capability before checking whether the
+        # tensor is CUDA-backed. Execute its pure-Torch fallback directly.
+        scale, scale_2 = NVFP4QTensor.get_weights_scaling_factor(weight, NVFP4_GROUP_SIZE, scale_2)
+        reshaped_weight = weight.view(*weight.shape[:-1], -1, NVFP4_GROUP_SIZE)
+        scaled_weight = reshaped_weight / ((scale.to(torch.float32) * scale_2).unsqueeze(-1))
+        fp4_values = NVFP4QTensor._cast_fp4(scaled_weight.view(weight.shape))
+        packed = (fp4_values[..., 1::2] << 4) | fp4_values[..., 0::2]
     if packed.dtype != torch.uint8:
         raise RuntimeError(f"modelopt returned packed dtype {packed.dtype}, expected uint8")
 
-    shape = torch.tensor([out_features, in_features], dtype=torch.int64, device=weight.device)
-    return packed.contiguous(), scale.contiguous(), scale_2.contiguous(), shape
-
-
-def _hf_weight_has_nvfp4_bundle(weight_key: str, hf_state_dict: Mapping[str, torch.Tensor]) -> bool:
-    if not weight_key.endswith(".weight"):
-        return False
-    return (
-        weight_key in hf_state_dict
-        and f"{weight_key}_scale" in hf_state_dict
-        and f"{weight_key}_scale_2" in hf_state_dict
+    # FP8 E4M3 has no subnormals below 2**-9.  Normalize empty blocks to the
+    # smallest representable positive scale so the producer and strict loader
+    # agree on a single canonical representation for all-zero blocks.
+    scale = scale.float().clamp_min(_NVFP4_FP8_MIN_POSITIVE).to(torch.float8_e4m3fn).contiguous()
+    scale_2 = scale_2.reshape(()).to(torch.float32).clamp_min(_NVFP4_FP32_MIN_POSITIVE).contiguous()
+    validate_nvfp4_weight_bundle(
+        {"weight": packed, "weight_scale": scale, "weight_scale_2": scale_2},
+        key="quantize_to_nvfp4.weight",
+        require_input_scale=False,
     )
+
+    shape = torch.tensor([out_features, in_features], dtype=torch.int64, device=weight.device)
+    return packed.contiguous(), scale, scale_2, shape
 
 
 def hf_param_uses_nvfp4(hf_param: Any, hf_state_dict: Mapping[str, torch.Tensor]) -> bool:
     """Return True if any HF weight key in ``hf_param`` has an NVFP4 bundle."""
     if isinstance(hf_param, str):
-        return _hf_weight_has_nvfp4_bundle(hf_param, hf_state_dict)
+        if not hf_param.endswith(".weight"):
+            return False
+        return _classify_nvfp4_weight_family(
+            hf_param,
+            hf_state_dict,
+            available_keys=None,
+            require_input_scale=True,
+            inspect_packed_dtype=True,
+        )
     if isinstance(hf_param, dict):
-        return any(hf_param_uses_nvfp4(value, hf_state_dict) for value in hf_param.values())
+        statuses = [hf_param_uses_nvfp4(value, hf_state_dict) for value in hf_param.values()]
+        if any(statuses) and not all(statuses):
+            raise ValueError("Mixed NVFP4/dense fused mappings are unsupported")
+        return all(statuses)
     return False
 
 
@@ -333,31 +557,23 @@ def is_nvfp4_source(hf_config: Any) -> bool:
     return "nvfp4" in {algo, fmt} or ("modelopt" in method and "nvfp4" in algo)
 
 
-def extract_nvfp4_weight_bundle(
+def extract_nvfp4_weight_bundle_if_present(
     weight_key: str,
     hf_state_dict: Mapping[str, torch.Tensor],
     *,
     available_keys: set[str] | None = None,
-) -> dict[str, torch.Tensor]:
-    """Collect the NVFP4 tensor bundle associated with one HF weight key."""
-    if not weight_key.endswith(".weight"):
-        raise ValueError(f"Expected a weight key ending in '.weight', got: {weight_key}")
-
-    module_prefix = weight_key[: -len(".weight")]
-    bundle: dict[str, torch.Tensor] = {}
-    missing = []
-    expected_keys = {
-        "weight": weight_key,
-        "weight_scale": f"{weight_key}_scale",
-        "weight_scale_2": f"{weight_key}_scale_2",
-        "input_scale": f"{module_prefix}.input_scale",
-    }
-
-    if available_keys is not None:
-        missing = [key for key in expected_keys.values() if key not in available_keys]
-
-    if missing:
-        raise KeyError(f"Missing NVFP4 bundle tensors for {weight_key}: {', '.join(missing)}")
+    require_input_scale: bool = True,
+) -> dict[str, torch.Tensor] | None:
+    """Collect and validate an NVFP4 family, or return ``None`` for a dense weight."""
+    expected_keys = _nvfp4_source_bundle_keys(weight_key, require_input_scale=require_input_scale)
+    if not _classify_nvfp4_weight_family(
+        weight_key,
+        hf_state_dict,
+        available_keys=available_keys,
+        require_input_scale=require_input_scale,
+        inspect_packed_dtype=True,
+    ):
+        return None
 
     keys_to_load = list(expected_keys.values())
     if hasattr(hf_state_dict, "source") and hasattr(hf_state_dict.source, "load_tensors"):
@@ -367,29 +583,35 @@ def extract_nvfp4_weight_bundle(
 
     missing = [key for key in keys_to_load if key not in loaded_by_key]
     if missing:
-        raise KeyError(f"Missing NVFP4 bundle tensors for {weight_key}: {', '.join(missing)}")
+        raise ValueError(f"Incomplete NVFP4 bundle for {weight_key!r}; missing: {', '.join(missing)}")
 
-    for bundle_name, key in expected_keys.items():
-        bundle[bundle_name] = loaded_by_key[key]
+    bundle = {bundle_name: loaded_by_key[key] for bundle_name, key in expected_keys.items()}
+    validate_nvfp4_weight_bundle(
+        bundle,
+        key=weight_key,
+        require_input_scale=require_input_scale,
+    )
 
     return bundle
 
 
-def _has_nvfp4_weight_bundle_keys(
+def extract_nvfp4_weight_bundle(
     weight_key: str,
-    available_keys: set[str],
-) -> bool:
-    if not weight_key.endswith(".weight"):
-        return False
-
-    module_prefix = weight_key[: -len(".weight")]
-    expected_keys = (
+    hf_state_dict: Mapping[str, torch.Tensor],
+    *,
+    available_keys: set[str] | None = None,
+    require_input_scale: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Collect the NVFP4 tensor bundle associated with one HF weight key."""
+    bundle = extract_nvfp4_weight_bundle_if_present(
         weight_key,
-        f"{weight_key}_scale",
-        f"{weight_key}_scale_2",
-        f"{module_prefix}.input_scale",
+        hf_state_dict,
+        available_keys=available_keys,
+        require_input_scale=require_input_scale,
     )
-    return all(key in available_keys for key in expected_keys)
+    if bundle is None:
+        raise ValueError(f"No NVFP4 tensor family found for {weight_key!r}")
+    return bundle
 
 
 def scale_to_amax(scale: torch.Tensor) -> torch.Tensor:
@@ -549,13 +771,14 @@ def build_megatron_nvfp4_weight_entries(
     """
     weight_key, weight_prefix, expert_idx = _split_megatron_weight_key(megatron_weight_key)
 
-    required = {"weight", "weight_scale", "weight_scale_2", "input_scale"}
-    missing = required.difference(bundle)
-    if missing:
-        raise KeyError(f"Missing NVFP4 bundle fields for {megatron_weight_key}: {', '.join(sorted(missing))}")
+    validate_nvfp4_weight_bundle(
+        bundle,
+        key=megatron_weight_key,
+        require_input_scale=True,
+    )
 
-    weight_scale_2 = bundle["weight_scale_2"].reshape(()).to(torch.float32)
-    input_scale = bundle["input_scale"].reshape(()).to(torch.float32)
+    weight_scale_2 = bundle["weight_scale_2"]
+    input_scale = bundle["input_scale"]
 
     names = nvfp4_quantizer_entry_names(weight_prefix, expert_idx)
     return {
@@ -642,42 +865,42 @@ def is_nvfp4_weight_mapping(
     hf_state_dict: Mapping[str, torch.Tensor],
     *,
     available_keys: set[str] | None = None,
+    inspect_packed_dtype: bool = False,
 ) -> bool:
     """Return whether the mapping can be satisfied from NVFP4 HF tensor bundles."""
     if isinstance(hf_param, str):
         if not hf_param.endswith(".weight"):
             return False
-        if available_keys is not None:
-            return _has_nvfp4_weight_bundle_keys(hf_param, available_keys)
-        try:
-            extract_nvfp4_weight_bundle(
-                hf_param,
-                hf_state_dict,
-                available_keys=available_keys,
-            )
-        except (KeyError, ValueError):
-            return False
-        return True
+        return _classify_nvfp4_weight_family(
+            hf_param,
+            hf_state_dict,
+            available_keys=available_keys,
+            require_input_scale=True,
+            inspect_packed_dtype=inspect_packed_dtype,
+        )
 
     if not hf_param:
         return False
 
+    statuses = []
     for source_weight_key in hf_param.values():
         if not source_weight_key.endswith(".weight"):
             return False
-        if available_keys is not None:
-            if not _has_nvfp4_weight_bundle_keys(source_weight_key, available_keys):
-                return False
-            continue
-        try:
-            extract_nvfp4_weight_bundle(
+        statuses.append(
+            _classify_nvfp4_weight_family(
                 source_weight_key,
                 hf_state_dict,
                 available_keys=available_keys,
+                require_input_scale=True,
+                inspect_packed_dtype=inspect_packed_dtype,
             )
-        except (KeyError, ValueError):
-            return False
-    return True
+        )
+    if any(statuses) and not all(statuses):
+        missing = [key for key, complete in zip(hf_param.values(), statuses) if not complete]
+        raise ValueError(
+            f"Mixed NVFP4/dense fused mapping is unsupported; missing NVFP4 bundles for: {', '.join(missing)}"
+        )
+    return all(statuses)
 
 
 def shared_scalar_from_bundles(
@@ -692,7 +915,7 @@ def shared_scalar_from_bundles(
 
     for name, bundle in bundles.items():
         candidate = bundle[field].reshape(()).to(torch.float32)
-        if not torch.allclose(candidate, shared):
+        if not torch.equal(candidate, shared):
             raise ValueError(
                 f"NVFP4 fused mapping for {megatron_weight_key} requires a shared global scale for "
                 f"{field}, but {first_name} and {name} differ"
@@ -710,23 +933,61 @@ def normalize_weight_scale_2_for_shared_fused_scale(
 
     Some fused Megatron layouts store a single global ``_double_scale`` even
     when the source HF branches carry different ``weight_scale_2`` scalars. In
-    that case we preserve the effective dequant scale exactly by choosing the
-    largest branch scalar as the shared global value and scaling each branch's
-    blockwise ``weight_scale`` by ``branch_scale_2 / shared_scale_2``.
+    that case we preserve each nonzero packed group's effective dequant scale
+    within the E4M3 half-ULP bound by choosing the largest branch scalar as the
+    shared global value and scaling each branch's blockwise ``weight_scale`` by
+    ``branch_scale_2 / shared_scale_2``. Scale cells for all-zero E2M1 groups
+    may be clamped more aggressively because their dequantized values remain
+    exactly zero regardless of scale.
     """
     candidates = {name: bundle["weight_scale_2"].reshape(()).to(torch.float32) for name, bundle in bundles.items()}
-    shared = torch.stack(tuple(candidates.values())).amax()
-    if shared.item() <= 0.0:
+    candidate_values = torch.stack(tuple(candidates.values()))
+    if not bool(torch.all(torch.isfinite(candidate_values)).item()) or not bool(
+        torch.all(candidate_values > 0).item()
+    ):
         raise ValueError(
             f"NVFP4 fused mapping for {megatron_weight_key} requires a positive shared global "
-            f"scale for weight_scale_2, got {shared.item()}"
+            "scale for every weight_scale_2"
         )
+    shared = candidate_values.amax()
 
     normalized: dict[str, dict[str, torch.Tensor]] = {}
     for name, bundle in bundles.items():
         ratio = candidates[name] / shared
         normalized_bundle = dict(bundle)
-        normalized_bundle["weight_scale"] = bundle["weight_scale"].float() * ratio
+        normalized_scale = (
+            (bundle["weight_scale"].float() * ratio)
+            .clamp(
+                min=_NVFP4_FP8_MIN_POSITIVE,
+                max=torch.finfo(torch.float8_e4m3fn).max,
+            )
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
+        expected_effective_scale = bundle["weight_scale"].float() * candidates[name]
+        actual_effective_scale = normalized_scale.float() * shared
+        packed_groups = bundle["weight"].reshape(
+            *bundle["weight_scale"].shape,
+            NVFP4_GROUP_SIZE // 2,
+        )
+        # Each byte contains two E2M1 values. Bits 0:2 and 4:6 encode
+        # magnitude, while bits 3 and 7 encode sign; 0x88 is therefore two
+        # signed zeros and must not make a scale cell active.
+        nonzero_scale_cells = torch.any((packed_groups & 0x77) != 0, dim=-1)
+        expected_nonzero_scale = expected_effective_scale[nonzero_scale_cells]
+        if expected_nonzero_scale.numel() != 0:
+            actual_nonzero_scale = actual_effective_scale[nonzero_scale_cells]
+            relative_error = (actual_nonzero_scale - expected_nonzero_scale).abs() / expected_nonzero_scale
+            max_relative_error = float(relative_error.amax().item())
+            if not bool(torch.all(torch.isfinite(relative_error)).item()) or max_relative_error > (
+                _NVFP4_FP8_MAX_RELATIVE_ERROR + torch.finfo(torch.float32).eps
+            ):
+                raise ValueError(
+                    f"NVFP4 fused mapping for {megatron_weight_key} cannot preserve effective block scales "
+                    f"for {name!r} within the E4M3 half-ULP bound of 6.25%; "
+                    f"maximum relative error is {max_relative_error:.6g}"
+                )
+        normalized_bundle["weight_scale"] = normalized_scale
         normalized[name] = normalized_bundle
 
     return normalized, shared
@@ -753,6 +1014,13 @@ def build_fused_nvfp4_weight_entries(
         ``register_buffer`` approach once its save contract is understood) can
         consume them without rebuilding merging logic.
     """
+    for name, bundle in bundles.items():
+        validate_nvfp4_weight_bundle(
+            bundle,
+            key=f"{megatron_weight_key}[{name}]",
+            require_input_scale=True,
+        )
+
     if split_swiglu_layout is None and split_swiglu_weight:
         split_swiglu_layout = _SPLIT_SWIGLU_LAYOUT_SPLIT_KEYS
 
@@ -787,6 +1055,19 @@ def build_fused_nvfp4_weight_entries(
             weight_scale_bundles,
             "weight_scale",
             megatron_module,
+        )
+        gate_packed = bundles["gate"]["weight"]
+        up_packed = bundles["up"]["weight"]
+        if gate_packed.shape[1] != up_packed.shape[1]:
+            raise ValueError(
+                f"Invalid NVFP4 split SwiGLU output for {megatron_weight_key!r}: gate/up packed "
+                f"column counts differ ({gate_packed.shape[1]} != {up_packed.shape[1]})"
+            )
+        _validate_nvfp4_scale_grid(
+            merged_weight_scale,
+            key=megatron_weight_key,
+            packed_rows=gate_packed.shape[0] + up_packed.shape[0],
+            packed_columns=gate_packed.shape[1],
         )
         input_scale = shared_scalar_from_bundles(
             bundles,
@@ -829,9 +1110,22 @@ def build_fused_nvfp4_weight_entries(
         }
         return entries, quantizer_state
 
+    try:
+        weight_scale_bundles = bundles
+        weight_scale_2 = shared_scalar_from_bundles(
+            bundles,
+            "weight_scale_2",
+            megatron_weight_key=megatron_weight_key,
+        )
+    except ValueError:
+        weight_scale_bundles, weight_scale_2 = normalize_weight_scale_2_for_shared_fused_scale(
+            bundles,
+            megatron_weight_key=megatron_weight_key,
+        )
+
     merged_weight_scale = _merge_fused_nvfp4_component(
         mapping,
-        bundles,
+        weight_scale_bundles,
         "weight_scale",
         megatron_module,
     )
@@ -840,11 +1134,6 @@ def build_fused_nvfp4_weight_entries(
         bundles,
         "weight",
         megatron_module,
-    )
-    weight_scale_2 = shared_scalar_from_bundles(
-        bundles,
-        "weight_scale_2",
-        megatron_weight_key=megatron_weight_key,
     )
     input_scale = shared_scalar_from_bundles(
         bundles,
@@ -949,6 +1238,7 @@ def collect_nvfp4_target_module_names(
     """Collect Megatron module names whose source HF weights are stored as NVFP4 bundles."""
     module_names = set()
     available_keys = set(hf_state_dict.keys())
+    preflight_nvfp4_source_families(hf_state_dict, require_input_scale=True)
     total_tasks = len(conversion_tasks)
     log_interval = max(1, total_tasks // 100) if show_progress else None
     t_start = time.monotonic() if show_progress else None
@@ -960,6 +1250,7 @@ def collect_nvfp4_target_module_names(
             task.mapping.hf_param,
             hf_state_dict,
             available_keys=available_keys,
+            inspect_packed_dtype=True,
         ):
             module_names.add(task.param_name.rsplit(".", 1)[0])
 
@@ -968,10 +1259,13 @@ def collect_nvfp4_target_module_names(
             eta = elapsed / (i + 1) * (total_tasks - i - 1) if i + 1 < total_tasks else 0.0
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
             eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
-            print(
-                f"  [{i + 1}/{total_tasks}] found {len(module_names)} NVFP4 target modules | "
-                f"elapsed {elapsed_str} ETA {eta_str}",
-                flush=True,
+            logger.info(
+                "  [%d/%d] found %d NVFP4 target modules | elapsed %s ETA %s",
+                i + 1,
+                total_tasks,
+                len(module_names),
+                elapsed_str,
+                eta_str,
             )
     return module_names
 
@@ -988,9 +1282,11 @@ def build_nvfp4_direct_model_state_dict(
     if len(meta_model) != 1:
         raise ValueError("Direct NVFP4 converter currently supports a single Megatron model chunk.")
 
-    model_state = prepare_empty_model_state(model_template)
     if conversion_tasks is None:
         conversion_tasks = bridge.build_conversion_tasks(hf_pretrained, meta_model)
+    _validate_single_rank_direct_conversion_tasks(conversion_tasks, format_name="NVFP4")
+
+    model_state = prepare_empty_model_state(model_template)
     hf_state_dict = hf_pretrained.state
     available_keys = set(hf_state_dict.keys())
 
@@ -1002,14 +1298,12 @@ def build_nvfp4_direct_model_state_dict(
     t_start = time.monotonic()
 
     for i, task in enumerate(conversion_tasks):
-        if task is None or task.megatron_module is None:
-            continue
-
         hf_param = task.mapping.hf_param
         if is_nvfp4_weight_mapping(
             hf_param,
             hf_state_dict,
             available_keys=available_keys,
+            inspect_packed_dtype=True,
         ):
             split_swiglu_layout = None
             if isinstance(hf_param, str):
@@ -1080,10 +1374,15 @@ def build_nvfp4_direct_model_state_dict(
                 eta = elapsed / (i + 1) * (total_tasks - i - 1) if i + 1 < total_tasks else 0.0
                 elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
                 eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
-                print(
-                    f"  [{i + 1}/{total_tasks}] {num_regular} regular, {num_nvfp4} NVFP4 | "
-                    f"elapsed {elapsed_str} ETA {eta_str} | {task.param_name}",
-                    flush=True,
+                logger.info(
+                    "  [%d/%d] %d regular, %d NVFP4 | elapsed %s ETA %s | %s",
+                    i + 1,
+                    total_tasks,
+                    num_regular,
+                    num_nvfp4,
+                    elapsed_str,
+                    eta_str,
+                    task.param_name,
                 )
             if (i + 1) % gc_interval == 0:
                 gc.collect()
@@ -1106,16 +1405,27 @@ def build_nvfp4_direct_model_state_dict(
             eta = elapsed / (i + 1) * (total_tasks - i - 1) if i + 1 < total_tasks else 0.0
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
             eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
-            print(
-                f"  [{i + 1}/{total_tasks}] {num_regular} regular, {num_nvfp4} NVFP4 | "
-                f"elapsed {elapsed_str} ETA {eta_str} | {task.param_name}",
-                flush=True,
+            logger.info(
+                "  [%d/%d] %d regular, %d NVFP4 | elapsed %s ETA %s | %s",
+                i + 1,
+                total_tasks,
+                num_regular,
+                num_nvfp4,
+                elapsed_str,
+                eta_str,
+                task.param_name,
             )
 
         if (i + 1) % gc_interval == 0:
             gc.collect()
 
-    print(f"Prepared direct checkpoint state dict: {num_regular} regular tensors, {num_nvfp4} NVFP4 mappings")
+    logger.info(
+        "Prepared direct checkpoint state dict: %d regular tensors, %d NVFP4 mappings",
+        num_regular,
+        num_nvfp4,
+    )
+    if num_nvfp4 == 0:
+        raise RuntimeError("Direct NVFP4 conversion found no complete NVFP4 mappings in the source checkpoint")
     return model_state
 
 
@@ -1145,19 +1455,37 @@ def transform_sharded_state_dict_for_nvfp4_dense(
 
     ckpt_keys = {str(k) for k in checkpoint_keys}
 
-    def _split_factory(value: ShardedTensorFactory):
-        built_sub = value.build()
-        if isinstance(built_sub, list):
-            return built_sub[0], built_sub
-        sub_sh_ten = next(iter(built_sub.values()))
-        return sub_sh_ten, list(built_sub.values())
-
     def _split_swiglu_checkpoint_keys(module_path: str) -> tuple[str, str] | None:
         weight_w_key = f"{module_path}.weight_w"
         weight_v_key = f"{module_path}.weight_v"
         if weight_w_key in ckpt_keys and weight_v_key in ckpt_keys:
             return weight_w_key, weight_v_key
         return None
+
+    def _preflight_checkpoint_family(module_path: str) -> bool:
+        weight_key = f"{module_path}.weight"
+        weight_w_key = f"{module_path}.weight_w"
+        weight_v_key = f"{module_path}.weight_v"
+        scale_key = f"{module_path}.weight_quantizer._scale"
+        double_scale_key = f"{module_path}.weight_quantizer._double_scale"
+        amax_key = f"{module_path}.weight_quantizer._amax"
+        markers = {weight_w_key, weight_v_key, scale_key, double_scale_key, amax_key}
+        if not markers.intersection(ckpt_keys):
+            return False
+        split = weight_w_key in ckpt_keys or weight_v_key in ckpt_keys
+        required = (
+            {weight_w_key, weight_v_key, scale_key, double_scale_key, amax_key}
+            if split
+            else {weight_key, scale_key, double_scale_key, amax_key}
+        )
+        missing = sorted(required.difference(ckpt_keys))
+        if missing:
+            raise ValueError(f"Incomplete NVFP4 checkpoint family for {module_path!r}; missing: {', '.join(missing)}")
+        if split and weight_key in ckpt_keys:
+            raise ValueError(
+                f"Ambiguous NVFP4 checkpoint family for {module_path!r}: contains both fused and split packed weights"
+            )
+        return True
 
     def _packed_weight_sharded_tensor(
         checkpoint_key: str,
@@ -1171,6 +1499,15 @@ def transform_sharded_state_dict_for_nvfp4_dense(
         in_offset: int,
         axis_fragmentations: tuple[int, ...],
     ) -> ShardedTensor:
+        validate_quantized_shard_geometry(
+            key=checkpoint_key,
+            local_shape=(local_out, local_in),
+            global_shape=(global_out, global_in),
+            global_offset=(out_offset, in_offset),
+            axis_fragmentations=axis_fragmentations,
+            packing_factor=2,
+            group_size=NVFP4_GROUP_SIZE,
+        )
         return ShardedTensor(
             key=checkpoint_key,
             data=torch.empty((local_out, local_in // 2), dtype=torch.uint8, device="cpu"),
@@ -1181,7 +1518,6 @@ def transform_sharded_state_dict_for_nvfp4_dense(
             axis_fragmentations=axis_fragmentations,
             replica_id=sh_ten.replica_id,
             prepend_axis_num=0,
-            allow_shape_mismatch=True,
         )
 
     def _packed_split_sharded_tensor(
@@ -1200,6 +1536,8 @@ def transform_sharded_state_dict_for_nvfp4_dense(
             local_shape = local_shape[-len(global_shape) :]
 
         if same_key_splits:
+            if split_factor != 2:
+                raise ValueError(f"Unexpected NVFP4 split factor for {checkpoint_key}: expected 2, got {split_factor}")
             if global_shape[0] % split_factor != 0:
                 raise ValueError(
                     f"Unexpected NVFP4 split SwiGLU shape for {checkpoint_key}: "
@@ -1215,11 +1553,16 @@ def transform_sharded_state_dict_for_nvfp4_dense(
             global_offset[0] %= split_global_out
             axis_fragmentations[0] //= split_factor
 
+        validate_quantized_shard_geometry(
+            key=checkpoint_key,
+            local_shape=local_shape,
+            global_shape=global_shape,
+            global_offset=global_offset,
+            axis_fragmentations=axis_fragmentations,
+            packing_factor=2,
+            group_size=NVFP4_GROUP_SIZE,
+        )
         local_in = local_shape[-1]
-        if local_in % 2 != 0:
-            raise ValueError(
-                f"NVFP4 split SwiGLU requires in-features divisible by 2, got {local_in} for {checkpoint_key}"
-            )
         local_shape[-1] = local_in // 2
         global_shape[-1] //= 2
         global_offset[-1] //= 2
@@ -1234,7 +1577,6 @@ def transform_sharded_state_dict_for_nvfp4_dense(
             axis_fragmentations=tuple(axis_fragmentations),
             replica_id=sub_sh_ten.replica_id,
             prepend_axis_num=0,
-            allow_shape_mismatch=True,
         )
 
     new_sd = {}
@@ -1250,43 +1592,16 @@ def transform_sharded_state_dict_for_nvfp4_dense(
             new_sd[key] = value
             continue
 
-        module_path = m.group("module")
-        scale_key = f"{module_path}.weight_quantizer._scale"
-        if scale_key not in ckpt_keys:
-            new_sd[key] = value
-            continue
-
         sub_sh_tens = None
         if isinstance(value, ShardedTensorFactory):
-            sh_ten, sub_sh_tens = _split_factory(value)
-            if len(sub_sh_tens) < 2:
-                new_sd[key] = value
-                continue
-
-            fused_local_out = value.data.shape[0]
-            split_local_out = sh_ten.local_shape[-2]
-            if split_local_out == 0 or fused_local_out % split_local_out != 0:
-                raise ValueError(
-                    f"Unexpected NVFP4 SwiGLU factory shapes for {skey}: "
-                    f"fused local out={fused_local_out}, split local out={split_local_out}"
-                )
-            split_factor = fused_local_out // split_local_out
-            out_axis = sh_ten.prepend_axis_num
-            rank_offset = sh_ten.global_offset[out_axis] // split_local_out
-            axis_fragmentations_override = list(sh_ten.axis_fragmentations)
-            if all(sub.key == value.key for sub in sub_sh_tens[:2]):
-                if axis_fragmentations_override[out_axis] % split_factor != 0:
-                    raise ValueError(
-                        f"Unexpected NVFP4 SwiGLU factory fragmentation for {skey}: "
-                        f"{axis_fragmentations_override[out_axis]} not divisible by {split_factor}"
-                    )
-                axis_fragmentations_override[out_axis] //= split_factor
-                global_out_override = sh_ten.global_shape[out_axis]
-            else:
-                global_out_override = sh_ten.global_shape[out_axis] * split_factor
-            local_out_override = fused_local_out
-            out_offset_override = rank_offset * fused_local_out
-            axis_fragmentations_override = tuple(axis_fragmentations_override)
+            geometry = reconstruct_swiglu_factory_geometry(value, key=skey)
+            sh_ten = geometry.sharded_tensor
+            sub_sh_tens = list(geometry.sub_tensors)
+            split_factor = 2
+            local_out_override = geometry.local_out
+            global_out_override = geometry.global_out
+            out_offset_override = geometry.out_offset
+            axis_fragmentations_override = geometry.axis_fragmentations
         elif isinstance(value, ShardedTensor) and len(value.local_shape) >= 2:
             sh_ten = value
             split_factor = 2
@@ -1299,27 +1614,21 @@ def transform_sharded_state_dict_for_nvfp4_dense(
             continue
 
         prepend = sh_ten.prepend_axis_num
+        global_layer_idx = resolve_dense_layer_index(sh_ten, key=skey)
+        checkpoint_weight_key = rewrite_dense_layer_key(skey, global_layer_idx)
+        checkpoint_match = _DENSE_NVFP4_WEIGHT_RE.match(checkpoint_weight_key)
+        if checkpoint_match is None:
+            raise ValueError(f"Cannot derive an NVFP4 checkpoint weight key from {skey!r}")
+        checkpoint_module_path = checkpoint_match.group("module")
+        if not _preflight_checkpoint_family(checkpoint_module_path):
+            new_sd[key] = value
+            continue
+
+        local_module_path = m.group("module")
         local_out = local_out_override if local_out_override is not None else sh_ten.local_shape[-2]
         local_in = sh_ten.local_shape[-1]
         global_out = global_out_override if global_out_override is not None else sh_ten.global_shape[-2]
         global_in = sh_ten.global_shape[-1]
-
-        # NVFP4 packs two e2m1 nibbles per byte; the per-group scale spans
-        # NVFP4_GROUP_SIZE (=16) input columns. Both must divide the local
-        # in-axis cleanly or the dist-ckpt loader cannot stitch shards back
-        # together.
-        if local_in % 2 != 0:
-            raise ValueError(f"NVFP4 requires in-features divisible by 2 (pack factor), got {local_in} for {skey}")
-        if local_in % NVFP4_GROUP_SIZE != 0:
-            raise ValueError(
-                f"NVFP4 requires in-features divisible by NVFP4_GROUP_SIZE="
-                f"{NVFP4_GROUP_SIZE}, got {local_in} for {skey}"
-            )
-
-        packed_in = local_in // 2
-        global_packed_in = global_in // 2
-        num_groups = local_in // NVFP4_GROUP_SIZE
-        global_num_groups = global_in // NVFP4_GROUP_SIZE
 
         # Strip the optional leading "stacked-layer" axis from both the
         # axis_fragmentations tuple and the global-offset tuple — once we
@@ -1332,128 +1641,125 @@ def transform_sharded_state_dict_for_nvfp4_dense(
             else (sh_ten.global_offset[prepend] if len(sh_ten.global_offset) > prepend else 0)
         )
         in_offset_full = sh_ten.global_offset[prepend + 1] if len(sh_ten.global_offset) > prepend + 1 else 0
+        validate_quantized_shard_geometry(
+            key=skey,
+            local_shape=(local_out, local_in),
+            global_shape=(global_out, global_in),
+            global_offset=(out_offset_full, in_offset_full),
+            axis_fragmentations=weight_axis_fragmentations,
+            packing_factor=2,
+            group_size=NVFP4_GROUP_SIZE,
+        )
 
-        # Megatron may emit linear weights in a stacked-layer layout
-        # (key path has a literal `layers.` segment and prepend_axis_num=1
-        # so global_shape=(num_layers, out, in)). The on-disk checkpoint
-        # carries one quantized entry per layer, so unroll the stacked
-        # template into per-layer keys with prepend_axis_num=0.
-        has_explicit_layer_idx = _EXPLICIT_LAYER_KEY_RE.search(skey) is not None
-        if prepend > 0 and not has_explicit_layer_idx:
-            num_local_layers = sh_ten.local_shape[0]
-            layer_start = sh_ten.global_offset[prepend - 1]
-            layer_indices = [layer_start + i for i in range(num_local_layers)]
+        packed_in = local_in // 2
+        global_packed_in = global_in // 2
+        num_groups = local_in // NVFP4_GROUP_SIZE
+        global_num_groups = global_in // NVFP4_GROUP_SIZE
+
+        checkpoint_scale_key = f"{checkpoint_module_path}.weight_quantizer._scale"
+        checkpoint_double_scale_key = f"{checkpoint_module_path}.weight_quantizer._double_scale"
+        checkpoint_amax_key = f"{checkpoint_module_path}.weight_quantizer._amax"
+        local_scale_key = f"{local_module_path}.weight_quantizer._scale"
+        local_double_scale_key = f"{local_module_path}.weight_quantizer._double_scale"
+        local_amax_key = f"{local_module_path}.weight_quantizer._amax"
+        checkpoint_split_weight_keys = _split_swiglu_checkpoint_keys(checkpoint_module_path)
+
+        if checkpoint_split_weight_keys is not None:
+            local_split_weight_keys = (
+                f"{local_module_path}.weight_w",
+                f"{local_module_path}.weight_v",
+            )
+            if sub_sh_tens is not None:
+                same_key_splits = all(sub.key == value.key for sub in sub_sh_tens)
+                for local_split_key, checkpoint_split_key, sub_sh_ten in zip(
+                    local_split_weight_keys,
+                    checkpoint_split_weight_keys,
+                    sub_sh_tens,
+                ):
+                    new_sd[local_split_key] = _packed_split_sharded_tensor(
+                        checkpoint_split_key,
+                        sub_sh_ten,
+                        split_factor=split_factor,
+                        same_key_splits=same_key_splits,
+                    )
+            else:
+                if weight_axis_fragmentations[0] != 1 or local_out != global_out or out_offset_full != 0:
+                    raise ValueError(
+                        f"NVFP4 split SwiGLU has ambiguous dense output sharding for {skey}; "
+                        "a two-way ShardedTensorFactory is required to associate local rows with weight_w/weight_v"
+                    )
+                if local_out % 2 != 0 or global_out % 2 != 0:
+                    raise ValueError(
+                        f"NVFP4 split SwiGLU requires even out-features, "
+                        f"got local={local_out}, global={global_out} for {skey}"
+                    )
+                for local_split_key, checkpoint_split_key in zip(
+                    local_split_weight_keys,
+                    checkpoint_split_weight_keys,
+                ):
+                    new_sd[local_split_key] = _packed_weight_sharded_tensor(
+                        checkpoint_split_key,
+                        sh_ten=sh_ten,
+                        local_out=local_out // 2,
+                        local_in=local_in,
+                        global_out=global_out // 2,
+                        global_in=global_in,
+                        out_offset=out_offset_full % (global_out // 2),
+                        in_offset=in_offset_full,
+                        axis_fragmentations=weight_axis_fragmentations,
+                    )
         else:
-            layer_indices = [None]
-
-        for global_layer_idx in layer_indices:
-            if global_layer_idx is None:
-                ckpt_key = skey
-            else:
-                ckpt_key = re.sub(
-                    r"(^|\.)layers\.",
-                    rf"\1layers.{global_layer_idx}.",
-                    skey,
-                    count=1,
-                )
-            ckpt_module_path = _DENSE_NVFP4_WEIGHT_RE.match(ckpt_key).group("module")
-            ckpt_scale_key = f"{ckpt_module_path}.weight_quantizer._scale"
-            ckpt_ds_key = f"{ckpt_module_path}.weight_quantizer._double_scale"
-            ckpt_amax_key = f"{ckpt_module_path}.weight_quantizer._amax"
-            split_weight_keys = _split_swiglu_checkpoint_keys(ckpt_module_path)
-
-            if split_weight_keys is not None:
-                if sub_sh_tens is not None:
-                    same_key_splits = all(sub.key == value.key for sub in sub_sh_tens[:2])
-                    for split_key, sub_sh_ten in zip(split_weight_keys, sub_sh_tens[:2]):
-                        new_sd[split_key] = _packed_split_sharded_tensor(
-                            split_key,
-                            sub_sh_ten,
-                            split_factor=split_factor,
-                            same_key_splits=same_key_splits,
-                        )
-                else:
-                    if local_out % 2 != 0 or global_out % 2 != 0:
-                        raise ValueError(
-                            f"NVFP4 split SwiGLU requires even out-features, "
-                            f"got local={local_out}, global={global_out} for {skey}"
-                        )
-                    split_axis_fragmentations = weight_axis_fragmentations
-                    for split_key in split_weight_keys:
-                        new_sd[split_key] = _packed_weight_sharded_tensor(
-                            split_key,
-                            sh_ten=sh_ten,
-                            local_out=local_out // 2,
-                            local_in=local_in,
-                            global_out=global_out // 2,
-                            global_in=global_in,
-                            out_offset=out_offset_full % (global_out // 2),
-                            in_offset=in_offset_full,
-                            axis_fragmentations=split_axis_fragmentations,
-                        )
-            else:
-                # weight -> uint8 [out, in/2]
-                packed = ShardedTensor(
-                    key=ckpt_key,
-                    data=torch.empty((local_out, packed_in), dtype=torch.uint8, device="cpu"),
-                    dtype=torch.uint8,
-                    local_shape=(local_out, packed_in),
-                    global_shape=(global_out, global_packed_in),
-                    global_offset=(out_offset_full, in_offset_full // 2),
-                    axis_fragmentations=weight_axis_fragmentations,
-                    replica_id=sh_ten.replica_id,
-                    prepend_axis_num=0,
-                    allow_shape_mismatch=True,
-                )
-                new_sd[ckpt_key] = packed
-
-            # weight_quantizer._scale -> fp8_e4m3fn [out, in/16]
-            scale_st = ShardedTensor(
-                key=ckpt_scale_key,
-                data=torch.empty((local_out, num_groups), dtype=torch.float8_e4m3fn, device="cpu"),
-                dtype=torch.float8_e4m3fn,
-                local_shape=(local_out, num_groups),
-                global_shape=(global_out, global_num_groups),
-                global_offset=(out_offset_full, in_offset_full // NVFP4_GROUP_SIZE),
+            packed = ShardedTensor(
+                key=checkpoint_weight_key,
+                data=torch.empty((local_out, packed_in), dtype=torch.uint8, device="cpu"),
+                dtype=torch.uint8,
+                local_shape=(local_out, packed_in),
+                global_shape=(global_out, global_packed_in),
+                global_offset=(out_offset_full, in_offset_full // 2),
                 axis_fragmentations=weight_axis_fragmentations,
                 replica_id=sh_ten.replica_id,
                 prepend_axis_num=0,
-                allow_shape_mismatch=True,
             )
-            new_sd[ckpt_scale_key] = scale_st
+            new_sd[skey] = packed
 
-            # weight_quantizer._double_scale -> fp32 scalar.
-            # Replicated across TP — wrap replica_id with the current TP rank
-            # so dist-ckpt sees one primary writer per TP rank rather than
-            # every rank claiming to be the same primary.
-            ds_st = ShardedTensor(
-                key=ckpt_ds_key,
-                data=torch.empty((), dtype=torch.float32, device="cpu"),
-                dtype=torch.float32,
-                local_shape=(),
-                global_shape=(),
-                global_offset=(),
-                axis_fragmentations=(),
-                replica_id=_replica_id_with_current_tp_rank(sh_ten.replica_id),
-                prepend_axis_num=0,
-                allow_shape_mismatch=True,
-            )
-            new_sd[ckpt_ds_key] = ds_st
+        scale_st = ShardedTensor(
+            key=checkpoint_scale_key,
+            data=torch.empty((local_out, num_groups), dtype=torch.float8_e4m3fn, device="cpu"),
+            dtype=torch.float8_e4m3fn,
+            local_shape=(local_out, num_groups),
+            global_shape=(global_out, global_num_groups),
+            global_offset=(out_offset_full, in_offset_full // NVFP4_GROUP_SIZE),
+            axis_fragmentations=weight_axis_fragmentations,
+            replica_id=sh_ten.replica_id,
+            prepend_axis_num=0,
+        )
+        new_sd[local_scale_key] = scale_st
 
-            # weight_quantizer._amax -> fp32 scalar (loaded but unused at fwd).
-            amax_st = ShardedTensor(
-                key=ckpt_amax_key,
-                data=torch.empty((), dtype=torch.float32, device="cpu"),
-                dtype=torch.float32,
-                local_shape=(),
-                global_shape=(),
-                global_offset=(),
-                axis_fragmentations=(),
-                replica_id=_replica_id_with_current_tp_rank(sh_ten.replica_id),
-                prepend_axis_num=0,
-                allow_shape_mismatch=True,
-            )
-            new_sd[ckpt_amax_key] = amax_st
+        ds_st = ShardedTensor(
+            key=checkpoint_double_scale_key,
+            data=torch.empty((), dtype=torch.float32, device="cpu"),
+            dtype=torch.float32,
+            local_shape=(),
+            global_shape=(),
+            global_offset=(),
+            axis_fragmentations=(),
+            replica_id=_replica_id_with_current_tp_rank(sh_ten.replica_id),
+            prepend_axis_num=0,
+        )
+        new_sd[local_double_scale_key] = ds_st
+
+        amax_st = ShardedTensor(
+            key=checkpoint_amax_key,
+            data=torch.empty((), dtype=torch.float32, device="cpu"),
+            dtype=torch.float32,
+            local_shape=(),
+            global_shape=(),
+            global_offset=(),
+            axis_fragmentations=(),
+            replica_id=_replica_id_with_current_tp_rank(sh_ten.replica_id),
+            prepend_axis_num=0,
+        )
+        new_sd[local_amax_key] = amax_st
 
     return new_sd
 
@@ -1589,5 +1895,5 @@ def register_nvfp4_buffers_after_load_dense(
 
         registered += 1
 
-    print(f"[NVFP4 dense register] Registered NVFP4 buffers for {registered} dense linears")
+    logger.info("[NVFP4 dense register] Registered NVFP4 buffers for %d dense linears", registered)
     return registered

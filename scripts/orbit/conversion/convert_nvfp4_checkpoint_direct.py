@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,36 +16,23 @@
 
 # ruff: noqa: D101, D103  # operational scripts: helpers here are entrypoint plumbing, not API
 import argparse
+import logging
 import os
 import re
 import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
-
-# Force mcore async strategy everywhere (modelopt's save_sharded_modelopt_state
-# calls dist_checkpointing.save without passing async_strategy, which defaults
-# to "nvrx" and fails when nvidia-resiliency-ext is unavailable/mismatched).
-from megatron.core import dist_checkpointing as _dc
-
-
-_orig_dc_save = _dc.save
-
-
-def _dc_save_with_mcore(*args, **kwargs):
-    kwargs.setdefault("async_strategy", "mcore")
-    return _orig_dc_save(*args, **kwargs)
-
-
-_dc.save = _dc_save_with_mcore
+from typing import Any
 
 from megatron.core.optimizer import OptimizerConfig
 
 from megatron.bridge.orbit.low_precision.common import (
     TensorSpillManager,
+    atomic_direct_checkpoint_directory,
     build_single_rank_meta_provider,
     patch_meta_init_for_te_modules,
 )
@@ -56,6 +43,9 @@ from megatron.bridge.orbit.low_precision.nvfp4 import (
     is_nvfp4_source,
 )
 from megatron.bridge.orbit.model_bridges.kimi_k25_vl_nvfp4_bridge import KimiK25VLNVFP4Bridge
+from megatron.bridge.orbit.model_bridges.qwen3_moe_provider_ext import (
+    apply_qwen3_moe_orbit_provider_settings,
+)
 from megatron.bridge.training.checkpointing import (
     get_checkpoint_name,
     save_checkpoint,
@@ -69,25 +59,25 @@ from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 
 
+logger = logging.getLogger(__name__)
+
+
 def _format_elapsed(seconds: float) -> str:
     return time.strftime("%H:%M:%S", time.gmtime(seconds))
 
 
 def _log_stage_start(message: str) -> float:
-    print(message, flush=True)
+    logger.info("%s", message)
     return time.monotonic()
 
 
 def _log_stage_done(message: str, start_time: float, *, extra: str | None = None) -> None:
     suffix = f" | {extra}" if extra else ""
-    print(
-        f"{message} in {_format_elapsed(time.monotonic() - start_time)}{suffix}",
-        flush=True,
-    )
+    logger.info("%s in %s%s", message, _format_elapsed(time.monotonic() - start_time), suffix)
 
 
 @contextmanager
-def keep_meta_model_unmaterialized():
+def keep_meta_model_unmaterialized() -> Iterator[None]:
     """Keep direct-conversion template models on meta instead of CUDA/CPU.
 
     The generic Bridge distributed-model builder calls
@@ -199,9 +189,10 @@ class _SaveProgressMonitor:
 
     def start(self) -> None:
         self._start_time = time.monotonic()
-        print(
-            f"Save progress monitor enabled for {self.checkpoint_root} (interval={self.interval_sec:.1f}s)",
-            flush=True,
+        logger.info(
+            "Save progress monitor enabled for %s (interval=%.1fs)",
+            self.checkpoint_root,
+            self.interval_sec,
         )
         self._thread.start()
 
@@ -242,9 +233,12 @@ class _SaveProgressMonitor:
         file_count, total_bytes = snapshot
         elapsed = _format_elapsed(time.monotonic() - self._start_time)
         label = "final save progress" if final else "save progress"
-        print(
-            f"[{label}] elapsed {elapsed} | files {file_count} | written {_format_num_bytes(total_bytes)}",
-            flush=True,
+        logger.info(
+            "[%s] elapsed %s | files %d | written %s",
+            label,
+            elapsed,
+            file_count,
+            _format_num_bytes(total_bytes),
         )
 
 
@@ -260,7 +254,7 @@ def _maybe_create_save_progress_monitor(path: str | Path) -> _SaveProgressMonito
     return _SaveProgressMonitor(path, interval_sec=interval_sec)
 
 
-def parse_args(argv: list[str] | None = None):
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Direct-write HF NVFP4 -> Megatron checkpoint conversion",
     )
@@ -296,13 +290,13 @@ def _select_nvfp4_bridge(auto_bridge: Any) -> Any:
 
 def _save_direct_checkpoint(
     provider: Any,
-    path: str,
+    path: str | Path,
     model_state: dict[str, Any],
     *,
     model_list: list[Any],
     pg_collection: Any,
-    hf_tokenizer_path: Optional[str],
-    hf_tokenizer_kwargs: Optional[dict[str, Any]],
+    hf_tokenizer_path: str | None,
+    hf_tokenizer_kwargs: dict[str, Any] | None,
 ) -> None:
     storage_writers_per_rank = int(os.environ.get("MEGATRON_BRIDGE_DIRECT_STORAGE_WRITERS_PER_RANK", "16"))
     tokenizer_config = None
@@ -348,7 +342,7 @@ def _save_direct_checkpoint(
 
     t0 = time.monotonic()
     progress_monitor = _maybe_create_save_progress_monitor(path)
-    print("Saving checkpoint...", flush=True)
+    logger.info("Saving checkpoint...")
     try:
         if progress_monitor is not None:
             progress_monitor.start()
@@ -364,10 +358,7 @@ def _save_direct_checkpoint(
     finally:
         if progress_monitor is not None:
             progress_monitor.stop()
-    print(
-        f"Checkpoint saved in {time.strftime('%H:%M:%S', time.gmtime(time.monotonic() - t0))}",
-        flush=True,
-    )
+    logger.info("Checkpoint saved in %s", time.strftime("%H:%M:%S", time.gmtime(time.monotonic() - t0)))
 
     if tokenizer_config is not None:
         tokenizer = build_tokenizer(tokenizer_config)
@@ -375,18 +366,16 @@ def _save_direct_checkpoint(
         save_tokenizer_assets(tokenizer, tokenizer_config, checkpoint_name)
 
 
-def main():
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
     auto_bridge, provider = build_single_rank_meta_provider(
         args.hf_model_path,
         trust_remote_code=True,
     )
-    _selected_bridge = _select_nvfp4_bridge(auto_bridge)
-    if _selected_bridge is not auto_bridge._model_bridge:
-        # `_model_bridge` is a read-only @property on AutoBridge; shadow it on
-        # the class so the custom Kimi bridge is returned by all subsequent
-        # accesses. No-op (and skipped) for non-Kimi models.
-        type(auto_bridge)._model_bridge = property(lambda self, _b=_selected_bridge: _b)
+    selected_bridge = _select_nvfp4_bridge(auto_bridge)
+    if _bridge_name(auto_bridge._causal_lm_architecture) == "Qwen3MoeForCausalLM":
+        apply_qwen3_moe_orbit_provider_settings(provider, auto_bridge.hf_pretrained.config)
     if not is_nvfp4_source(auto_bridge.hf_pretrained.config):
         raise ValueError("Source model is not an NVFP4 HuggingFace checkpoint")
 
@@ -410,7 +399,7 @@ def main():
         _log_stage_done("Built Megatron meta model", stage_start)
 
         stage_start = _log_stage_start("Building conversion tasks...")
-        conversion_tasks = auto_bridge._model_bridge.build_conversion_tasks(
+        conversion_tasks = selected_bridge.build_conversion_tasks(
             auto_bridge.hf_pretrained,
             megatron_model,
         )
@@ -437,11 +426,10 @@ def main():
                 stage_start,
                 extra=f"{len(conversion_tasks)}/{original_task_count} tasks kept",
             )
-            print(
+            logger.warning(
                 "Debug partial-conversion mode is enabled. "
                 "The output checkpoint is only meant for conversion/save validation "
-                "and is not expected to be loadable.",
-                flush=True,
+                "and is not expected to be loadable."
             )
 
         stage_start = _log_stage_start("Collecting NVFP4 target modules...")
@@ -485,10 +473,9 @@ def main():
         @contextmanager
         def _maybe_spill_manager():
             if not use_spill:
-                print(
+                logger.info(
                     "Spill disabled — keeping all converted tensors in CPU RAM "
-                    "(set MEGATRON_BRIDGE_DIRECT_USE_SPILL=1 to re-enable).",
-                    flush=True,
+                    "(set MEGATRON_BRIDGE_DIRECT_USE_SPILL=1 to re-enable)."
                 )
                 yield None
                 return
@@ -498,35 +485,33 @@ def main():
                 prefix=f".{Path(args.megatron_path).name}.nvfp4_spill_",
                 dir=spill_parent,
             ) as spill_dir:
-                print(
-                    f"Using spill directory for direct tensors: {spill_dir}",
-                    flush=True,
-                )
+                logger.info("Using spill directory for direct tensors: %s", spill_dir)
                 yield TensorSpillManager(spill_dir)
 
-        with _maybe_spill_manager() as spill_manager:
-            stage_start = _log_stage_start("Preparing direct NVFP4 model state dict...")
-            model_state = build_nvfp4_direct_model_state_dict(
-                auto_bridge._model_bridge,
-                auto_bridge.hf_pretrained,
-                megatron_model,
-                model_template,
-                conversion_tasks=conversion_tasks,
-                spill_manager=spill_manager,
-            )
-            _log_stage_done("Prepared direct NVFP4 model state dict", stage_start)
+        with atomic_direct_checkpoint_directory(args.megatron_path) as checkpoint_path:
+            with _maybe_spill_manager() as spill_manager:
+                stage_start = _log_stage_start("Preparing direct NVFP4 model state dict...")
+                model_state = build_nvfp4_direct_model_state_dict(
+                    selected_bridge,
+                    auto_bridge.hf_pretrained,
+                    megatron_model,
+                    model_template,
+                    conversion_tasks=conversion_tasks,
+                    spill_manager=spill_manager,
+                )
+                _log_stage_done("Prepared direct NVFP4 model state dict", stage_start)
 
-            _save_direct_checkpoint(
-                provider,
-                args.megatron_path,
-                model_state,
-                model_list=megatron_model,
-                pg_collection=pg_collection,
-                hf_tokenizer_path=args.hf_model_path,
-                hf_tokenizer_kwargs=tokenizer_kwargs,
-            )
+                _save_direct_checkpoint(
+                    provider,
+                    checkpoint_path,
+                    model_state,
+                    model_list=megatron_model,
+                    pg_collection=pg_collection,
+                    hf_tokenizer_path=args.hf_model_path,
+                    hf_tokenizer_kwargs=tokenizer_kwargs,
+                )
 
-    print(f"Done. Direct NVFP4 Megatron checkpoint saved to: {args.megatron_path}")
+    logger.info("Done. Direct NVFP4 Megatron checkpoint saved to: %s", args.megatron_path)
     return 0
 
 

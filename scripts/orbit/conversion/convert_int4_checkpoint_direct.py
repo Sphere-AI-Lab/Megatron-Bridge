@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,13 +40,15 @@ the INT4 triplets (``*_packed``, ``*_scale``, ``*_shape``) for expert linears.
 # ruff: noqa: D101, D103  # operational scripts: helpers here are entrypoint plumbing, not API
 
 import argparse
+import logging
 import os
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from megatron.core.optimizer import OptimizerConfig
@@ -56,6 +58,7 @@ from megatron.bridge.models.kimi_vl.kimi_k25_vl_bridge import KimiK25VLBridge
 from megatron.bridge.orbit.conversion.compressed_tensors_int4 import int4_bridge_for
 from megatron.bridge.orbit.low_precision.common import (
     TensorSpillManager,
+    atomic_direct_checkpoint_directory,
     build_single_rank_meta_provider,
     patch_meta_init_for_te_modules,
 )
@@ -63,6 +66,9 @@ from megatron.bridge.orbit.low_precision.int4 import build_int4_direct_model_sta
 from megatron.bridge.orbit.model_bridges.deepseek_v3_int4_bridge import DeepSeekV3INT4Bridge
 from megatron.bridge.orbit.model_bridges.llama_int4_bridge import LlamaINT4Bridge
 from megatron.bridge.orbit.model_bridges.qwen3_int4_bridge import Qwen3INT4Bridge, Qwen3MoEINT4Bridge
+from megatron.bridge.orbit.model_bridges.qwen3_moe_provider_ext import (
+    apply_qwen3_moe_orbit_provider_settings,
+)
 from megatron.bridge.training.checkpointing import (
     get_checkpoint_name,
     save_checkpoint,
@@ -74,6 +80,9 @@ from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.config import TokenizerConfig
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
+
+
+logger = logging.getLogger(__name__)
 
 
 _SAFETENSORS_TORCH_DTYPES = {
@@ -163,18 +172,26 @@ class _PyMmapSafeTensors:
         return torch.frombuffer(view, dtype=dtype).reshape(info["shape"])
 
 
-def _patch_safetensors_reader(max_attempts: int = 3) -> None:
-    """Route safe_open through a no-populate reader (forced or ENOMEM fallback).
+@contextmanager
+def _temporary_safetensors_reader(max_attempts: int = 3):
+    """Temporarily route HF reads through a no-populate ``safe_open`` wrapper.
 
     MEGATRON_BRIDGE_PYMMAP_READER: "1" always use the lazy reader, "0" never
     (retry-and-raise only), default "auto" retries the native reader and
     falls back to the lazy one per file after repeated mmap ENOMEM.
+
+    Both safetensors' public entrypoint and Bridge's imported alias are scoped
+    to the conversion read. Restoring the exact prior objects avoids poisoning
+    later conversions or stacking wrappers when this script is imported more
+    than once in the same process.
     """
     import safetensors
 
     import megatron.bridge.models.hf_pretrained.state as _hf_state
 
+    missing = object()
     original_safe_open = safetensors.safe_open
+    original_hf_state_safe_open = getattr(_hf_state, "safe_open", missing)
     mode = os.environ.get("MEGATRON_BRIDGE_PYMMAP_READER", "auto").lower()
     fallback_paths: set[str] = set()
 
@@ -190,17 +207,18 @@ def _patch_safetensors_reader(max_attempts: int = 3) -> None:
                 if attempt == max_attempts - 1:
                     if mode == "0":
                         raise
-                    print(
-                        f"safe_open mmap keeps failing for {path}; switching to the lazy python-mmap reader",
-                        flush=True,
+                    logger.warning(
+                        "safe_open mmap keeps failing for %s; switching to the lazy python-mmap reader",
+                        path,
                     )
                     fallback_paths.add(str(path))
                     return _PyMmapSafeTensors(path, *args, **kwargs)
                 wait_s = 5 * (attempt + 1)
-                print(
-                    f"safe_open mmap failed under memory pressure; sync + retry "
-                    f"{attempt + 1}/{max_attempts - 1} in {wait_s}s",
-                    flush=True,
+                logger.warning(
+                    "safe_open mmap failed under memory pressure; sync + retry %d/%d in %ds",
+                    attempt + 1,
+                    max_attempts - 1,
+                    wait_s,
                 )
                 os.sync()
                 time.sleep(wait_s)
@@ -208,9 +226,14 @@ def _patch_safetensors_reader(max_attempts: int = 3) -> None:
 
     safetensors.safe_open = _patched_safe_open
     _hf_state.safe_open = _patched_safe_open
-
-
-_patch_safetensors_reader()
+    try:
+        yield
+    finally:
+        safetensors.safe_open = original_safe_open
+        if original_hf_state_safe_open is missing:
+            delattr(_hf_state, "safe_open")
+        else:
+            _hf_state.safe_open = original_hf_state_safe_open
 
 
 class _ResidencyCappedSpillManager(TensorSpillManager):
@@ -241,9 +264,14 @@ class _ResidencyCappedSpillManager(TensorSpillManager):
         _ResidencyCappedSpillManager._libc.madvise(
             ctypes.c_void_p(start), ctypes.c_size_t(length), 4
         )  # MADV_DONTNEED: zap PTEs; file-backed shared pages stay in page cache
-        fd = os.open(self._paths[-1], os.O_RDONLY)
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        os.close(fd)
+        posix_fadvise = getattr(os, "posix_fadvise", None)
+        dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+        if posix_fadvise is not None and dontneed is not None:
+            fd = os.open(self._paths[-1], os.O_RDONLY)
+            try:
+                posix_fadvise(fd, 0, 0, dontneed)
+            finally:
+                os.close(fd)
         return spilled
 
 
@@ -259,7 +287,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "INT4 group size used when re-quantising weights. If omitted, read "
-            "from HF config.quantization_config.config_groups.*.weights.group_size; "
+            "from HF config.quantization_config.group_size or "
+            "config_groups.*.weights.group_size; "
             "falls back to 32 for legacy checkpoints that do not expose a "
             "quantization_config block (e.g. Kimi-K2.5)."
         ),
@@ -268,7 +297,7 @@ def parse_args() -> argparse.Namespace:
 
 
 @contextmanager
-def keep_meta_model_unmaterialized():
+def keep_meta_model_unmaterialized() -> Iterator[None]:
     """Keep direct-conversion template models on meta instead of CUDA.
 
     The generic Bridge distributed-model builder materializes meta tensors onto
@@ -304,26 +333,55 @@ def _bridge_name(architecture: Any) -> str:
     return architecture.__name__
 
 
-def _infer_group_size(auto_bridge: AutoBridge, override: Optional[int]) -> int:
+def _infer_group_size(auto_bridge: AutoBridge, override: int | None) -> int:
     if override is not None:
+        if isinstance(override, bool) or not isinstance(override, int) or override <= 0:
+            raise ValueError(f"--group-size must be a positive integer, got {override!r}")
         return override
     hf_config = getattr(auto_bridge.hf_pretrained, "config", None)
     qcfg = getattr(hf_config, "quantization_config", None)
-    if isinstance(qcfg, dict):
-        groups = qcfg.get("config_groups") or {}
-        for group in groups.values():
-            if not isinstance(group, dict):
-                continue
-            weights = group.get("weights") or {}
-            gs = weights.get("group_size")
-            if isinstance(gs, int) and gs > 0:
-                print(f"Inferred group_size={gs} from HF quantization_config")
-                return gs
-        top_gs = qcfg.get("group_size")
-        if isinstance(top_gs, int) and top_gs > 0:
-            print(f"Inferred group_size={top_gs} from HF quantization_config")
-            return top_gs
-    print("No group_size found in HF config; falling back to 32 (legacy default)")
+    if qcfg is not None:
+        if not isinstance(qcfg, dict):
+            raise ValueError("HF quantization_config must be a mapping when present")
+
+        declarations: list[tuple[str, int]] = []
+
+        def add_declaration(location: str, value: Any) -> None:
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{location} group_size must be a positive integer, got {value!r}")
+            declarations.append((location, value))
+
+        if "group_size" in qcfg:
+            add_declaration("quantization_config", qcfg["group_size"])
+
+        if "config_groups" in qcfg:
+            groups = qcfg["config_groups"]
+            if not isinstance(groups, dict):
+                raise ValueError("HF quantization_config.config_groups must be a mapping")
+            missing = object()
+            for group_name, group in groups.items():
+                if not isinstance(group, dict):
+                    raise ValueError(f"HF quantization_config.config_groups[{group_name!r}] must be a mapping")
+                weights = group.get("weights", missing)
+                if weights is missing:
+                    continue
+                if not isinstance(weights, dict):
+                    raise ValueError(f"HF quantization_config.config_groups[{group_name!r}].weights must be a mapping")
+                if "group_size" in weights:
+                    add_declaration(
+                        f"quantization_config.config_groups[{group_name!r}].weights",
+                        weights["group_size"],
+                    )
+
+        declared_values = {value for _, value in declarations}
+        if len(declared_values) > 1:
+            details = ", ".join(f"{location}={value}" for location, value in declarations)
+            raise ValueError(f"Ambiguous INT4 group_size declarations in HF quantization_config: {details}")
+        if declarations:
+            group_size = declarations[0][1]
+            logger.info("Inferred group_size=%d from HF quantization_config", group_size)
+            return group_size
+    logger.warning("No group_size found in HF config; falling back to 32 (legacy default)")
     return 32
 
 
@@ -341,18 +399,33 @@ def _select_int4_bridge(auto_bridge: AutoBridge) -> Any:
         return Qwen3MoEINT4Bridge()
     # Any other registered architecture: compose the generic INT4 mixin with
     # its registered bridge (same conversion path the named classes above use).
-    print(f"No named INT4 bridge for {architecture_name}; composing the generic INT4 adapter")
+    logger.info("No named INT4 bridge for %s; composing the generic INT4 adapter", architecture_name)
     return int4_bridge_for(auto_bridge)
+
+
+def _int4_checkpoint_scale_dtype(auto_bridge: AutoBridge) -> torch.dtype:
+    """Select the dtype declared by the matching runtime DCP load schema."""
+    architecture_name = _bridge_name(auto_bridge._causal_lm_architecture)
+    if architecture_name in {
+        "KimiK25ForConditionalGeneration",
+        "DeepseekV3ForCausalLM",
+        "DeepSeekV3ForCausalLM",
+    }:
+        # Kimi/Moonlight use the native expert-only INT4 schema.
+        return torch.float16
+    # Compressed-tensors Llama/Qwen and the generic bridge use the all-linear
+    # schema installed by QOFT, whose scales are declared as BF16.
+    return torch.bfloat16
 
 
 def _save_direct_checkpoint(
     provider: Any,
-    path: str,
+    path: str | Path,
     model_state: dict[str, Any],
     *,
     pg_collection: Any,
-    hf_tokenizer_path: Optional[str],
-    hf_tokenizer_kwargs: Optional[dict[str, Any]],
+    hf_tokenizer_path: str | None,
+    hf_tokenizer_kwargs: dict[str, Any] | None,
 ) -> None:
     tokenizer_config = None
     if hf_tokenizer_path is not None:
@@ -402,7 +475,7 @@ def _save_direct_checkpoint(
     }
 
     t0 = time.monotonic()
-    print("Saving checkpoint...", flush=True)
+    logger.info("Saving checkpoint...")
     from megatron.core.dist_checkpointing.strategies import torch as torch_dist_strategy
 
     original_have_nvrx = torch_dist_strategy.HAVE_NVRX
@@ -419,7 +492,7 @@ def _save_direct_checkpoint(
         )
     finally:
         torch_dist_strategy.HAVE_NVRX = original_have_nvrx
-    print(f"Checkpoint saved in {time.strftime('%H:%M:%S', time.gmtime(time.monotonic() - t0))}", flush=True)
+    logger.info("Checkpoint saved in %s", time.strftime("%H:%M:%S", time.gmtime(time.monotonic() - t0)))
 
     if tokenizer_config is not None:
         tokenizer = build_tokenizer(tokenizer_config)
@@ -428,16 +501,20 @@ def _save_direct_checkpoint(
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
 
-    print(f"Converting INT4 checkpoint directly: {args.hf_model_path} -> {args.megatron_path}")
-    print("Using single-process meta-model conversion (TP=PP=EP=1 checkpoint write)")
+    logger.info("Converting INT4 checkpoint directly: %s -> %s", args.hf_model_path, args.megatron_path)
+    logger.info("Using single-process meta-model conversion (TP=PP=EP=1 checkpoint write)")
 
     auto_bridge, provider = build_single_rank_meta_provider(
         args.hf_model_path,
         trust_remote_code=True,
     )
     int4_bridge = _select_int4_bridge(auto_bridge)
+    scale_dtype = _int4_checkpoint_scale_dtype(auto_bridge)
+    if _bridge_name(auto_bridge._causal_lm_architecture) == "Qwen3MoeForCausalLM":
+        apply_qwen3_moe_orbit_provider_settings(provider, auto_bridge.hf_pretrained.config)
     group_size = _infer_group_size(auto_bridge, args.group_size)
 
     if hasattr(provider, "finalize"):
@@ -477,34 +554,37 @@ def main() -> int:
                 prefix=f".{Path(args.megatron_path).name}.int4_spill_",
                 dir=spill_parent,
             ) as spill_dir:
-                print(f"Using spill directory for direct tensors: {spill_dir}", flush=True)
+                logger.info("Using spill directory for direct tensors: %s", spill_dir)
                 yield _ResidencyCappedSpillManager(spill_dir)
 
-        # The spill files back the state dict's tensors, so the manager must
-        # stay alive through the save.
-        with _maybe_spill_manager() as spill_manager:
-            model_state = build_int4_direct_model_state_dict(
-                int4_bridge,
-                auto_bridge.hf_pretrained,
-                meta_model,
-                model_template,
-                group_size=group_size,
-                spill_manager=spill_manager,
-            )
+        with atomic_direct_checkpoint_directory(args.megatron_path) as checkpoint_path:
+            # The spill files back the state dict's tensors, so the manager
+            # must stay alive through the save.
+            with _maybe_spill_manager() as spill_manager:
+                with _temporary_safetensors_reader():
+                    model_state = build_int4_direct_model_state_dict(
+                        int4_bridge,
+                        auto_bridge.hf_pretrained,
+                        meta_model,
+                        model_template,
+                        group_size=group_size,
+                        scale_dtype=scale_dtype,
+                        spill_manager=spill_manager,
+                    )
 
-            del meta_model
-            del model_template
+                del meta_model
+                del model_template
 
-            _save_direct_checkpoint(
-                provider,
-                args.megatron_path,
-                model_state,
-                pg_collection=pg_collection,
-                hf_tokenizer_path=args.hf_model_path,
-                hf_tokenizer_kwargs=tokenizer_kwargs,
-            )
+                _save_direct_checkpoint(
+                    provider,
+                    checkpoint_path,
+                    model_state,
+                    pg_collection=pg_collection,
+                    hf_tokenizer_path=args.hf_model_path,
+                    hf_tokenizer_kwargs=tokenizer_kwargs,
+                )
 
-    print(f"Done. Direct INT4 Megatron checkpoint saved to: {args.megatron_path}")
+    logger.info("Done. Direct INT4 Megatron checkpoint saved to: %s", args.megatron_path)
     return 0
 
 

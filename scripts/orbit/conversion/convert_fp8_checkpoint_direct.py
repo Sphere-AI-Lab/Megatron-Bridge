@@ -20,13 +20,17 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_single_rank_meta_provider(*args, **kwargs):
@@ -45,6 +49,14 @@ def patch_meta_init_for_te_modules(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+def atomic_direct_checkpoint_directory(*args, **kwargs):
+    from megatron.bridge.orbit.low_precision.common import (
+        atomic_direct_checkpoint_directory as _impl,
+    )
+
+    return _impl(*args, **kwargs)
+
+
 def build_fp8_direct_model_state_dict(*args, **kwargs):
     from megatron.bridge.orbit.low_precision.fp8 import (
         build_fp8_direct_model_state_dict as _impl,
@@ -53,9 +65,25 @@ def build_fp8_direct_model_state_dict(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+def preflight_fp8_conversion_tasks(*args, **kwargs):
+    from megatron.bridge.orbit.low_precision.fp8 import (
+        preflight_fp8_conversion_tasks as _impl,
+    )
+
+    return _impl(*args, **kwargs)
+
+
 def apply_modelopt_fp8_to_meta_model(*args, **kwargs):
     from megatron.bridge.orbit.low_precision.fp8 import (
         apply_modelopt_fp8_to_meta_model as _impl,
+    )
+
+    return _impl(*args, **kwargs)
+
+
+def apply_qwen3_moe_orbit_provider_settings(*args, **kwargs):
+    from megatron.bridge.orbit.model_bridges.qwen3_moe_provider_ext import (
+        apply_qwen3_moe_orbit_provider_settings as _impl,
     )
 
     return _impl(*args, **kwargs)
@@ -113,6 +141,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _bridge_name(architecture: Any) -> str:
+    if isinstance(architecture, str):
+        return architecture
+    return architecture.__name__
+
+
 def _format_elapsed(seconds: float) -> str:
     return time.strftime("%H:%M:%S", time.gmtime(seconds))
 
@@ -148,9 +182,10 @@ class _SaveProgressMonitor:
 
     def start(self) -> None:
         self._start_time = time.monotonic()
-        print(
-            f"Save progress monitor enabled for {self.checkpoint_root} (interval={self.interval_sec:.1f}s)",
-            flush=True,
+        logger.info(
+            "Save progress monitor enabled for %s (interval=%.1fs)",
+            self.checkpoint_root,
+            self.interval_sec,
         )
         self._thread.start()
 
@@ -191,9 +226,12 @@ class _SaveProgressMonitor:
         file_count, total_bytes = snapshot
         elapsed = _format_elapsed(time.monotonic() - self._start_time)
         label = "final save progress" if final else "save progress"
-        print(
-            f"[{label}] elapsed {elapsed} | files {file_count} | written {_format_num_bytes(total_bytes)}",
-            flush=True,
+        logger.info(
+            "[%s] elapsed %s | files %d | written %s",
+            label,
+            elapsed,
+            file_count,
+            _format_num_bytes(total_bytes),
         )
 
 
@@ -211,13 +249,13 @@ def _maybe_create_save_progress_monitor(path: str | Path) -> _SaveProgressMonito
 
 def _save_direct_checkpoint(
     provider: Any,
-    path: str,
+    path: str | Path,
     model_state: dict[str, Any],
     *,
     model_list: list[Any],
     pg_collection: Any,
-    hf_tokenizer_path: Optional[str],
-    hf_tokenizer_kwargs: Optional[dict[str, Any]],
+    hf_tokenizer_path: str | None,
+    hf_tokenizer_kwargs: dict[str, Any] | None,
 ) -> None:
     from megatron.core.optimizer import OptimizerConfig
 
@@ -283,12 +321,15 @@ def _save_direct_checkpoint(
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
 
-    print(f"Converting FP8 checkpoint directly: {args.hf_model_path} -> {args.megatron_path}")
+    logger.info("Converting FP8 checkpoint directly: %s -> %s", args.hf_model_path, args.megatron_path)
 
     auto_bridge, provider = build_single_rank_meta_provider(args.hf_model_path)
     bridge = auto_bridge._model_bridge
+    if _bridge_name(auto_bridge._causal_lm_architecture) == "Qwen3MoeForCausalLM":
+        apply_qwen3_moe_orbit_provider_settings(provider, auto_bridge.hf_pretrained.config)
 
     if hasattr(provider, "finalize"):
         provider.finalize()
@@ -297,7 +338,7 @@ def main() -> int:
 
     with temporary_distributed_context(backend="gloo"):
         t0 = time.monotonic()
-        print("Building Megatron meta model...", flush=True)
+        logger.info("Building Megatron meta model...")
         with keep_meta_model_unmaterialized():
             meta_model = provider.provide_distributed_model(
                 wrap_with_ddp=False,
@@ -305,35 +346,49 @@ def main() -> int:
                 init_model_with_meta_device=True,
                 mixed_precision_wrapper=None,
             )
-        print(f"Built Megatron meta model in {time.monotonic() - t0:.2f}s", flush=True)
+        logger.info("Built Megatron meta model in %.2fs", time.monotonic() - t0)
 
-        apply_modelopt_fp8_to_meta_model(meta_model[0])
-        pg_collection = get_pg_collection(meta_model)
-        model_template = meta_model[0].sharded_state_dict(metadata={"dp_cp_group": pg_collection.dp_cp})
-        model_state = build_fp8_direct_model_state_dict(
-            bridge,
+        conversion_tasks = bridge.build_conversion_tasks(
             auto_bridge.hf_pretrained,
             meta_model,
-            model_template,
         )
-        save_progress_monitor = _maybe_create_save_progress_monitor(args.megatron_path)
-        if save_progress_monitor is not None:
-            save_progress_monitor.start()
-        try:
-            _save_direct_checkpoint(
-                provider,
-                args.megatron_path,
-                model_state,
-                model_list=meta_model,
-                pg_collection=pg_collection,
-                hf_tokenizer_path=args.hf_model_path,
-                hf_tokenizer_kwargs=None,
+        fp8_plan = preflight_fp8_conversion_tasks(
+            conversion_tasks,
+            auto_bridge.hf_pretrained.state,
+            require_complete=True,
+        )
+        if not fp8_plan.fp8_task_ids:
+            raise RuntimeError("Direct FP8 conversion found no complete FP8 mappings in the source checkpoint")
+        apply_modelopt_fp8_to_meta_model(meta_model[0], module_names=fp8_plan.module_names)
+        pg_collection = get_pg_collection(meta_model)
+        model_template = meta_model[0].sharded_state_dict(metadata={"dp_cp_group": pg_collection.dp_cp})
+        with atomic_direct_checkpoint_directory(args.megatron_path) as checkpoint_path:
+            model_state = build_fp8_direct_model_state_dict(
+                bridge,
+                auto_bridge.hf_pretrained,
+                meta_model,
+                model_template,
+                conversion_tasks=conversion_tasks,
+                fp8_plan=fp8_plan,
             )
-        finally:
+            save_progress_monitor = _maybe_create_save_progress_monitor(checkpoint_path)
             if save_progress_monitor is not None:
-                save_progress_monitor.stop()
+                save_progress_monitor.start()
+            try:
+                _save_direct_checkpoint(
+                    provider,
+                    checkpoint_path,
+                    model_state,
+                    model_list=meta_model,
+                    pg_collection=pg_collection,
+                    hf_tokenizer_path=args.hf_model_path,
+                    hf_tokenizer_kwargs=None,
+                )
+            finally:
+                if save_progress_monitor is not None:
+                    save_progress_monitor.stop()
 
-    print(f"Done. Direct FP8 Megatron checkpoint saved to: {args.megatron_path}")
+    logger.info("Done. Direct FP8 Megatron checkpoint saved to: %s", args.megatron_path)
     return 0
 
 

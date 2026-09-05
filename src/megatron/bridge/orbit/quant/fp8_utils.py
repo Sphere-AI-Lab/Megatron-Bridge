@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -112,6 +112,35 @@ def _fp8_scale_shape_for_weight(weight_shape: Tuple[int, ...], block_size: int) 
     raise ValueError(f"Unsupported FP8 weight shape: {weight_shape}")
 
 
+def _validate_fp8_scale_shard_boundaries(
+    weight_local_shape: Tuple[int, ...],
+    weight_global_shape: Tuple[int, ...],
+    weight_global_offset: Tuple[int, ...],
+    axis_fragmentations: Tuple[int, ...],
+    block_size: int,
+) -> None:
+    """Reject weight shards that split a blockwise FP8 scale region."""
+    first_block_axis = max(0, len(weight_global_shape) - 2)
+    for axis in range(first_block_axis, len(weight_global_shape)):
+        local_size = weight_local_shape[axis]
+        global_size = weight_global_shape[axis]
+        offset = weight_global_offset[axis]
+        fragmentation = axis_fragmentations[axis]
+        is_sharded = fragmentation > 1 or offset != 0 or local_size != global_size
+        if not is_sharded:
+            continue
+
+        shard_end = offset + local_size
+        if offset % block_size != 0:
+            raise ValueError(
+                f"FP8 weight shard axis {axis} starts at {offset}, inside a {block_size}-element FP8 block"
+            )
+        if shard_end < global_size and shard_end % block_size != 0:
+            raise ValueError(
+                f"FP8 weight shard axis {axis} ends at {shard_end}, inside a {block_size}-element FP8 block"
+            )
+
+
 def transform_sharded_state_dict_for_fp8(
     sharded_state_dict: Dict[str, Any],
     block_size: int = FP8_WEIGHT_BLOCK_SIZE,
@@ -154,9 +183,18 @@ def transform_sharded_state_dict_for_fp8(
     ) -> None:
         if replica_id is None:
             replica_id = sh_ten.replica_id
+        _validate_fp8_scale_shard_boundaries(
+            weight_local_shape,
+            weight_global_shape,
+            weight_global_offset,
+            axis_fragmentations,
+            block_size,
+        )
         scale_local_shape = _fp8_scale_shape_for_weight(weight_local_shape, block_size)
         scale_global_shape = _fp8_scale_shape_for_weight(weight_global_shape, block_size)
-        scale_global_offset = tuple(offset // block_size for offset in weight_global_offset)
+        scale_global_offset = weight_global_offset[:-2] + tuple(
+            offset // block_size for offset in weight_global_offset[-2:]
+        )
         out[scale_key] = ShardedTensor(
             key=checkpoint_key or scale_key,
             data=torch.empty(scale_local_shape, dtype=torch.float32, device="cpu"),
@@ -538,7 +576,7 @@ def dequant_fp8(
 
     Args:
         w_fp8: ``[out, in]`` in ``float8_e4m3fn``.
-        scale_inv: ``[1]`` (per-tensor) or ``[out//B, in//B]`` (block-wise).
+        scale_inv: ``[1]`` (per-tensor) or ``[ceil(out/B), ceil(in/B)]`` (block-wise).
         out_dtype: Target dtype.
     """
     if scale_inv.numel() == 1:
@@ -548,20 +586,34 @@ def dequant_fp8(
     if w_fp8.is_cuda and w_fp8.dim() == 2 and scale_inv.dim() == 2:
         try:
             from megatron.bridge.orbit.oft.triton_oft.dequant_fp8 import (
+                _HAS_TRITON,
                 dequant_fp8_block_triton,
             )
-
-            return dequant_fp8_block_triton(w_fp8, scale_inv.to(torch.float32), out_dtype)
-        except Exception:
-            # Fall through to PyTorch reference on any kernel failure.
-            pass
+        except ModuleNotFoundError as error:
+            if error.name is None or error.name.split(".", maxsplit=1)[0] != "triton":
+                raise
+        else:
+            if _HAS_TRITON:
+                return dequant_fp8_block_triton(
+                    w_fp8,
+                    scale_inv.to(torch.float32),
+                    out_dtype,
+                    block_size=FP8_WEIGHT_BLOCK_SIZE,
+                )
 
     out_feat, in_feat = w_fp8.shape
-    sr, sc = scale_inv.shape
-    bh, bw = out_feat // sr, in_feat // sc
-    w = w_fp8.float().reshape(sr, bh, sc, bw)
-    w = w * scale_inv.float().unsqueeze(1).unsqueeze(3)
-    return w.reshape(out_feat, in_feat).to(out_dtype)
+    expected_scale_shape = (
+        math.ceil(out_feat / FP8_WEIGHT_BLOCK_SIZE),
+        math.ceil(in_feat / FP8_WEIGHT_BLOCK_SIZE),
+    )
+    if tuple(scale_inv.shape) != expected_scale_shape:
+        raise ValueError(
+            f"Expected FP8 scale grid {expected_scale_shape} for weight shape {tuple(w_fp8.shape)} "
+            f"with {FP8_WEIGHT_BLOCK_SIZE}-element blocks, got {tuple(scale_inv.shape)}"
+        )
+    expanded_scale = scale_inv.float().repeat_interleave(FP8_WEIGHT_BLOCK_SIZE, dim=0)
+    expanded_scale = expanded_scale.repeat_interleave(FP8_WEIGHT_BLOCK_SIZE, dim=1)
+    return (w_fp8.float() * expanded_scale[:out_feat, :in_feat]).to(out_dtype)
 
 
 # ------------------------------------------------------------------ #
@@ -578,8 +630,8 @@ def merge_qkv_scale_inv(config, q_s, k_s, v_s):
     Args:
         config: ``TransformerConfig``-like with ``num_attention_heads``,
             ``num_query_groups``, ``kv_channels``, ``hidden_size``.
-        q_s, k_s, v_s: Scale-inv tensors, shapes
-            ``[q_heads * head_blocks, in_blocks]``, etc.
+        q_s, k_s, v_s: Scale-inv tensors. The Q row count includes both
+            query and output-gate blocks when ``attention_output_gate`` is set.
 
     Returns:
         Merged scale-inv of shape ``[merged_out_blocks, in_blocks]``.
@@ -591,16 +643,26 @@ def merge_qkv_scale_inv(config, q_s, k_s, v_s):
     in_blocks = q_s.shape[-1]
     # Each head occupies head_size / block_size rows in the scale tensor.
     # Infer block_size from the scale shape: q has head_num * (head_size/B) rows.
-    scale_rows_per_q_head = q_s.shape[0] // head_num  # head_size / block_size
+    scale_rows_per_q_head = q_s.shape[0] // head_num
     scale_rows_per_kv_head = k_s.shape[0] // num_query_groups
 
     q_r = q_s.reshape(head_num, scale_rows_per_q_head, in_blocks)
     k_r = k_s.reshape(num_query_groups, scale_rows_per_kv_head, in_blocks)
     v_r = v_s.reshape(num_query_groups, scale_rows_per_kv_head, in_blocks)
+    has_output_gate = getattr(config, "attention_output_gate", False)
+    if has_output_gate:
+        if scale_rows_per_q_head % 2 != 0:
+            raise ValueError(
+                "Output-gated Q scale rows must split evenly into query and gate halves, "
+                f"got {scale_rows_per_q_head} rows per head"
+            )
+        q_r, z_r = torch.chunk(q_r, 2, dim=1)
 
     parts = []
     for i in range(num_query_groups):
         parts.append(q_r[i * heads_per_group : (i + 1) * heads_per_group])
+        if has_output_gate:
+            parts.append(z_r[i * heads_per_group : (i + 1) * heads_per_group])
         parts.append(k_r[i : i + 1])
         parts.append(v_r[i : i + 1])
     return torch.cat(parts, dim=0).reshape(-1, in_blocks)

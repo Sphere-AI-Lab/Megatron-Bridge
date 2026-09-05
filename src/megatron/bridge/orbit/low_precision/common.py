@@ -17,22 +17,99 @@
 from __future__ import annotations
 
 import os
+import shutil
+import stat
+import tempfile
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 
 
+if TYPE_CHECKING:
+    from megatron.bridge.models.conversion.auto_bridge import AutoBridge
+    from megatron.bridge.models.gpt_provider import GPTModelProvider
+
+
 __all__ = [
     "add_tensor_entry",
+    "atomic_direct_checkpoint_directory",
     "build_single_rank_meta_provider",
     "patch_meta_init_for_te_modules",
     "prepare_empty_model_state",
     "retain_non_tensor_entries",
     "TensorSpillManager",
 ]
+
+
+_DIRECT_CHECKPOINT_ARTIFACT = Path("iter_0000000") / "metadata.json"
+
+
+def _validate_single_rank_direct_conversion_tasks(
+    conversion_tasks: Sequence[Any],
+    *,
+    format_name: str,
+) -> None:
+    """Require a complete, local task plan for a single-rank direct conversion."""
+    for task_index, task in enumerate(conversion_tasks):
+        if task is None:
+            raise RuntimeError(
+                f"Direct {format_name} conversion task index {task_index} is missing; "
+                "single-rank direct conversion requires every task to have a local Megatron destination"
+            )
+
+        if getattr(task, "megatron_module", None) is None:
+            parameter_name = getattr(task, "global_param_name", None) or getattr(task, "param_name", None)
+            parameter_detail = f" for parameter {parameter_name!r}" if parameter_name is not None else ""
+            raise RuntimeError(
+                f"Direct {format_name} conversion task index {task_index}{parameter_detail} "
+                "has no local Megatron destination; single-rank direct conversion requires a complete local task plan"
+            )
+
+
+@contextmanager
+def atomic_direct_checkpoint_directory(destination: str | Path) -> Iterator[Path]:
+    """Stage a direct checkpoint beside its destination and publish it atomically."""
+    destination = Path(destination)
+    if destination.is_symlink():
+        raise FileExistsError(f"Direct checkpoint destination is a symlink: {destination}")
+    if destination.exists():
+        raise FileExistsError(f"Direct checkpoint destination already exists: {destination}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.staging-",
+            dir=destination.parent,
+        )
+    )
+    mode_probe = staging / ".publish-mode"
+    mode_probe.mkdir()
+    publish_mode = stat.S_IMODE(mode_probe.stat().st_mode)
+    mode_probe.rmdir()
+    try:
+        yield staging
+
+        expected_artifact = staging / _DIRECT_CHECKPOINT_ARTIFACT
+        if not expected_artifact.is_file():
+            raise RuntimeError(
+                "Direct checkpoint is incomplete: expected "
+                f"{_DIRECT_CHECKPOINT_ARTIFACT.as_posix()} before publication"
+            )
+
+        if destination.is_symlink() or destination.exists():
+            raise FileExistsError(
+                f"Direct checkpoint destination appeared before checkpoint publication: {destination}"
+            )
+        staging.chmod(publish_mode)
+        staging.rename(destination)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 class TensorSpillManager:
@@ -146,7 +223,7 @@ def build_single_rank_meta_provider(
     hf_model_path: str,
     *,
     trust_remote_code: bool = False,
-):
+) -> tuple[AutoBridge, GPTModelProvider]:
     """Build a single-rank provider without loading weights for direct conversion."""
     from megatron.bridge.models.conversion.auto_bridge import AutoBridge
 
@@ -197,7 +274,11 @@ def patch_meta_init_for_te_modules() -> None:
         try:
             return _orig_init_affine(weight, *args, **kwargs)
         except NotImplementedError:
-            return None
+            weight_device = getattr(getattr(weight, "device", None), "type", None)
+            default_device = torch.device(torch.get_default_device()).type
+            if weight_device == "meta" or default_device == "meta":
+                return None
+            raise
 
     _tp_layers._initialize_affine_weight_cpu = _patched_init_affine
     _te_ext._initialize_affine_weight_cpu = _patched_init_affine

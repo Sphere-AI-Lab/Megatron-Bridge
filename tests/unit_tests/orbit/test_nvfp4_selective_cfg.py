@@ -14,9 +14,15 @@
 
 """Unit tests for _selective_nvfp4_quant_cfg across both ModelOpt schemas."""
 
-import pytest
+from types import SimpleNamespace
 
-from megatron.bridge.orbit.low_precision.nvfp4 import _selective_nvfp4_quant_cfg
+import pytest
+import torch
+
+from megatron.bridge.orbit.low_precision.nvfp4 import (
+    _selective_nvfp4_quant_cfg,
+    build_fused_nvfp4_weight_entries,
+)
 
 
 pytestmark = pytest.mark.unit
@@ -75,3 +81,113 @@ class TestListSchema:
     def test_unsupported_type_raises(self):
         with pytest.raises(TypeError, match="Unsupported ModelOpt quant_cfg type"):
             _selective_nvfp4_quant_cfg("not-a-config", ["m"])
+
+
+@pytest.mark.unit
+def test_fused_qkv_normalizes_distinct_weight_double_scales() -> None:
+    """Independent Q/K/V quantizers may not share ``weight_scale_2``."""
+    config = SimpleNamespace(
+        num_attention_heads=2,
+        num_query_groups=1,
+        kv_channels=8,
+        hidden_size=16,
+        attention_output_gate=False,
+    )
+    mapping = SimpleNamespace(_get_config=lambda module: config)
+
+    def bundle(rows: int, double_scale: float) -> dict[str, torch.Tensor]:
+        return {
+            "weight": torch.zeros((rows, 8), dtype=torch.uint8),
+            "weight_scale": torch.ones((rows, 1), dtype=torch.float8_e4m3fn),
+            "weight_scale_2": torch.tensor(double_scale),
+            "input_scale": torch.tensor(1.0),
+        }
+
+    entries, state = build_fused_nvfp4_weight_entries(
+        mapping,
+        "decoder.layers.0.self_attention.linear_qkv.weight",
+        {
+            "q": bundle(16, 1.0),
+            "k": bundle(8, 2.0),
+            "v": bundle(8, 4.0),
+        },
+        object(),
+    )
+
+    shared = state["weight_scale_2"]
+    effective_scale = entries["decoder.layers.0.self_attention.linear_qkv.weight_quantizer._scale"].float() * shared
+    expected = torch.tensor([[1.0]] * 16 + [[2.0]] * 8 + [[4.0]] * 8)
+    torch.testing.assert_close(effective_scale, expected)
+
+
+@pytest.mark.unit
+def test_fused_qkv_normalizes_near_double_scales_back_to_canonical_fp8() -> None:
+    """Near double scales stay schema-valid with only FP8-rounding error."""
+    config = SimpleNamespace(
+        num_attention_heads=2,
+        num_query_groups=1,
+        kv_channels=8,
+        hidden_size=16,
+        attention_output_gate=False,
+    )
+    mapping = SimpleNamespace(_get_config=lambda module: config)
+
+    def bundle(rows: int, double_scale: float) -> dict[str, torch.Tensor]:
+        return {
+            "weight": torch.zeros((rows, 8), dtype=torch.uint8),
+            "weight_scale": torch.ones((rows, 1), dtype=torch.float8_e4m3fn),
+            "weight_scale_2": torch.tensor(double_scale),
+            "input_scale": torch.tensor(1.0),
+        }
+
+    entries, state = build_fused_nvfp4_weight_entries(
+        mapping,
+        "decoder.layers.0.self_attention.linear_qkv.weight",
+        {
+            "q": bundle(16, 1.0),
+            "k": bundle(8, 1.000005),
+            "v": bundle(8, 1.0),
+        },
+        object(),
+    )
+
+    shared = state["weight_scale_2"]
+    block_scale = entries["decoder.layers.0.self_attention.linear_qkv.weight_quantizer._scale"]
+    effective_scale = block_scale.float() * shared
+    expected = torch.tensor([[1.0]] * 16 + [[1.000005]] * 8 + [[1.0]] * 8)
+    assert block_scale.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(effective_scale, expected, atol=1e-5, rtol=0)
+
+
+@pytest.mark.unit
+def test_fused_qkv_rejects_shared_scale_normalization_that_exceeds_fp8_rounding_bound() -> None:
+    """Fixed nonzero packed values must not be published with corrupted effective scales."""
+    config = SimpleNamespace(
+        num_attention_heads=2,
+        num_query_groups=1,
+        kv_channels=8,
+        hidden_size=16,
+        attention_output_gate=False,
+    )
+    mapping = SimpleNamespace(_get_config=lambda module: config)
+
+    def bundle(rows: int, double_scale: float) -> dict[str, torch.Tensor]:
+        return {
+            # 0x11 decodes to two nonzero E2M1 values, so scale corruption is observable.
+            "weight": torch.full((rows, 8), 0x11, dtype=torch.uint8),
+            "weight_scale": torch.ones((rows, 1), dtype=torch.float8_e4m3fn),
+            "weight_scale_2": torch.tensor(double_scale),
+            "input_scale": torch.tensor(1.0),
+        }
+
+    with pytest.raises(ValueError, match=r"cannot preserve effective block scales.*6\.25%"):
+        build_fused_nvfp4_weight_entries(
+            mapping,
+            "decoder.layers.0.self_attention.linear_qkv.weight",
+            {
+                "q": bundle(16, 1.0),
+                "k": bundle(8, 1e-8),
+                "v": bundle(8, 1.0),
+            },
+            object(),
+        )

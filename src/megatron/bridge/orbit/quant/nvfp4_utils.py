@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ NVFP4 4-tuple entries the on-disk checkpoint stores.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict
 
@@ -57,6 +58,16 @@ from megatron.bridge.orbit.low_precision.nvfp4 import (
     scale_to_amax,
     transform_sharded_state_dict_for_nvfp4_dense,
 )
+from megatron.bridge.orbit.quantized_geometry import (
+    reconstruct_swiglu_factory_geometry,
+    resolve_expert_layer_index,
+    rewrite_dense_layer_key,
+    validate_quantized_shard_geometry,
+    validate_sharded_weight_metadata,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -146,46 +157,15 @@ def transform_sharded_state_dict_for_nvfp4(
         # restore the fused local out-dim, fused out offset, and fused out-axis
         # fragmentation before constructing the NVFP4 entries.
         if isinstance(value, ShardedTensorFactory):
-            built_sub = value.build()
-            if isinstance(built_sub, list):
-                sub_sh_ten = built_sub[0]
-                sub_sh_tens = built_sub
-            else:
-                sub_sh_ten = next(iter(built_sub.values()))
-                sub_sh_tens = list(built_sub.values())
-            sh_ten = sub_sh_ten
-
-            fused_local_out = value.data.shape[0]
-            split_local_out = sh_ten.local_shape[-2]
-            if split_local_out == 0 or fused_local_out % split_local_out != 0:
-                raise ValueError(
-                    f"Unexpected SwiGLU factory shapes for {key}: "
-                    f"fused local out={fused_local_out}, split local out={split_local_out}"
-                )
-            split_factor = fused_local_out // split_local_out
-            out_axis = sh_ten.prepend_axis_num
-            rank_offset = sh_ten.global_offset[out_axis] // split_local_out
-
-            axis_fragmentations_override = list(sh_ten.axis_fragmentations)
-            if all(sub.key == value.key for sub in sub_sh_tens):
-                # singleton_local_shards=False: sub-shards tile the fused grid.
-                if axis_fragmentations_override[out_axis] % split_factor != 0:
-                    raise ValueError(
-                        f"Unexpected SwiGLU factory fragmentation for {key}: "
-                        f"{axis_fragmentations_override[out_axis]} not divisible by {split_factor}"
-                    )
-                axis_fragmentations_override[out_axis] //= split_factor
-                fused_global_out = sh_ten.global_shape[out_axis]
-            else:
-                # singleton_local_shards=True: split keys -> rebuild fused grid.
-                fused_global_out = sh_ten.global_shape[out_axis] * split_factor
-
-            local_out = fused_local_out
-            global_out = fused_global_out
-            out_offset = rank_offset * fused_local_out
-            axis_fragmentations = tuple(axis_fragmentations_override)
+            geometry = reconstruct_swiglu_factory_geometry(value, key=key)
+            sh_ten = geometry.sharded_tensor
+            local_out = geometry.local_out
+            global_out = geometry.global_out
+            out_offset = geometry.out_offset
+            axis_fragmentations = geometry.axis_fragmentations
         elif isinstance(value, ShardedTensor):
             sh_ten = value
+            validate_sharded_weight_metadata(sh_ten, key=key)
             local_out = sh_ten.local_shape[-2]
             global_out = sh_ten.global_shape[-2]
             out_offset = sh_ten.global_offset[sh_ten.prepend_axis_num]
@@ -206,6 +186,15 @@ def transform_sharded_state_dict_for_nvfp4(
         weight_axis_fragmentations = (
             tuple(axis_fragmentations[prepend:]) if prepend > 0 else tuple(axis_fragmentations)
         )
+        validate_quantized_shard_geometry(
+            key=key,
+            local_shape=(local_out, local_in),
+            global_shape=(global_out, global_in),
+            global_offset=(out_offset, in_offset),
+            axis_fragmentations=weight_axis_fragmentations,
+            packing_factor=2,
+            group_size=NVFP4_GROUP_SIZE,
+        )
         # For grouped MoE with EP, the local runtime index N differs from the
         # global expert index (e.g. EP rank 1 of 4 with 96 local experts maps
         # local weight0 -> global weight96). Use the prepend axis's global_offset
@@ -225,14 +214,21 @@ def transform_sharded_state_dict_for_nvfp4(
         # can find packed/scale/scalar entries under one consistent path
         # (matches int4_utils.py and fp8_utils.py).
         prefix = m.group(1)
+        global_layer_idx = resolve_expert_layer_index(sh_ten, key=canonical)
+        checkpoint_prefix = rewrite_dense_layer_key(prefix, global_layer_idx)
         # On-disk names come from the shared definition in
         # orbit.low_precision.nvfp4, which the converter also uses, so the
         # two sides cannot describe different layouts.
-        ckpt_names = nvfp4_weight_entry_names(prefix, str(expert_global_idx), swiglu=is_fc1)
-        ckpt_quant_names = nvfp4_quantizer_entry_names(prefix, str(expert_global_idx))
+        ckpt_names = nvfp4_weight_entry_names(checkpoint_prefix, str(expert_global_idx), swiglu=is_fc1)
+        ckpt_quant_names = nvfp4_quantizer_entry_names(checkpoint_prefix, str(expert_global_idx))
 
         if is_fc1:
             # SwiGLU: gate (_w) and up (_v) halves at half-out, half-in (FP4 packed).
+            if local_out % 2 != 0 or global_out % 2 != 0 or out_offset % 2 != 0:
+                raise ValueError(
+                    f"NVFP4 split SwiGLU requires even local/global output rows and output offset for {key}; "
+                    f"got local={local_out}, global={global_out}, offset={out_offset}"
+                )
             half_in = local_in // 2
             global_half_in = global_in // 2
             for half_suffix in ("_w", "_v"):
@@ -247,7 +243,6 @@ def transform_sharded_state_dict_for_nvfp4(
                     axis_fragmentations=weight_axis_fragmentations,
                     replica_id=sh_ten.replica_id,
                     prepend_axis_num=0,
-                    allow_shape_mismatch=True,
                 )
                 new_sd[f"{canonical}{half_suffix}"] = new_st
         else:
@@ -265,7 +260,6 @@ def transform_sharded_state_dict_for_nvfp4(
                 axis_fragmentations=weight_axis_fragmentations,
                 replica_id=sh_ten.replica_id,
                 prepend_axis_num=0,
-                allow_shape_mismatch=True,
             )
             new_sd[canonical] = new_st
 
@@ -284,7 +278,6 @@ def transform_sharded_state_dict_for_nvfp4(
             axis_fragmentations=weight_axis_fragmentations,
             replica_id=sh_ten.replica_id,
             prepend_axis_num=0,
-            allow_shape_mismatch=True,
         )
         new_sd[f"{prefix}.weight_quantizer._scale{expert_local_idx}"] = scale_st
 
@@ -301,7 +294,6 @@ def transform_sharded_state_dict_for_nvfp4(
                 # so the dist-ckpt loader sees one primary writer per TP rank.
                 replica_id=_replica_id_with_current_tp_rank(sh_ten.replica_id),
                 prepend_axis_num=0,
-                allow_shape_mismatch=True,
             )
             new_sd[f"{prefix}.weight_quantizer.{scalar_suffix}{expert_local_idx}"] = scalar_st
 
@@ -396,4 +388,4 @@ def register_nvfp4_buffers_after_load(
         if base_w is not None and hasattr(base_w, "data"):
             base_w.data = _empty_storage_view(base_w.data)
 
-    print(f"[NVFP4 expert register] Registered NVFP4 buffers for {registered} expert weights")
+    logger.info("[NVFP4 expert register] Registered NVFP4 buffers for %d expert weights", registered)

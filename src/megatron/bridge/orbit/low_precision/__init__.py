@@ -23,10 +23,13 @@ from .common import (
     retain_non_tensor_entries,
 )
 from .fp8 import (
+    FP8ConversionPlan,
     apply_modelopt_fp8_to_meta_model,
     build_fp8_direct_model_state_dict,
     build_fp8_scale_inv_key,
     build_merged_scale_inv_for_task,
+    collect_fp8_target_module_names,
+    preflight_fp8_conversion_tasks,
 )
 from .int4 import (
     build_int4_direct_model_state_dict,
@@ -49,6 +52,7 @@ from .nvfp4 import (
 
 
 __all__ = [
+    "FP8ConversionPlan",
     "add_tensor_entry",
     "apply_modelopt_fp8_to_meta_model",
     "build_fp8_direct_model_state_dict",
@@ -60,6 +64,7 @@ __all__ = [
     "build_megatron_nvfp4_weight_entries",
     "build_nvfp4_direct_model_state_dict",
     "build_single_rank_meta_provider",
+    "collect_fp8_target_module_names",
     "collect_nvfp4_target_module_names",
     "convert_hf_weight_for_direct_save",
     "dequantize_int4",
@@ -69,6 +74,7 @@ __all__ = [
     "is_nvfp4_source",
     "is_nvfp4_weight_mapping",
     "patch_meta_init_for_te_modules",
+    "preflight_fp8_conversion_tasks",
     "prepare_empty_model_state",
     "quantize_to_int4",
     "retain_non_tensor_entries",
