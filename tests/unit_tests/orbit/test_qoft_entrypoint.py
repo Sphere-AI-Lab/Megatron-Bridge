@@ -16,11 +16,12 @@ import importlib.util
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
-from transformers import Qwen3Config
+from transformers import Qwen3Config, Qwen3MoeConfig
 
 
 _REPO_ROOT = Path(__file__).parents[3]
@@ -89,6 +90,49 @@ def test_build_config_accepts_dense_qwen3_fp8(tmp_path: Path) -> None:
 
     assert arch_spec["key"] == "qwen3_dense"
     assert args.tp == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("quant", ["int4", "fp8", "nvfp4"])
+def test_qwen3_moe_qoft_build_config_applies_orbit_provider_settings(tmp_path: Path, quant: str) -> None:
+    """The maintained finetuning entrypoint must use the quantized provider contract."""
+    hf_model_path = tmp_path / "qwen3-moe"
+    hf_model_path.mkdir()
+    hf_config = Qwen3MoeConfig(
+        hidden_size=256,
+        intermediate_size=512,
+        moe_intermediate_size=128,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_experts=8,
+        num_experts_per_tok=2,
+        decoder_sparse_step=2,
+        mlp_only_layers=[3],
+        vocab_size=512,
+    )
+    hf_config.architectures = ["Qwen3MoeForCausalLM"]
+    hf_config.save_pretrained(hf_model_path)
+
+    entrypoint = _load_qoft_entrypoint()
+    args = entrypoint.parse_args(
+        [
+            "--quant",
+            quant,
+            "--hf-model-path",
+            str(hf_model_path),
+            "--pretrained-checkpoint",
+            str(tmp_path / "checkpoint"),
+            "--skip-train",
+        ]
+    )
+    spec = entrypoint.resolve_arch(str(hf_model_path))
+    entrypoint._fill_arch_defaults(args, spec, world_size=8)
+    config = entrypoint.build_config(args, spec)
+
+    assert config.model.moe_router_dtype == "fp32"
+    assert config.model.moe_layer_freq == [0, 1, 0, 0, 0, 1]
 
 
 @pytest.mark.unit
@@ -198,6 +242,28 @@ def test_fp8_preflight_reports_only_missing_request_keys() -> None:
 
 
 @pytest.mark.unit
+def test_fp8_quant_mode_disables_independent_modelopt_restore() -> None:
+    """QOFT's plain-module FP8 transform is the sole checkpoint owner."""
+    entrypoint = _load_qoft_entrypoint()
+    hooks = []
+    config = SimpleNamespace(
+        model=SimpleNamespace(
+            restore_modelopt_state=True,
+            register_pre_wrap_hook=lambda hook: hooks.append(hook),
+        )
+    )
+
+    entrypoint._apply_quant_mode(
+        config,
+        SimpleNamespace(quant="fp8"),
+        {"key": "qwen3_dense"},
+    )
+
+    assert config.model.restore_modelopt_state is False
+    assert hooks == [entrypoint.ensure_fp8_scale_inv_buffers]
+
+
+@pytest.mark.unit
 def test_qoft_cli_rejects_removed_quantized_lora_option(tmp_path: Path) -> None:
     """The quantized entrypoint owns OFT only until QLoRA has an implementation."""
     entrypoint = _load_qoft_entrypoint()
@@ -283,6 +349,86 @@ def test_moonlight_defaults_match_supported_world_size(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("architecture", "quant"),
+    [
+        ("KimiK25ForConditionalGeneration", "nvfp4"),
+        ("Qwen3MoeForCausalLM", "nvfp4"),
+    ],
+)
+def test_arch_defaults_allow_overlapping_tp_and_ep_axes(tmp_path: Path, architecture: str, quant: str) -> None:
+    """TP and EP overlap, so their product must not be treated as rank count."""
+    entrypoint = _load_qoft_entrypoint()
+    spec = entrypoint.ARCH_SPECS[architecture]
+    args = entrypoint.parse_args(_oft_argv(tmp_path, quant))
+    entrypoint._fill_arch_defaults(args, spec, world_size=4)
+    assert (args.tp, args.ep, args.pp) == (2, 4, 1)
+
+    entrypoint._validate_runtime_topology(args, spec, world_size=4)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("world_size", "tp", "ep", "pp", "valid"),
+    [
+        (4, 2, 4, 1, True),
+        (8, 4, 4, 2, True),
+        (12, 2, 4, 1, True),
+        (6, 4, 3, 1, False),
+        (6, 3, 4, 1, False),
+    ],
+)
+def test_general_topology_validates_tp_and_ep_axes_separately(
+    tmp_path: Path, world_size: int, tp: int, ep: int, pp: int, valid: bool
+) -> None:
+    entrypoint = _load_qoft_entrypoint()
+    spec = entrypoint.ARCH_SPECS["Qwen3MoeForCausalLM"]
+    args = entrypoint.parse_args(_oft_argv(tmp_path, "fp8", "--tp", str(tp), "--ep", str(ep), "--pp", str(pp)))
+    entrypoint._fill_arch_defaults(args, spec, world_size=world_size)
+
+    if valid:
+        entrypoint._validate_runtime_topology(args, spec, world_size=world_size)
+    else:
+        with pytest.raises(SystemExit, match=r"TP\*PP|EP\*PP"):
+            entrypoint._validate_runtime_topology(args, spec, world_size=world_size)
+
+
+@pytest.mark.unit
+def test_general_topology_accepts_data_parallel_multiple(tmp_path: Path) -> None:
+    entrypoint = _load_qoft_entrypoint()
+    spec = entrypoint.ARCH_SPECS["Qwen3MoeForCausalLM"]
+    args = entrypoint.parse_args(_oft_argv(tmp_path, "nvfp4", "--tp", "2", "--ep", "2", "--pp", "1"))
+    entrypoint._fill_arch_defaults(args, spec, world_size=8)
+
+    entrypoint._validate_runtime_topology(args, spec, world_size=8)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("world_size", "extra", "invalid_name"),
+    [
+        (0, (), "WORLD_SIZE"),
+        (1, ("--tp", "0"), "TP"),
+        (1, ("--ep", "-1"), "EP"),
+        (1, ("--pp", "0"), "PP"),
+    ],
+)
+def test_general_topology_rejects_nonpositive_dimensions(
+    tmp_path: Path,
+    world_size: int,
+    extra: tuple[str, ...],
+    invalid_name: str,
+) -> None:
+    entrypoint = _load_qoft_entrypoint()
+    spec = entrypoint.ARCH_SPECS["Qwen3ForCausalLM"]
+    args = entrypoint.parse_args(_oft_argv(tmp_path, "fp8", *extra))
+    entrypoint._fill_arch_defaults(args, spec, world_size=world_size)
+
+    with pytest.raises(SystemExit, match=rf"{invalid_name}.*positive|positive.*{invalid_name}"):
+        entrypoint._validate_runtime_topology(args, spec, world_size=world_size)
+
+
+@pytest.mark.unit
 def test_big_model_specs_define_pipeline_layout() -> None:
     entrypoint = _load_qoft_entrypoint()
 
@@ -294,16 +440,17 @@ def test_big_model_specs_define_pipeline_layout() -> None:
 @pytest.mark.unit
 def test_qoft_launcher_forwards_explicit_operational_controls(tmp_path: Path) -> None:
     """The consolidated launcher exposes former model-wrapper controls directly."""
-    capture_path = tmp_path / "torchrun-args.txt"
+    capture_path = tmp_path / "uv-args.txt"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    torchrun = bin_dir / "torchrun"
-    torchrun.write_text('#!/bin/bash\nprintf "%s\\n" "$@" >"$CAPTURE_PATH"\n')
-    torchrun.chmod(0o755)
+    uv = bin_dir / "uv"
+    uv.write_text('#!/bin/bash\nprintf "%s\\n" "$@" >"$CAPTURE_PATH"\n')
+    uv.chmod(0o755)
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "CAPTURE_PATH": str(capture_path),
+        "EXTRA_ARGS": "",
         "QUANT": "int4",
         "HF_MODEL_PATH": "/models/kimi",
         "MEGATRON_CKPT": "/checkpoints/kimi",
@@ -330,7 +477,16 @@ def test_qoft_launcher_forwards_explicit_operational_controls(tmp_path: Path) ->
 
     assert result.returncode == 0, result.stderr
     forwarded = capture_path.read_text().splitlines()
-    assert forwarded[:2] == ["--nproc_per_node=8", "scripts/orbit/finetune_qoft.py"]
+    assert forwarded[:8] == [
+        "run",
+        "--project",
+        str(_REPO_ROOT),
+        "python",
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node=8",
+        "scripts/orbit/finetune_qoft.py",
+    ]
     assert "--sp" in forwarded
     assert "--distributed-timeout-minutes" in forwarded
     assert "--target-modules" in forwarded
@@ -341,6 +497,41 @@ def test_qoft_launcher_forwards_explicit_operational_controls(tmp_path: Path) ->
     assert "--profile-memory" in forwarded
     assert "--profile-memory-steps" in forwarded
     assert "--peft" not in forwarded
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("num_gpus", [None, "0", "-2", "two", "1.5"])
+def test_qoft_launcher_requires_explicit_positive_integer_num_gpus(tmp_path: Path, num_gpus: str | None) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text("#!/bin/bash\nexit 99\n")
+    uv.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "EXTRA_ARGS": "",
+        "QUANT": "fp8",
+        "HF_MODEL_PATH": "/models/qwen3",
+        "MEGATRON_CKPT": "/checkpoints/qwen3",
+    }
+    if num_gpus is None:
+        env.pop("NUM_GPUS", None)
+    else:
+        env["NUM_GPUS"] = num_gpus
+
+    result = subprocess.run(
+        ["bash", str(_QOFT_LAUNCHER_PATH)],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.returncode != 99
+    assert "NUM_GPUS" in result.stderr
 
 
 def _oft_argv(tmp_path: Path, quant: str, *extra: str) -> list[str]:
@@ -484,16 +675,17 @@ def test_qoft_rejects_unknown_oft_type(tmp_path: Path) -> None:
 @pytest.mark.unit
 def test_qoft_launcher_forwards_oft_type(tmp_path: Path) -> None:
     """OFT_TYPE reaches the entrypoint, so either implementation is selectable."""
-    capture_path = tmp_path / "torchrun-args.txt"
+    capture_path = tmp_path / "uv-args.txt"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    torchrun = bin_dir / "torchrun"
-    torchrun.write_text('#!/bin/bash\nprintf "%s\\n" "$@" >"$CAPTURE_PATH"\n')
-    torchrun.chmod(0o755)
+    uv = bin_dir / "uv"
+    uv.write_text('#!/bin/bash\nprintf "%s\\n" "$@" >"$CAPTURE_PATH"\n')
+    uv.chmod(0o755)
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "CAPTURE_PATH": str(capture_path),
+        "EXTRA_ARGS": "",
         "QUANT": "nvfp4",
         "HF_MODEL_PATH": "/models/qwen3-moe",
         "MEGATRON_CKPT": "/checkpoints/qwen3-moe",

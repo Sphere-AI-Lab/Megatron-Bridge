@@ -1,6 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
+
+
+# The project module below imports Triton eagerly.  Skip before importing it so
+# optional-Triton environments can still collect the rest of the Orbit suite.
+pytest.importorskip("triton")
+
 import torch
 
 from megatron.bridge.orbit.oft.triton_oft.segmented_oft_linear import (
@@ -42,9 +48,7 @@ def test_reference_routes_repeated_rotation_ids() -> None:
     ("shape", "block_size"),
     [((1, 32), 16), ((2, 17, 64), 32)],
 )
-def test_segmented_oft_linear_matches_reference(
-    shape: tuple[int, ...], block_size: int
-) -> None:
+def test_segmented_oft_linear_matches_reference(shape: tuple[int, ...], block_size: int) -> None:
     torch.manual_seed(11)
     device = torch.device("cuda")
     input_dim = shape[-1]
@@ -66,9 +70,7 @@ def test_segmented_oft_linear_matches_reference(
     actual = segmented_oft_linear(x, weight, rotations, offsets, rotation_ids)
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
-    cosine = torch.nn.functional.cosine_similarity(
-        actual.float().flatten(), expected.float().flatten(), dim=0
-    )
+    cosine = torch.nn.functional.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0)
     assert cosine > 0.9999
 
 
@@ -98,9 +100,7 @@ def test_segmented_oft_linear_backward_accumulates_repeated_rotation_ids() -> No
         (x_actual.grad, x_ref.grad),
         (rotations_actual.grad, rotations_ref.grad),
     ):
-        torch.testing.assert_close(
-            actual_grad.float(), reference_grad.float(), rtol=5e-2, atol=6.25e-2
-        )
+        torch.testing.assert_close(actual_grad.float(), reference_grad.float(), rtol=5e-2, atol=6.25e-2)
         cosine = torch.nn.functional.cosine_similarity(
             actual_grad.float().flatten(), reference_grad.float().flatten(), dim=0
         )

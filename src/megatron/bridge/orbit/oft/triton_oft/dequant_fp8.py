@@ -118,12 +118,14 @@ def dequant_fp8_block_triton(
     w_fp8: torch.Tensor,
     scale: torch.Tensor,
     out_dtype: torch.dtype,
+    *,
+    block_size: int | None = None,
 ) -> torch.Tensor:
     """Fused FP8 block-wise dequant. CUDA-only; caller must gate on device.
 
     Accepts 2-D ``[M, N]`` or 3-D ``[E, M, N]`` inputs; returns same rank.
-    ``scale`` must have a matching ``[sr, sc]`` or ``[E, sr, sc]`` shape
-    such that ``M % sr == 0`` and ``N % sc == 0``.
+    By default, block dimensions are inferred from an evenly divisible scale
+    grid. Passing ``block_size`` supports fixed-size blocks with partial tails.
     """
     assert _HAS_TRITON, "triton not available"
     assert w_fp8.is_cuda, "dequant_fp8_block_triton requires CUDA"
@@ -139,14 +141,29 @@ def dequant_fp8_block_triton(
     E, M, N = w_fp8.shape
     E_s, SR, SC = scale.shape
     assert E_s == E, (E, E_s)
-    assert M % SR == 0 and N % SC == 0, (M, SR, N, SC)
-    BH = M // SR
-    BW = N // SC
+    if block_size is None:
+        assert M % SR == 0 and N % SC == 0, (M, SR, N, SC)
+        BH = M // SR
+        BW = N // SC
+    else:
+        if block_size <= 0:
+            raise ValueError(f"block_size must be positive, got {block_size}")
+        expected_scale_shape = (
+            triton.cdiv(M, block_size),
+            triton.cdiv(N, block_size),
+        )
+        if (SR, SC) != expected_scale_shape:
+            raise ValueError(
+                f"Expected scale grid {expected_scale_shape} for weight shape {(M, N)} "
+                f"with block_size={block_size}, got {(SR, SC)}"
+            )
+        BH = block_size
+        BW = block_size
 
     out = torch.empty((E, M, N), dtype=out_dtype, device=w_fp8.device)
 
-    BLOCK_M = min(128, max(16, BH))
-    BLOCK_N = min(128, max(16, BW))
+    BLOCK_M = min(128, max(16, triton.next_power_of_2(BH)))
+    BLOCK_N = min(128, max(16, triton.next_power_of_2(BW)))
 
     grid = (E, triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _dequant_fp8_block_kernel[grid](

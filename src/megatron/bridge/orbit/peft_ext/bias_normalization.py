@@ -7,14 +7,12 @@ Extracted from ``megatron.bridge.peft.utils`` and invoked by
 upstream PEFT transformation walks and freezes the model.
 """
 
-from typing import Optional
-
 from torch import nn
 
 from megatron.bridge.peft.utils import HAVE_TE, TECL, TERL
 
 
-def _compose_module_name(name: Optional[str] = None, prefix: Optional[str] = None) -> str:
+def _compose_module_name(name: str | None = None, prefix: str | None = None) -> str:
     if prefix and name:
         return f"{prefix}.{name}"
     if prefix:
@@ -24,9 +22,9 @@ def _compose_module_name(name: Optional[str] = None, prefix: Optional[str] = Non
 
 def module_bias_enabled(
     module: nn.Module,
-    name: Optional[str] = None,
-    prefix: Optional[str] = None,
-) -> Optional[bool]:
+    name: str | None = None,
+    prefix: str | None = None,
+) -> bool | None:
     """Return whether ``module`` should actively use bias.
 
     The explicit module flags are the primary source of truth. When a module
@@ -61,7 +59,8 @@ def module_bias_enabled(
     if hasattr(module, "bias") and add_bias_linear is not None:
         if isinstance(module, nn.Linear):
             return bool(add_bias_linear)
-        if HAVE_TE and isinstance(module, (*TECL, *TERL)):
+        te_linear_types = tuple(candidate for candidate in (*TECL, *TERL) if isinstance(candidate, type))
+        if HAVE_TE and te_linear_types and isinstance(module, te_linear_types):
             return bool(add_bias_linear)
 
     return None
@@ -69,8 +68,8 @@ def module_bias_enabled(
 
 def normalize_disabled_bias_placeholders(
     module: nn.Module,
-    name: Optional[str] = None,
-    prefix: Optional[str] = None,
+    name: str | None = None,
+    prefix: str | None = None,
 ) -> nn.Module:
     """Remove placeholder bias parameters from modules that are logically no-bias.
 

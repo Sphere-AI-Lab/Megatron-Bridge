@@ -275,5 +275,27 @@ class OFTRotationSingleFunction(torch.autograd.Function):
 
 
 def oft_r_single(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
-    """Functional API: triton OFT Rotation Single with autograd support."""
+    """Apply a block-diagonal OFT rotation with differentiable dispatch."""
+    if x.dim() != 2:
+        raise ValueError(f"oft_r_single expects a 2-D [tokens, width] input, got shape {tuple(x.shape)}")
+    if R.dim() != 3:
+        raise ValueError(f"oft_r_single expects a 3-D batch of square rotation matrices, got shape {tuple(R.shape)}")
+    if R.numel() == 0:
+        raise ValueError(f"oft_r_single expects a nonempty rotation tensor, got shape {tuple(R.shape)}")
+    if R.shape[-2] != R.shape[-1]:
+        raise ValueError(f"oft_r_single expects square rotation matrices, got shape {tuple(R.shape)}")
+
+    num_blocks, block_size, _ = R.shape
+    expected_width = num_blocks * block_size
+    if x.shape[1] != expected_width:
+        raise ValueError(
+            f"oft_r_single input width must equal num_blocks * block_size ({expected_width}), got {x.shape[1]}"
+        )
+
+    x = x.contiguous()
+    is_power_of_two = block_size > 0 and block_size & (block_size - 1) == 0
+    if not is_power_of_two:
+        total_tokens = x.shape[0]
+        x_blocks = x.reshape(total_tokens, num_blocks, block_size)
+        return torch.einsum("tbk,bkc->tbc", x_blocks, R).reshape_as(x)
     return OFTRotationSingleFunction.apply(x, R)

@@ -247,11 +247,17 @@ class CayleyNeumannFunction(torch.autograd.Function):
 def cayley_neumann(Q_skew: torch.Tensor, num_terms: int = 5) -> torch.Tensor:
     """Functional API: triton Cayley-Neumann with autograd support.
 
-    Uses triton for small blocks (fp16: <= 64, fp32: <= 32).
-    Falls back to torch for larger blocks (register pressure makes triton slower).
+    Uses triton for small power-of-two blocks (fp16: <= 128, fp32: <= 32).
+    Falls back to torch for larger or non-power-of-two blocks.
     """
+    if Q_skew.dim() != 3:
+        raise ValueError(f"cayley_neumann expects a 3-D batch of square matrices, got shape {tuple(Q_skew.shape)}")
+    if Q_skew.shape[-2] != Q_skew.shape[-1]:
+        raise ValueError(f"cayley_neumann expects square matrices, got shape {tuple(Q_skew.shape)}")
+
     block_size = Q_skew.shape[-1]
     max_bs = _TRITON_MAX_BLOCK_SIZE_FP32 if Q_skew.dtype == torch.float32 else _TRITON_MAX_BLOCK_SIZE_FP16
-    if block_size > max_bs:
+    is_power_of_two = block_size > 0 and block_size & (block_size - 1) == 0
+    if block_size > max_bs or not is_power_of_two:
         return _torch_cayley_neumann(Q_skew, num_terms)
     return CayleyNeumannFunction.apply(Q_skew, num_terms)

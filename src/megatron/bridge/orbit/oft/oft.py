@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +24,6 @@ Reference: https://arxiv.org/abs/2306.07280
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -37,6 +36,7 @@ from megatron.bridge.orbit.oft.oft_layers import (
     OFTLinear,
     OFTRotationModule,
     OFTTopKRouter,
+    TEOFTLayerNormLinear,
     _clear_disabled_bias_parameters,
     _fp8_activation_qdq_per_token_group_ste,
     _get_active_bias_tensor,
@@ -44,6 +44,8 @@ from megatron.bridge.orbit.oft.oft_layers import (
     _is_direct_fp8_runtime_weight,
     _module_bias_enabled,
     _oft_fp8_debug_log,
+    _prepare_raw_column_parallel_input,
+    _validate_oft_hyperparameters,
 )
 from megatron.bridge.orbit.peft_ext.adapter_attrs import get_oft_adapter_attributes_from_linear
 from megatron.bridge.orbit.peft_ext.peft_mixin import OrbitPEFTMixin
@@ -63,6 +65,18 @@ TELayerNormColumnParallelLinear, HAVE_TE_LN_COL_LINEAR = safe_import_from(
     "megatron.core.extensions.transformer_engine",
     "TELayerNormColumnParallelLinear",
 )
+
+
+def _localize_oft_row_parallel_geometry(full_in_features: int, r: int, tp_size: int) -> tuple[int, int]:
+    """Return TP-local input width and block count without splitting OFT blocks."""
+    if tp_size <= 0:
+        raise ValueError(f"tensor-parallel size must be positive, got {tp_size}")
+    if full_in_features % tp_size != 0:
+        raise ValueError(f"in_features ({full_in_features}) must be divisible by tensor-parallel size ({tp_size})")
+    if r > 0 and r % tp_size != 0:
+        raise ValueError(f"r ({r}) must be divisible by tensor-parallel size ({tp_size})")
+    local_r = r // tp_size if r > 0 else r
+    return full_in_features // tp_size, local_r
 
 
 class _SplitLNOFTLinear(nn.Module):
@@ -236,10 +250,6 @@ class _SplitLNOFTLinear(nn.Module):
         in the de-fused OFT path, so mirror the INT4 branch and run the GEMM
         against a bf16/fp16 dequantized view while keeping autograd saves packed.
         """
-        from megatron.core.tensor_parallel.mappings import (
-            gather_from_sequence_parallel_region,
-        )
-
         from megatron.bridge.orbit.low_precision.nvfp4 import dequantize_nvfp4
 
         packed = self._orig_module.weight
@@ -253,9 +263,7 @@ class _SplitLNOFTLinear(nn.Module):
         bias = _get_active_bias_tensor(self._orig_module)
         has_bias = bias is not None
 
-        if getattr(self._orig_module, "sequence_parallel", False):
-            x = gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=True)
-
+        x = _prepare_raw_column_parallel_input(self._orig_module, x)
         x = x.to(w_compute.dtype)
         te_return_bias = getattr(self._orig_module, "te_return_bias", False)
 
@@ -299,10 +307,6 @@ class _SplitLNOFTLinear(nn.Module):
         de-fused linear behavior and source the GEMM weight from the INT4
         triplet on each forward.
         """
-        from megatron.core.tensor_parallel.mappings import (
-            gather_from_sequence_parallel_region,
-        )
-
         from megatron.bridge.orbit.low_precision.int4 import dequantize_int4
 
         packed = self._orig_module.weight_packed
@@ -314,9 +318,7 @@ class _SplitLNOFTLinear(nn.Module):
         bias = _get_active_bias_tensor(self._orig_module)
         has_bias = bias is not None
 
-        if getattr(self._orig_module, "sequence_parallel", False):
-            x = gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=True)
-
+        x = _prepare_raw_column_parallel_input(self._orig_module, x)
         x = x.to(w_compute.dtype)
         te_return_bias = getattr(self._orig_module, "te_return_bias", False)
 
@@ -361,10 +363,6 @@ class _SplitLNOFTLinear(nn.Module):
         dequantize the direct FP8 checkpoint weight for the local GEMM, and use
         saved tensor hooks so backward stores only the FP8 weight handle.
         """
-        from megatron.core.tensor_parallel.mappings import (
-            gather_from_sequence_parallel_region,
-        )
-
         from megatron.bridge.orbit.quant.fp8_utils import dequant_fp8
 
         w_fp8 = self.linear.weight.data
@@ -397,9 +395,7 @@ class _SplitLNOFTLinear(nn.Module):
                 w_compute_ptr = w_compute.data_ptr()
             return w_compute
 
-        if getattr(self._orig_module, "sequence_parallel", False):
-            x = gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=True)
-
+        x = _prepare_raw_column_parallel_input(self._orig_module, x)
         te_return_bias = getattr(self._orig_module, "te_return_bias", False)
         native_bias = None if te_return_bias else (bias if has_bias else None)
 
@@ -501,7 +497,7 @@ class OFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
             during training (multiplicative dropout). Default: 0.0.
     """
 
-    target_modules: List[str] = field(
+    target_modules: list[str] = field(
         default_factory=lambda: ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"]
     )
     r: int = 0
@@ -511,7 +507,16 @@ class OFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
     block_share: bool = False
     module_dropout: float = 0.0
 
-    def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
+    def __post_init__(self) -> None:
+        _validate_oft_hyperparameters(
+            r=self.r,
+            block_size=self.block_size,
+            coft=self.coft,
+            eps=self.eps,
+            module_dropout=self.module_dropout,
+        )
+
+    def transform(self, module: nn.Module, name: str | None = None, prefix: str | None = None) -> nn.Module:
         """
         Applies OFT to a specific module within the model architecture.
 
@@ -529,12 +534,13 @@ class OFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
 
         if (ans := self.match(module, name, prefix)) is not None:
             (match, full_name) = ans
+            module_leaf = full_name.rsplit(".", 1)[-1]
 
-            if match in ("output_layer", "word_embeddings"):
+            if module_leaf in ("output_layer", "word_embeddings"):
                 raise NotImplementedError(
                     f"--oft-type oft (legacy shared-R OFT) does not support OFT on "
-                    f"{match!r} (matched at {full_name}). Use --oft-type canonical_oft "
-                    f"(the default) which supports the all-mode targets."
+                    f"{module_leaf!r} (matched by {match!r} at {full_name}). "
+                    f"Explicitly select --oft-type canonical_oft, which supports the all-mode targets."
                 )
 
             # Fused LN+Linear layers (TELayerNormColumnParallelLinear):
@@ -542,7 +548,11 @@ class OFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
             # TE custom autograd Function cannot track OFT parameters captured
             # inside its forward boundary. De-fuse the module so the rotation
             # remains an ordinary nn.Module tracked by autograd.
-            if HAVE_TE_LN_COL_LINEAR and isinstance(module, TELayerNormColumnParallelLinear):
+            if (
+                HAVE_TE_LN_COL_LINEAR
+                and isinstance(TELayerNormColumnParallelLinear, type)
+                and isinstance(module, TELayerNormColumnParallelLinear)
+            ):
                 logger.warning(
                     f"OFT on fused TELayerNormColumnParallelLinear ({full_name}): "
                     f"de-fusing to separate LN + OFTLinear to ensure correct gradient flow. "
@@ -571,6 +581,7 @@ class OFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
             # Determine input features for the rotation module.
             model_parallel_config = getattr(module, "config", None)
 
+            rotation_r = self.r
             if model_parallel_config is not None:
                 # Megatron parallel linear — use get_adapter_attributes_from_linear
                 is_expert = is_expert_linear(full_name)
@@ -584,7 +595,9 @@ class OFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
                         tp_size = parallel_state.get_expert_tensor_parallel_world_size()
                     else:
                         tp_size = parallel_state.get_tensor_model_parallel_world_size()
-                    rotation_in_features = attrs.in_features // tp_size
+                    rotation_in_features, rotation_r = _localize_oft_row_parallel_geometry(
+                        attrs.in_features, self.r, tp_size
+                    )
                 else:
                     rotation_in_features = attrs.in_features
 
@@ -602,7 +615,7 @@ class OFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
 
             adapter = OFTRotationModule(
                 in_features=rotation_in_features,
-                r=self.r,
+                r=rotation_r,
                 block_size=self.block_size,
                 coft=self.coft,
                 eps=self.eps,
@@ -633,37 +646,233 @@ class VLMOFT(OFT):
     freeze_language_model: bool = True
 
     def freeze_model(self, model: nn.Module, training: bool = True) -> None:
-        modules_to_freeze = []
+        unwrapped = unwrap_model(model)
+        model_chunks = unwrapped if isinstance(unwrapped, list) else [unwrapped]
 
-        model = unwrap_model(model)[0]
-        if hasattr(model, "llava_model"):
-            model = model.llava_model
-
-        if self.freeze_vision_model and model.vision_model is not None:
-            modules_to_freeze.append(model.vision_model)
-        if self.freeze_vision_projection and model.vision_projection is not None:
-            modules_to_freeze.append(model.vision_projection)
-        if self.freeze_language_model and model.language_model is not None:
-            modules_to_freeze.append(model.language_model)
-
-        for module in modules_to_freeze:
-            for param in module.parameters():
-                param.requires_grad = False
+        for model_chunk in model_chunks:
+            vlm = getattr(model_chunk, "llava_model", model_chunk)
+            components = (
+                (self.freeze_vision_model, getattr(vlm, "vision_model", None)),
+                (self.freeze_vision_projection, getattr(vlm, "vision_projection", None)),
+                (self.freeze_language_model, getattr(vlm, "language_model", None)),
+            )
+            for should_freeze, component in components:
+                if should_freeze and component is not None:
+                    for param in component.parameters():
+                        param.requires_grad = False
 
         if training:
-            if isinstance(model, list):
-                for model_chunk in model:
-                    model_chunk.train(mode=True)
-            elif isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                model.module.train(mode=True)
-            else:
-                model.train(mode=True)
+            for model_chunk in model_chunks:
+                model_chunk.train(mode=True)
+
+
+def _collect_oft_merge_wrappers(model, wrapper_types: tuple[type[nn.Module], ...]) -> list[nn.Module]:
+    """Collect wrapper roots without descending into their owned base/adapter children."""
+    wrappers: list[nn.Module] = []
+    seen: set[int] = set()
+
+    def visit(module: nn.Module) -> None:
+        if id(module) in seen:
+            return
+        seen.add(id(module))
+        if isinstance(module, wrapper_types):
+            wrappers.append(module)
+            return
+        for child in module._modules.values():
+            if child is not None:
+                visit(child)
+
+    roots = model if isinstance(model, list) else [model]
+    for root in roots:
+        visit(root)
+    return wrappers
+
+
+@dataclass(frozen=True)
+class _OFTMergeUpdate:
+    """One already-computed dense weight replacement for an OFT merge."""
+
+    holder: nn.Module
+    name: str
+    weight: torch.Tensor
+    merged_weight: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _OFTWrapperMergePlan:
+    """The mutation-free result of preparing one wrapper for merge."""
+
+    wrapper: nn.Module
+    replacement: nn.Module
+    updates: tuple[_OFTMergeUpdate, ...]
+
+
+def _tensor_storage_span(tensor: torch.Tensor) -> tuple[int, int] | None:
+    """Return the conservative half-open byte span touched by a strided tensor."""
+    if tensor.numel() == 0:
+        return None
+    storage_start = tensor.untyped_storage().data_ptr()
+    if storage_start == 0:
+        return None
+    min_offset = max_offset = tensor.storage_offset()
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        extent = (size - 1) * stride
+        min_offset += min(0, extent)
+        max_offset += max(0, extent)
+    element_size = tensor.element_size()
+    return (
+        storage_start + min_offset * element_size,
+        storage_start + (max_offset + 1) * element_size,
+    )
+
+
+def _tensors_share_storage(first: torch.Tensor, second: torch.Tensor) -> bool:
+    """Return whether two live strided tensors touch overlapping storage bytes."""
+    if first is second:
+        return True
+    if first.device != second.device or first.layout != torch.strided or second.layout != torch.strided:
+        return False
+    try:
+        first_span = _tensor_storage_span(first)
+        second_span = _tensor_storage_span(second)
+    except (NotImplementedError, RuntimeError, TypeError):
+        return False
+    if first_span is None or second_span is None:
+        return False
+    return max(first_span[0], second_span[0]) < min(first_span[1], second_span[1])
+
+
+def _surviving_registered_tensors(
+    model,
+    plans: tuple[_OFTWrapperMergePlan, ...],
+) -> list[tuple[_OFTWrapperMergePlan | None, nn.Module, str, torch.Tensor]]:
+    """Collect tensor owners that remain after every planned wrapper is removed.
+
+    Split fused-LN wrappers deliberately contain temporary linears sharing the
+    original module's parameters. Traversing the replacement tree, rather than
+    every child of the old wrapper, ignores those discarded implementation
+    aliases while retaining any consumer reachable outside the wrapper. Module
+    identity alone cannot identify a consumer: the same base module may also be
+    reachable through an untargeted path, so each acyclic path is retained with
+    the wrapper plan (if any) that introduced its replacement.
+    """
+    plan_by_wrapper = {id(plan.wrapper): plan for plan in plans}
+    tensors: list[tuple[_OFTWrapperMergePlan | None, nn.Module, str, torch.Tensor]] = []
+    active: set[int] = set()
+
+    def visit(module: nn.Module, replacement_plan: _OFTWrapperMergePlan | None = None) -> None:
+        module_id = id(module)
+        if module_id in active:
+            return
+        active.add(module_id)
+        try:
+            plan = plan_by_wrapper.get(module_id)
+            if plan is not None:
+                visit(plan.replacement, plan)
+                return
+            for collection in (module._parameters, module._buffers):
+                for name, tensor in collection.items():
+                    if isinstance(tensor, torch.Tensor):
+                        tensors.append((replacement_plan, module, name, tensor))
+            for child in module._modules.values():
+                if child is not None:
+                    visit(child, replacement_plan)
+        finally:
+            active.remove(module_id)
+
+    roots = model if isinstance(model, list) else [model]
+    for root in roots:
+        visit(root)
+    return tensors
+
+
+def _validate_unaliased_merge_weights(model, plans: tuple[_OFTWrapperMergePlan, ...]) -> None:
+    """Reject a merge target used by another surviving tensor consumer.
+
+    A destructive OFT fold changes the semantics of the underlying Parameter.
+    Applying it to a tied embedding/output weight would therefore also change
+    an untargeted consumer, while two targeted consumers may require different
+    rotation orientation or values. There is no generally correct local fold,
+    so fail before copying any prepared weight.
+    """
+    updates = [update for plan in plans for update in plan.updates]
+    for index, update in enumerate(updates):
+        for other in updates[index + 1 :]:
+            if _tensors_share_storage(update.weight, other.weight):
+                raise ValueError(
+                    "OFT merge refuses aliased merge targets with shared storage: "
+                    f"{type(update.holder).__name__}.{update.name} and "
+                    f"{type(other.holder).__name__}.{other.name}"
+                )
+
+    surviving = _surviving_registered_tensors(model, plans)
+    for plan in plans:
+        for update in plan.updates:
+            for replacement_plan, owner, name, tensor in surviving:
+                if replacement_plan is plan and owner is update.holder and name == update.name:
+                    continue
+                if _tensors_share_storage(update.weight, tensor):
+                    raise ValueError(
+                        "OFT merge refuses a target with shared storage owned by another surviving consumer: "
+                        f"{type(update.holder).__name__}.{update.name} aliases "
+                        f"{type(owner).__name__}.{name}"
+                    )
+
+
+@torch.no_grad()
+def _apply_oft_merge_plan(plan: _OFTWrapperMergePlan) -> nn.Module:
+    """Copy a fully prepared plan and return the wrapper replacement."""
+    for update in plan.updates:
+        update.weight.copy_(update.merged_weight)
+    return plan.replacement
+
+
+def _replace_oft_merge_wrappers(model, wrapper_types: tuple[type[nn.Module], ...], merge_wrapper):
+    """Replace adapter wrappers while preserving aliases and avoiding wrapper-child grafting.
+
+    The generic PEFT walker iterates the *old* wrapper's children after a
+    transform returns a new base module, then attaches those children to the
+    replacement. A destructive merge needs a replacement-aware traversal that
+    treats each recognized wrapper as a leaf.
+    """
+    replacements: dict[int, nn.Module] = {}
+
+    def replace(module: nn.Module) -> nn.Module:
+        module_id = id(module)
+        if module_id in replacements:
+            return replacements[module_id]
+        if isinstance(module, wrapper_types):
+            replacement = merge_wrapper(module)
+            replacements[module_id] = replacement
+            return replacement
+
+        replacements[module_id] = module
+        for name, child in list(module._modules.items()):
+            if child is None:
+                continue
+            replacement = replace(child)
+            if replacement is not child:
+                module._modules[name] = replacement
+        return module
+
+    if isinstance(model, list):
+        for index, model_chunk in enumerate(model):
+            model[index] = replace(model_chunk)
+        return model
+    return replace(model)
+
+
+def _set_oft_merged_model_mode(model, training: bool) -> None:
+    """Set train/eval mode on a single merged model or every pipeline chunk."""
+    model_chunks = model if isinstance(model, list) else [model]
+    for model_chunk in model_chunks:
+        model_chunk.train(mode=training)
 
 
 @dataclass
 class OFTMerge(OrbitPEFTMixin, PEFT):
     """
-    Merges the learned OFT rotation into the base weight: W_merged = W @ R.
+    Merges the learned OFT rotation into the base weight: W_merged = W @ R.T.
 
     Tensor-parallelism handling:
         Unlike LoRA merge which requires all-gather to reconstruct full-rank matrices,
@@ -671,36 +880,149 @@ class OFTMerge(OrbitPEFTMixin, PEFT):
 
         - ColumnParallelLinear (linear_qkv, linear_fc1):
             W: [out/TP, in], R: [in, in]
-            W_merged = W @ R operates on the full input dimension — no gather needed.
+            W_merged = W @ R.T operates on the full input dimension — no gather needed.
 
         - RowParallelLinear (linear_proj, linear_fc2):
             W: [out, in/TP], R: [in/TP, in/TP]
             R is already sized for the local input shard (set in OFT.transform),
-            so W_merged = W @ R operates on the local shard — no gather needed.
+            so W_merged = W @ R.T operates on the local shard — no gather needed.
     """
 
-    @torch.no_grad()
-    def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
-        if not isinstance(module, (OFTLinear, OFTTopKRouter)):
-            return module
-        logging.debug(f"merging OFT {(prefix if prefix else '') + '.' + (name if name else '')}")
+    _WRAPPER_TYPES = (OFTLinear, OFTTopKRouter, _SplitLNOFTLinear, TEOFTLayerNormLinear)
 
-        # For TopKRouter, the weight lives in the gating sub-module
-        if isinstance(module, OFTTopKRouter):
-            weight_holder = module.to_wrap.gating
-        else:
-            weight_holder = module.to_wrap
+    @staticmethod
+    def _merge_weight_or_raise(weight_holder: nn.Module, name: str, wrapper: nn.Module) -> torch.Tensor:
+        """Return a mergeable dense weight or fail before any model mutation."""
+        weight = getattr(weight_holder, name, None)
+        suffix = name[len("weight") :] if name.startswith("weight") else ""
+        quantized_markers = (
+            f"{name}_packed",
+            f"{name}_w_packed",
+            f"{name}_v_packed",
+            f"{name}_scale",
+            f"{name}_shape",
+            f"{name}_scale_inv",
+            f"weight_scale{suffix}",
+            f"weight_double_scale{suffix}",
+        )
+        has_quantized_state = getattr(weight_holder, "weight_quantizer", None) is not None or any(
+            getattr(weight_holder, marker, None) is not None for marker in quantized_markers
+        )
+        dtype_name = str(getattr(weight, "dtype", ""))
+        if (
+            has_quantized_state
+            or dtype_name.startswith("torch.float8")
+            or getattr(weight, "dtype", None) == torch.uint8
+        ):
+            raise ValueError(
+                f"OFT merge does not support quantized weight {name!r} on {type(wrapper).__name__}; "
+                "dequantize the base model before merging"
+            )
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2 or not weight.is_floating_point():
+            raise ValueError(
+                f"OFT merge requires a floating 2-D {name!r} on {type(wrapper).__name__}, "
+                f"got {type(weight).__name__} with shape {getattr(weight, 'shape', None)}"
+            )
+        if weight.device.type == "meta":
+            raise ValueError(f"OFT merge cannot mutate meta-device weight {name!r} on {type(wrapper).__name__}")
+        return weight
 
-        if hasattr(weight_holder, "weight"):
-            base_weight = weight_holder.weight
-            R = module.adapter.get_delta_weight().to(base_weight.device, base_weight.dtype)
-
-            # Validate shapes: R should be [in, in] matching weight's input dim
-            assert R.shape[0] == base_weight.shape[1], (
-                f"Shape mismatch: R is {R.shape} but weight input dim is {base_weight.shape[1]}. "
-                f"This may indicate a tensor-parallelism configuration issue."
+    @staticmethod
+    def _validate_rotation_shape(adapter: nn.Module, weight: torch.Tensor, wrapper: nn.Module, name: str) -> None:
+        """Require the adapter rotation to span the base weight's local input axis."""
+        in_features = getattr(adapter, "in_features", None)
+        if in_features != weight.shape[1]:
+            raise ValueError(
+                f"OFT merge shape mismatch for {type(wrapper).__name__}.{name}: "
+                f"adapter input is {in_features}, weight input is {weight.shape[1]}"
             )
 
-            # W_merged = W @ R  (weight is [out, in], R is [in, in])
-            weight_holder.weight.data = base_weight @ R
-        return module
+    @classmethod
+    def _merge_parts(cls, wrapper: nn.Module):
+        """Resolve the replacement base, weight owner/names, and rotation module."""
+        if isinstance(wrapper, OFTTopKRouter):
+            return wrapper.to_wrap, wrapper.to_wrap.gating, ["weight"], wrapper.adapter
+        if isinstance(wrapper, (_SplitLNOFTLinear, TEOFTLayerNormLinear)):
+            return wrapper._orig_module, wrapper._orig_module, ["weight"], wrapper.adapter
+        weight_names = list(getattr(wrapper, "_weight_names", ()))
+        if not weight_names:
+            raise ValueError(f"OFT merge found no base weights on {type(wrapper).__name__}")
+        return wrapper.to_wrap, wrapper.to_wrap, weight_names, wrapper.adapter
+
+    @classmethod
+    def _validate_wrapper(cls, wrapper: nn.Module) -> None:
+        """Validate every weight owned by one supported legacy wrapper."""
+        _, weight_holder, weight_names, adapter = cls._merge_parts(wrapper)
+        for name in weight_names:
+            weight = cls._merge_weight_or_raise(weight_holder, name, wrapper)
+            cls._validate_rotation_shape(adapter, weight, wrapper, name)
+
+    @classmethod
+    @torch.no_grad()
+    def _prepare_wrapper(cls, wrapper: nn.Module) -> _OFTWrapperMergePlan:
+        """Compute every legacy merged weight without mutating the model."""
+        base_module, weight_holder, weight_names, adapter = cls._merge_parts(wrapper)
+        cls._validate_wrapper(wrapper)
+        rotations: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+        updates: list[_OFTMergeUpdate] = []
+        for name in weight_names:
+            base_weight = getattr(weight_holder, name)
+            cache_key = (base_weight.device, base_weight.dtype)
+            if cache_key not in rotations:
+                rotation = adapter.get_delta_weight().to(
+                    device=base_weight.device,
+                    dtype=base_weight.dtype,
+                )
+                expected_shape = (base_weight.shape[1], base_weight.shape[1])
+                if rotation.ndim != 2 or tuple(rotation.shape) != expected_shape:
+                    raise ValueError(
+                        f"OFT merge rotation shape mismatch for {type(wrapper).__name__}.{name}: "
+                        f"expected {expected_shape}, got {tuple(rotation.shape)}"
+                    )
+                rotations[cache_key] = rotation
+            merged_weight = base_weight @ rotations[cache_key].transpose(-1, -2)
+            updates.append(
+                _OFTMergeUpdate(
+                    holder=weight_holder,
+                    name=name,
+                    weight=base_weight,
+                    merged_weight=merged_weight,
+                )
+            )
+        return _OFTWrapperMergePlan(wrapper=wrapper, replacement=base_module, updates=tuple(updates))
+
+    @classmethod
+    def _preflight_model(cls, model) -> tuple[_OFTWrapperMergePlan, ...]:
+        """Prepare the complete merge set and reject aliases before any write."""
+        wrappers = _collect_oft_merge_wrappers(model, cls._WRAPPER_TYPES)
+        plans = tuple(cls._prepare_wrapper(wrapper) for wrapper in wrappers)
+        _validate_unaliased_merge_weights(model, plans)
+        return plans
+
+    @classmethod
+    @torch.no_grad()
+    def _merge_wrapper(cls, wrapper: nn.Module) -> nn.Module:
+        """Prepare and fold one wrapper for direct-call compatibility."""
+        return _apply_oft_merge_plan(cls._prepare_wrapper(wrapper))
+
+    def __call__(self, model, training: bool = True):
+        """Atomically preflight, merge, unwrap, freeze, and return the model."""
+        plans = self._preflight_model(model)
+        plan_by_wrapper = {id(plan.wrapper): plan for plan in plans}
+        merged = _replace_oft_merge_wrappers(
+            model,
+            self._WRAPPER_TYPES,
+            lambda wrapper: _apply_oft_merge_plan(plan_by_wrapper[id(wrapper)]),
+        )
+        self.freeze_model(merged, training=training)
+        _set_oft_merged_model_mode(merged, training)
+        return merged
+
+    @torch.no_grad()
+    def transform(self, module: nn.Module, name: str | None = None, prefix: str | None = None) -> nn.Module:
+        """Merge and unwrap one supported wrapper for direct-call compatibility."""
+        if not isinstance(module, self._WRAPPER_TYPES):
+            return module
+        logging.debug(f"merging OFT {(prefix if prefix else '') + '.' + (name if name else '')}")
+        self._validate_wrapper(module)
+        return self._merge_wrapper(module)

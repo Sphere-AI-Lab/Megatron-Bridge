@@ -29,7 +29,7 @@ exact recipe base and settings its retired entrypoint used:
     DeepseekV3ForCausalLM           int4                 (moonlight_16b recipe)
 
 Usage:
-    torchrun --nproc_per_node=4 scripts/orbit/finetune_qoft.py \\
+    uv run python -m torch.distributed.run --nproc_per_node=4 scripts/orbit/finetune_qoft.py \\
         --quant fp8 \\
         --hf-model-path /path/to/Qwen3-30B-A3B-FP8 \\
         --pretrained-checkpoint ./checkpoints/Qwen3-30B-A3B-FP8-mcore \\
@@ -68,6 +68,8 @@ from models._qoft_common import (  # noqa: E402
     set_sequence_length,
     tokenizer_model_from_checkpoint,
 )
+
+from megatron.bridge.utils.common_utils import print_rank_0  # noqa: E402
 
 
 KIMI_K25_ALL_LINEAR_OFT_TARGET_MODULES = [
@@ -316,8 +318,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--group-size",
         type=int,
         default=None,
-        help="INT4 quantization group size (default per architecture -- getting this wrong "
-        "silently changes checkpoint-load precision, not a crash)",
+        help="INT4 quantization group size (default per architecture; must match the checkpoint or load is rejected)",
     )
     i4.add_argument(
         "--int4-active-expert-chunk-size",
@@ -402,6 +403,29 @@ def build_oft(args, spec: dict):
 
 def _validate_runtime_topology(args, spec: dict, *, world_size: int) -> None:
     """Retain model-specific launch constraints after launcher consolidation."""
+    dimensions = {
+        "WORLD_SIZE": world_size,
+        "TP": args.tp,
+        "EP": args.ep,
+        "PP": args.pp,
+    }
+    for name, value in dimensions.items():
+        if value <= 0:
+            raise SystemExit(f"{name} must be a positive integer; received {value}.")
+
+    tp_pipeline_size = args.tp * args.pp
+    ep_pipeline_size = args.ep * args.pp
+    invalid_axes = []
+    if world_size % tp_pipeline_size != 0:
+        invalid_axes.append(f"TP*PP={tp_pipeline_size}")
+    if world_size % ep_pipeline_size != 0:
+        invalid_axes.append(f"EP*PP={ep_pipeline_size}")
+    if invalid_axes:
+        raise SystemExit(
+            f"WORLD_SIZE={world_size} must be divisible by TP*PP={tp_pipeline_size} and "
+            f"EP*PP={ep_pipeline_size} because TP and EP overlap; failed: {', '.join(invalid_axes)}."
+        )
+
     if spec["key"] != "moonlight" or args.quant != "int4":
         return
 
@@ -505,6 +529,10 @@ def _apply_quant_mode(config, args, spec: dict) -> None:
     from megatron.bridge.training.mixed_precision import get_mixed_precision_config
 
     if args.quant == "fp8":
+        # The QOFT FP8 loader keeps the plain Megatron module tree and owns the
+        # explicit ``weight_w`` / scale transform. Replaying ModelOpt here would
+        # replace that tree before its sharded schema is generated.
+        config.model.restore_modelopt_state = False
         config.model.register_pre_wrap_hook(ensure_fp8_scale_inv_buffers)
         return
 
@@ -549,6 +577,9 @@ def build_config(args, spec: dict):
 
     if spec["key"] == "qwen3_moe":
         from megatron.bridge import AutoBridge
+        from megatron.bridge.orbit.model_bridges.qwen3_moe_provider_ext import (
+            apply_qwen3_moe_orbit_provider_settings,
+        )
         from megatron.bridge.recipes.qwen import qwen3_30b_a3b_peft_config
 
         config = qwen3_30b_a3b_peft_config(peft_scheme=peft)
@@ -557,9 +588,9 @@ def build_config(args, spec: dict):
         # the checkpoint conversion path exactly, the same as kimi_k25/moonlight
         # below. The recipe otherwise hardcodes Qwen/Qwen3-30B-A3B, ignoring
         # --hf-model-path / --pretrained-checkpoint entirely.
-        config.model = AutoBridge.from_hf_pretrained(args.hf_model_path, trust_remote_code=True).to_megatron_provider(
-            load_weights=False
-        )
+        auto_bridge = AutoBridge.from_hf_pretrained(args.hf_model_path, trust_remote_code=True)
+        config.model = auto_bridge.to_megatron_provider(load_weights=False)
+        apply_qwen3_moe_orbit_provider_settings(config.model, auto_bridge.hf_pretrained.config)
     elif spec["key"] == "qwen3_dense":
         from megatron.bridge import AutoBridge
         from megatron.bridge.recipes.common import _peft_common
@@ -696,13 +727,13 @@ def main() -> None:
         config.optimizer.min_lr = 0.0
         config.scheduler.lr_warmup_init = 0.0
         config.scheduler.lr_warmup_iters = 0
-        print("[qoft-debug] learning rate pinned to 0: parameters are identical on every step")
+        print_rank_0("[qoft-debug] learning rate pinned to 0: parameters are identical on every step")
 
     if _debug_flag("QOFT_DEBUG_ANOMALY"):
         # Names the forward operation whose backward produced the first
         # non-finite value, which module-level hooks cannot do.
         torch.autograd.set_detect_anomaly(True)
-        print("[qoft-debug] autograd anomaly detection enabled (slow)")
+        print_rank_0("[qoft-debug] autograd anomaly detection enabled (slow)")
 
     if args.quant == "int4":
         after_load_hook = None

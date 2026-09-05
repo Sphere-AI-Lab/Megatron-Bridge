@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.bridge.orbit.peft_ext import adapter_attrs, recompute_ext
+from megatron.bridge.orbit.peft_ext import adapter_attrs, bias_normalization, recompute_ext
 from megatron.bridge.orbit.peft_ext.bias_normalization import normalize_disabled_bias_placeholders
 from megatron.bridge.orbit.peft_ext.meta_init import to_empty_if_meta_device
 from megatron.bridge.orbit.peft_ext.peft_mixin import OrbitPEFTMixin
@@ -77,6 +77,24 @@ def test_oft_adapter_attributes_restore_te_layernorm_output_state(monkeypatch: p
 
 
 @pytest.mark.unit
+def test_oft_adapter_attributes_ignore_non_type_te_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    attrs = AdapterAttributes(
+        input_is_parallel=False,
+        in_features=8,
+        out_features=16,
+        disable_tensor_parallel_comm=False,
+        disable_sequence_parallel_comm=True,
+        base_linear_is_parallel=True,
+    )
+    module = torch.nn.Linear(8, 16)
+    monkeypatch.setattr(adapter_attrs, "HAVE_TE", True)
+    monkeypatch.setattr(adapter_attrs, "TELayerNormColumnParallelLinear", object())
+    monkeypatch.setattr(adapter_attrs, "get_adapter_attributes_from_linear", lambda _module, is_expert=False: attrs)
+
+    assert adapter_attrs.get_oft_adapter_attributes_from_linear(module) is attrs
+
+
+@pytest.mark.unit
 def test_bias_normalization_removes_disabled_linear_bias() -> None:
     linear = torch.nn.Linear(4, 4, bias=True)
     linear.config = SimpleNamespace(add_bias_linear=False, add_qkv_bias=False)
@@ -91,6 +109,20 @@ def test_bias_normalization_preserves_non_linear_router_bias() -> None:
     router = torch.nn.Module()
     router.config = SimpleNamespace(add_bias_linear=False, add_qkv_bias=False)
     router.register_parameter("bias", torch.nn.Parameter(torch.ones(4)))
+
+    normalize_disabled_bias_placeholders(router, name="router")
+
+    assert router.bias is not None
+
+
+@pytest.mark.unit
+def test_bias_normalization_ignores_non_type_te_placeholders(monkeypatch: pytest.MonkeyPatch) -> None:
+    router = torch.nn.Module()
+    router.config = SimpleNamespace(add_bias_linear=False, add_qkv_bias=False)
+    router.register_parameter("bias", torch.nn.Parameter(torch.ones(4)))
+    monkeypatch.setattr(bias_normalization, "HAVE_TE", True)
+    monkeypatch.setattr(bias_normalization, "TECL", (object(),))
+    monkeypatch.setattr(bias_normalization, "TERL", (object(),))
 
     normalize_disabled_bias_placeholders(router, name="router")
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ import logging
 import math
 import os
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -136,7 +136,7 @@ def _oft_fp8_debug_log(event: str, **fields: Any) -> None:
                 f"shape={tuple(value.shape)} dtype={value.dtype} device={value.device} contig={value.is_contiguous()}"
             )
         parts.append(f"{key}={value}")
-    print(" ".join(parts), flush=True)
+    logger.info("%s", " ".join(parts))
 
 
 def _cuda_memory_summary(device: torch.device) -> str:
@@ -269,11 +269,12 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTe
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
+    gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.moe.router import apply_random_logits
+from megatron.core.transformer.moe.router import TopKRouter, apply_biased_logits, apply_random_logits
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
 from megatron.bridge.orbit.quant.int4_utils import _empty_storage_view
@@ -288,10 +289,55 @@ from megatron.bridge.utils.import_utils import safe_import_from
 TEColumnParallelLinear, HAVE_TE_COL_LINEAR = safe_import_from(
     "megatron.core.extensions.transformer_engine", "TEColumnParallelLinear"
 )
+
+
+def _prepare_raw_column_parallel_input(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Recreate the input-side autograd collective for a raw column GEMM."""
+    tp_group = getattr(module, "tp_group", None) or getattr(module, "_tp_group", None)
+    tp_size = getattr(module, "tp_size", None)
+
+    if getattr(module, "explicit_expert_comm", False):
+        return x
+
+    sequence_parallel = getattr(module, "sequence_parallel", None)
+    if sequence_parallel is None:
+        sequence_parallel = getattr(getattr(module, "config", None), "sequence_parallel", False)
+    if sequence_parallel:
+        if tp_size is not None and tp_size <= 1:
+            return x
+        return gather_from_sequence_parallel_region(
+            x,
+            tensor_parallel_output_grad=True,
+            group=tp_group,
+        )
+    if getattr(module, "disable_grad_reduce", False):
+        return x
+
+    allreduce_dgrad = getattr(module, "allreduce_dgrad", None)
+    if allreduce_dgrad is None:
+        allreduce_dgrad = tp_size is not None and tp_size > 1
+    if allreduce_dgrad:
+        if tp_size is not None and tp_size <= 1:
+            return x
+        return copy_to_tensor_model_parallel_region(x, group=tp_group)
+    return x
+
+
 TERowParallelLinear, HAVE_TE_ROW_LINEAR = safe_import_from(
     "megatron.core.extensions.transformer_engine", "TERowParallelLinear"
 )
 TELinear, HAVE_TE_LINEAR = safe_import_from("megatron.core.extensions.transformer_engine", "TELinear")
+
+
+def _is_available_type_instance(instance: object, candidate: object, available: bool) -> bool:
+    """Match an optional dependency class only when the imported symbol is a real type.
+
+    Megatron Core exposes ``MagicMock`` placeholders for Transformer Engine
+    classes when TE is not installed. Importing those attributes succeeds, so
+    the availability flag alone cannot make them safe as ``isinstance``'s
+    second argument.
+    """
+    return bool(available and isinstance(candidate, type) and isinstance(instance, candidate))
 
 
 def _module_bias_enabled(module: nn.Module) -> bool:
@@ -315,7 +361,7 @@ def _module_bias_enabled(module: nn.Module) -> bool:
     return True
 
 
-def _get_active_bias_tensor(module: nn.Module, name: str = "bias") -> Optional[torch.Tensor]:
+def _get_active_bias_tensor(module: nn.Module, name: str = "bias") -> torch.Tensor | None:
     """Return the active bias tensor for ``module`` or ``None`` when bias is disabled."""
     if not _module_bias_enabled(module):
         return None
@@ -339,22 +385,50 @@ def _clear_disabled_bias_parameters(module: nn.Module) -> None:
         module._parameters[name] = None
 
 
+def _validate_oft_hyperparameters(
+    *,
+    r: int,
+    block_size: int,
+    coft: bool,
+    eps: float,
+    module_dropout: float,
+) -> None:
+    """Validate public OFT geometry and numeric hyperparameters before model mutation."""
+    if r < 0:
+        raise ValueError(f"r must be non-negative, got {r}")
+    if block_size < 0:
+        raise ValueError(f"block_size must be non-negative, got {block_size}")
+    if block_size == 1:
+        raise ValueError("block_size must be 0 or at least 2")
+    if (r > 0) == (block_size > 0):
+        raise ValueError("exactly one of r or block_size must be positive")
+    if coft and (not math.isfinite(eps) or eps <= 0):
+        raise ValueError(f"eps must be finite and positive when coft=True, got {eps}")
+    if not math.isfinite(module_dropout) or not 0.0 <= module_dropout <= 1.0:
+        raise ValueError(f"module_dropout must be finite and within [0, 1], got {module_dropout}")
+
+
 class MultiplicativeDropoutLayer(nn.Module):
     """Applies multiplicative dropout to OFT blocks.
 
     During training, randomly replaces OFT blocks with identity matrices.
     """
 
-    def __init__(self, p: float = 0.0):
+    def __init__(self, p: float = 0.0, *, block_share: bool = False):
         super().__init__()
         self.p = p
+        self.block_share = block_share
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.p == 0.0:
+        # ``block_share`` represents the whole adapter with one rotation block.
+        # Dropping that sole block disables the entire adapter, whereas OFT
+        # module dropout is defined over a *set* of independently sampled
+        # blocks. Preserve the shared rotation just as PEFT does.
+        if not self.training or self.p == 0.0 or self.block_share:
             return x
         num_blocks = x.shape[0]
         block_size = x.shape[1]
-        mask = torch.bernoulli(torch.ones(num_blocks, 1, 1, device=x.device) * (1 - self.p))
+        mask = torch.bernoulli(torch.ones(num_blocks, 1, 1, device=x.device, dtype=x.dtype) * (1 - self.p))
         eye = torch.eye(block_size, device=x.device, dtype=x.dtype).unsqueeze(0)
         return x * mask + eye * (1 - mask)
 
@@ -366,7 +440,7 @@ def _make_expert_ep_sharded_tensor(
     ep_new_axis: bool,
     blocks_local_axis: int,
     blocks_tp_sharded: bool,
-    sharded_offsets: Tuple = (),
+    sharded_offsets: tuple = (),
 ) -> ShardedTensor:
     """Build a ShardedTensor for expert ``oft_r`` with EP encoded as a real axis.
 
@@ -463,26 +537,39 @@ class OFTRotationModule(nn.Module):
         eps: float = 6e-5,
         block_share: bool = False,
         module_dropout: float = 0.0,
-        model_parallel_config: Optional[ModelParallelConfig] = None,
+        model_parallel_config: ModelParallelConfig | None = None,
         input_is_parallel: bool = False,
         is_expert: bool = False,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
     ):
         super().__init__()
-        if r > 0 and block_size > 0:
-            raise ValueError("Only one of r or block_size should be specified, not both.")
-        if r == 0 and block_size == 0:
-            raise ValueError("One of r or block_size must be specified.")
+        _validate_oft_hyperparameters(
+            r=r,
+            block_size=block_size,
+            coft=coft,
+            eps=eps,
+            module_dropout=module_dropout,
+        )
+        if in_features <= 0:
+            raise ValueError(f"in_features must be positive, got {in_features}")
 
         if r > 0:
             if in_features % r != 0:
-                r = self._find_nearest_divisor(in_features, r)
+                raise ValueError(f"in_features must be divisible by r, got in_features={in_features}, r={r}")
             block_size = in_features // r
         else:
             if in_features % block_size != 0:
-                block_size = self._find_nearest_divisor(in_features, block_size)
+                raise ValueError(
+                    "in_features must be divisible by block_size, "
+                    f"got in_features={in_features}, block_size={block_size}"
+                )
             r = in_features // block_size
+
+        if block_size < 2:
+            raise ValueError(
+                f"derived block_size must be at least 2, got {block_size} from in_features={in_features}, r={r}"
+            )
 
         self.in_features = in_features
         self.r = r
@@ -496,6 +583,20 @@ class OFTRotationModule(nn.Module):
         if model_parallel_config is None:
             model_parallel_config = ModelParallelConfig()
         self.config = model_parallel_config
+        if input_is_parallel:
+            if is_expert:
+                tp_size = getattr(model_parallel_config, "expert_tensor_parallel_size", None)
+                if tp_size is None:
+                    tp_size = getattr(model_parallel_config, "tensor_model_parallel_size", 1)
+            else:
+                tp_size = getattr(model_parallel_config, "tensor_model_parallel_size", 1)
+            if tp_size <= 0:
+                raise ValueError(f"tensor-parallel size must be positive, got {tp_size}")
+        else:
+            tp_size = 1
+        # Row-parallel adapters hold only this rank's block shard. COFT's
+        # aggregate constraint is defined over the full serialized block bank.
+        self._coft_num_blocks = r * tp_size
 
         n_elements = block_size * (block_size - 1) // 2
         num_blocks = 1 if block_share else r
@@ -520,7 +621,7 @@ class OFTRotationModule(nn.Module):
         # SequentialMLP handles expert identity for every child key.
         self.ep_axis_sharded = False
 
-        self.dropout = MultiplicativeDropoutLayer(p=module_dropout)
+        self.dropout = MultiplicativeDropoutLayer(p=module_dropout, block_share=block_share)
 
         # Pre-register upper triangle indices as buffers for efficient skew-symmetric construction
         rows, cols = torch.triu_indices(block_size, block_size, 1)
@@ -528,17 +629,6 @@ class OFTRotationModule(nn.Module):
         cols = cols.to(torch.int32)
         self.register_buffer("rows", rows, persistent=False)
         self.register_buffer("cols", cols, persistent=False)
-
-    @staticmethod
-    def _find_nearest_divisor(n: int, target: int) -> int:
-        """Find the nearest divisor of n to target."""
-        best = 1
-        for i in range(1, int(math.isqrt(n)) + 1):
-            if n % i == 0:
-                for d in (i, n // i):
-                    if abs(d - target) < abs(best - target):
-                        best = d
-        return best
 
     def _pytorch_skew_symmetric(self, vec: torch.Tensor, block_size: int) -> torch.Tensor:
         """Convert parameter vectors to skew-symmetric matrices.
@@ -602,10 +692,12 @@ class OFTRotationModule(nn.Module):
         """Project each block onto the Constrained-OFT epsilon-ball.
 
         The constraint is on the skew-symmetric generator and is centred on
-        **zero**, matching the reference PEFT OFT implementation. Blocks already
-        inside the ball pass through unchanged; blocks outside are pulled back so
-        their Frobenius norm becomes exactly ``eps``. That makes the boundary a
-        fixed point, which matters because this runs on every forward.
+        **zero**, matching the reference PEFT OFT implementation. For a
+        non-shared rotation, PEFT distributes the configured epsilon across the
+        full serialized block bank as ``eps / sqrt(num_blocks)``. Blocks already
+        inside their effective ball pass through unchanged; blocks outside are
+        pulled back to that boundary. This makes the boundary a fixed point,
+        which matters because this runs on every forward.
 
         Centring on the identity instead is wrong: ``Q_skew`` is skew-symmetric,
         so its diagonal is structurally zero and
@@ -618,24 +710,41 @@ class OFTRotationModule(nn.Module):
 
         Args:
             weight: (num_blocks, n_elements) parameter vectors.
-            eps: Maximum Frobenius norm of each block's skew-symmetric generator.
+            eps: Maximum aggregate Frobenius norm of the block-diagonal generator.
         """
         Q_skew = self._pytorch_skew_symmetric(weight, self.block_size)
         norm = torch.norm(Q_skew, p="fro", dim=(-2, -1), keepdim=True)
-        # Inside the ball clamp() returns `norm` and the ratio is 1 (up to the
-        # 1e-8 division guard); outside it returns `eps` and the ratio is the
-        # exact shrink factor. Scaling `weight` scales Q_skew by the same factor.
-        scale = torch.clamp(norm, max=eps) / (norm + 1e-8)
+        effective_eps = eps if self.block_share else eps / math.sqrt(self._coft_num_blocks)
+        outside = norm > effective_eps
+        # Only divide blocks that actually need projection. Adding a fixed
+        # epsilon to every denominator also shrinks valid blocks, and that tiny
+        # per-forward error compounds because the projected value is written
+        # back to the trainable parameter.
+        denominator = torch.where(outside, norm, torch.ones_like(norm))
+        projected_scale = effective_eps / denominator
+        scale = torch.where(outside, projected_scale, torch.ones_like(norm))
         return weight * (scale.squeeze(-1).squeeze(-1).unsqueeze(-1))
 
-    def _compute_rotation(self) -> torch.Tensor:
+    def _compute_rotation(
+        self,
+        *,
+        apply_dropout: bool = True,
+        project_coft_in_place: bool = True,
+    ) -> torch.Tensor:
         """Compute the block-diagonal orthogonal rotation blocks.
+
+        Args:
+            apply_dropout: Whether to apply multiplicative module dropout.
+            project_coft_in_place: Whether COFT projection is written back to
+                the trainable parameter. Merge planning disables this so a
+                later validation failure cannot mutate adapter state.
 
         Returns:
             (r, block_size, block_size) orthogonal blocks.
         """
+        oft_r = self.oft_r
         if self.coft:
-            # Project the Parameter itself, *before* the tensor-parallel wrapper.
+            # Training forward projects the Parameter itself, *before* the tensor-parallel wrapper.
             # ``oft_r`` is a leaf, so an in-place write under ``no_grad`` is legal
             # on every layout -- mechanically the same thing an optimizer step does.
             #
@@ -651,23 +760,29 @@ class OFTRotationModule(nn.Module):
             # so a row-parallel rank projecting its own shard produces bitwise the
             # same values as slicing a full projection; column-parallel ranks all
             # hold the same replicated oft_r and apply the same deterministic map.
-            with torch.no_grad():
-                self.oft_r.copy_(self._project_batch(self.oft_r, eps=self.eps))
+            if project_coft_in_place:
+                with torch.no_grad():
+                    self.oft_r.copy_(self._project_batch(self.oft_r, eps=self.eps))
+                oft_r = self.oft_r
+            else:
+                # A merge consumes the projected value without changing optimizer-visible state.
+                oft_r = self._project_batch(self.oft_r, eps=self.eps)
 
         if self.input_is_parallel and not self.block_share:
             # Row Tensor Parallel: each TP rank has a shard of the blocks, so use directly.
             # A block-shared adapter is the exception: its one block is a TP
             # replica, so its gradient must be reduced across ranks.
-            oft_r_parallel = self.oft_r
+            oft_r_parallel = oft_r
         else:
             # Column Tensor Parallel and row-parallel block_share both carry a
             # replicated parameter. The copy op is identity in forward and
             # all-reduces its gradient in backward.
-            oft_r_parallel = copy_to_tensor_model_parallel_region(self.oft_r, group=self.tp_group)
+            oft_r_parallel = copy_to_tensor_model_parallel_region(oft_r, group=self.tp_group)
 
         R = self._cayley_batch(oft_r_parallel, self.block_size)
 
-        R = self.dropout(R)
+        if apply_dropout:
+            R = self.dropout(R)
 
         return R
 
@@ -707,12 +822,14 @@ class OFTRotationModule(nn.Module):
         return x.to(required_dtype)
 
     def get_delta_weight(self) -> torch.Tensor:
-        """Compute the full block-diagonal rotation matrix for weight merging.
+        """Compute the full block-diagonal merge rotation without mutating adapter state.
 
         Returns:
             (in_features, in_features) block-diagonal orthogonal matrix.
         """
-        R = self._compute_rotation()
+        # A merged checkpoint must be independent of the adapter's current
+        # train/eval mode and of the random dropout mask from this invocation.
+        R = self._compute_rotation(apply_dropout=False, project_coft_in_place=False)
         rank = self.r if not self.block_share else self.in_features // self.block_size
         if self.block_share:
             R = R.repeat(rank, 1, 1)
@@ -721,8 +838,8 @@ class OFTRotationModule(nn.Module):
     def sharded_state_dict(
         self,
         prefix: str = "",
-        sharded_offsets: Tuple = (),
-        metadata: Optional[Dict] = None,
+        sharded_offsets: tuple = (),
+        metadata: dict | None = None,
     ) -> ShardedStateDict:
         """Create sharded state dictionary for distributed checkpointing.
 
@@ -797,13 +914,27 @@ class OFTTopKRouter(AdapterWrapper):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
         _trap_oft_applied_bridge(self, "TopKRouter")
+        if not self._adapter_enabled:
+            return self.to_wrap(x, *args, **kwargs)
+
+        # MCore subclasses use custom ``forward`` implementations for dense
+        # inference and other router-specific behavior. Reimplementing only
+        # TopKRouter.forward would silently bypass those contracts, so reject
+        # such subclasses until they have an explicit adapter integration.
+        if type(self.to_wrap).forward is not TopKRouter.forward:
+            raise NotImplementedError(
+                f"OFTTopKRouter cannot safely wrap {type(self.to_wrap).__name__}: it overrides TopKRouter.forward"
+            )
+
         self.to_wrap._maintain_float32_expert_bias()
         jittered_input = self.to_wrap.apply_input_jitter(x)
-        if self._adapter_enabled:
-            jittered_input = self.adapter(jittered_input.contiguous())
+        jittered_input = self.adapter(jittered_input.contiguous())
         logits = self.to_wrap.gating(jittered_input)
         if self.to_wrap.config.moe_router_force_load_balancing:
             logits = apply_random_logits(logits)
+        force_biased = getattr(self.to_wrap.config, "moe_router_force_biased", None)
+        if force_biased is not None:
+            logits = apply_biased_logits(logits, force_biased, self.to_wrap.layer_number)
         return self.to_wrap.routing(logits, *args, **kwargs)
 
 
@@ -874,7 +1005,7 @@ class OFTLinear(AdapterWrapper):
             self._base_int4 = False
         self._int4_active_expert_chunk_size = get_int4_active_expert_chunk_size()
         self._int4_grouped_chunk_backend = get_int4_grouped_chunk_backend()
-        self._int4_te_chunk_modules: Dict[Tuple[int, int, int, str, Optional[int], str], nn.Module] = {}
+        self._int4_te_chunk_modules: dict[tuple[int, int, int, str, int | None, str], nn.Module] = {}
 
     def _is_base_nvfp4(self) -> bool:
         """Return whether the wrapped module currently carries ModelOpt NVFP4 weight state."""
@@ -909,7 +1040,7 @@ class OFTLinear(AdapterWrapper):
         has_packed = hasattr(self.to_wrap, f"{first}_packed") or hasattr(self.to_wrap, f"{first}_w_packed")
         return has_packed and self._nvfp4_grouped_scale_suffix(suffix) is not None
 
-    def _nvfp4_grouped_scale_suffix(self, local_suffix: str) -> Optional[str]:
+    def _nvfp4_grouped_scale_suffix(self, local_suffix: str) -> str | None:
         """Return the quantizer-buffer suffix for a local grouped expert.
 
         Packed expert buffers are keyed by local runtime names (``weight0``),
@@ -1020,7 +1151,7 @@ class OFTLinear(AdapterWrapper):
         )
         logger.warning("%s", message)
 
-    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
         _trap_oft_applied_bridge(self, "Linear")
         if self._adapter_enabled:
             x = self.adapter(x.contiguous())
@@ -1045,7 +1176,7 @@ class OFTLinear(AdapterWrapper):
 
         # --- Standard BF16 path ---
         if not hasattr(self.to_wrap, "config"):
-            return self.to_wrap(x, *args, **kwargs), None
+            return self.to_wrap(x, *args, **kwargs)
         linear_output, bias, _ = self.base_linear_forward(x, *args, **kwargs)
         return linear_output, bias
 
@@ -1057,7 +1188,7 @@ class OFTLinear(AdapterWrapper):
             return name[len("weight") :]
         return ""
 
-    def _get_nvfp4_quantizer_buffer(self, quantizer: nn.Module, attr: str, name: str) -> Optional[torch.Tensor]:
+    def _get_nvfp4_quantizer_buffer(self, quantizer: nn.Module, attr: str, name: str) -> torch.Tensor | None:
         suffix = self._nvfp4_weight_suffix(name)
         if suffix:
             value = getattr(quantizer, f"{attr}{suffix}", None)
@@ -1072,7 +1203,7 @@ class OFTLinear(AdapterWrapper):
                 return value[expert_idx]
         return value
 
-    def _get_nvfp4_scale_2(self, quantizer: nn.Module, name: str) -> Optional[torch.Tensor]:
+    def _get_nvfp4_scale_2(self, quantizer: nn.Module, name: str) -> torch.Tensor | None:
         scale_2 = self._get_nvfp4_quantizer_buffer(quantizer, "_double_scale", name)
         if scale_2 is not None:
             return scale_2
@@ -1109,7 +1240,7 @@ class OFTLinear(AdapterWrapper):
             device=device,
         )
 
-    def _forward_nvfp4_te_linear(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _forward_nvfp4_te_linear(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """NVFP4 forward for TE-backed single-weight linears."""
         from megatron.bridge.orbit.low_precision.nvfp4 import dequantize_nvfp4
 
@@ -1149,7 +1280,7 @@ class OFTLinear(AdapterWrapper):
 
         try:
             with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
-                if HAVE_TE_ROW_LINEAR and isinstance(self.to_wrap, TERowParallelLinear):
+                if _is_available_type_instance(self.to_wrap, TERowParallelLinear, HAVE_TE_ROW_LINEAR):
                     output_parallel = F.linear(x.to(w_compute.dtype), w_compute, None)
                     if getattr(self.to_wrap, "explicit_expert_comm", False):
                         output_ = output_parallel
@@ -1162,16 +1293,8 @@ class OFTLinear(AdapterWrapper):
                         return output_, bias
                     return output_ + bias if has_bias else output_, None
 
-                if HAVE_TE_COL_LINEAR and isinstance(self.to_wrap, TEColumnParallelLinear):
-                    if (
-                        getattr(self.to_wrap, "allreduce_dgrad", False)
-                        or getattr(self.to_wrap, "sequence_parallel", False)
-                        or getattr(self.to_wrap, "explicit_expert_comm", False)
-                        or getattr(self.to_wrap, "disable_grad_reduce", False)
-                    ):
-                        input_parallel = x
-                    else:
-                        input_parallel = copy_to_tensor_model_parallel_region(x, group=tp_group)
+                if _is_available_type_instance(self.to_wrap, TEColumnParallelLinear, HAVE_TE_COL_LINEAR):
+                    input_parallel = _prepare_raw_column_parallel_input(self.to_wrap, x)
 
                     output_parallel = F.linear(
                         input_parallel.to(w_compute.dtype),
@@ -1196,9 +1319,38 @@ class OFTLinear(AdapterWrapper):
         finally:
             del w_compute
 
-    def _forward_nvfp4_grouped_eager(
-        self, x: torch.Tensor, tokens_per_expert: Any
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _grouped_return_biases(self) -> list[torch.Tensor] | None:
+        """Return TEGroupedLinear's per-expert bias list when requested.
+
+        Grouped FC2 sets ``te_return_bias`` so TEGroupedMLP can apply each bias
+        *after* routing probabilities. Quantized fallbacks must therefore omit
+        bias from their GEMMs and return the complete numbered bias family.
+        """
+        if not getattr(self.to_wrap, "te_return_bias", False):
+            return None
+
+        biases = []
+        missing = []
+        for idx in range(len(self._weight_names)):
+            name = f"bias{idx}"
+            bias = getattr(self.to_wrap, name, None)
+            if bias is None or (isinstance(bias, torch.Tensor) and bias.numel() == 0):
+                missing.append(name)
+            else:
+                biases.append(bias)
+        if missing:
+            raise RuntimeError(
+                f"{type(self.to_wrap).__name__} requests returned grouped bias but is missing "
+                f"returned bias tensors: {', '.join(missing)}"
+            )
+        return biases
+
+    def _grouped_gemm_bias(self, expert_idx: int, returned_biases: list[torch.Tensor] | None) -> torch.Tensor | None:
+        if returned_biases is not None:
+            return None
+        return _get_active_bias_tensor(self.to_wrap, f"bias{expert_idx}")
+
+    def _forward_nvfp4_grouped_eager(self, x: torch.Tensor, tokens_per_expert: Any) -> tuple[torch.Tensor, Any | None]:
         """Grouped expert NVFP4 forward that dequantizes active experts and uses F.linear."""
         from megatron.bridge.orbit.low_precision.nvfp4 import dequantize_nvfp4
 
@@ -1215,10 +1367,11 @@ class OFTLinear(AdapterWrapper):
         first_scale = self._get_nvfp4_quantizer_buffer(quantizer, "_scale", first_name)
         first_shape = self._nvfp4_weight_shape(first_packed, first_scale, first_name)
         out_features = int(first_shape.reshape(-1)[0].item())
+        returned_biases = self._grouped_return_biases()
         output_chunks = [x.new_empty((split, out_features), dtype=x.dtype) for split in token_splits]
         active_experts = [idx for idx, split in enumerate(token_splits) if split > 0]
         if not active_experts:
-            return x.new_empty((0, out_features), dtype=x.dtype), None
+            return x.new_empty((0, out_features), dtype=x.dtype), returned_biases
 
         input_chunks = list(torch.split(x, token_splits, dim=0))
         ptr_to_handle = {}
@@ -1259,16 +1412,14 @@ class OFTLinear(AdapterWrapper):
         try:
             with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
                 for idx in active_experts:
-                    bias = _get_active_bias_tensor(self.to_wrap, f"bias{idx}")
+                    bias = self._grouped_gemm_bias(idx, returned_biases)
                     output_chunks[idx] = F.linear(input_chunks[idx], expert_weights[idx], bias)
         finally:
             del expert_weights
 
-        return torch.cat(output_chunks, dim=0), None
+        return torch.cat(output_chunks, dim=0), returned_biases
 
-    def _forward_nvfp4(
-        self, x: torch.Tensor, *args: Any, **kwargs: Any
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _forward_nvfp4(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
         if len(self._weight_names) != 1:
             if len(args) == 0:
                 raise ValueError("Grouped OFTLinear NVFP4 fallback requires tokens_per_expert")
@@ -1277,7 +1428,7 @@ class OFTLinear(AdapterWrapper):
 
     def _forward_nvfp4_grouped_buffers(
         self, x: torch.Tensor, *args: Any, **kwargs: Any
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, Any | None]:
         """Grouped MoE NVFP4 forward reading per-expert NVFP4 buffers.
 
         Reads ``weight{N}_packed`` (fc2) or ``weight{N}_w_packed`` + ``weight{N}_v_packed``
@@ -1313,6 +1464,7 @@ class OFTLinear(AdapterWrapper):
                 f"{None if first_scale is None else tuple(first_scale.shape)}"
             )
         out_features = int(first_scale.shape[-2])
+        returned_biases = self._grouped_return_biases()
 
         # Megatron's TEGroupedLinear inputs are typically [total_tokens, hidden],
         # but when ``config.fp4`` or ``config.fp8`` is on, Megatron applies
@@ -1358,7 +1510,7 @@ class OFTLinear(AdapterWrapper):
         output_chunks = [x.new_empty((split, out_features), dtype=x.dtype) for split in token_splits]
         active_experts = [idx for idx, split in enumerate(token_splits) if split > 0]
         if not active_experts:
-            return x.new_empty((0, out_features), dtype=x.dtype), None
+            return x.new_empty((0, out_features), dtype=x.dtype), returned_biases
 
         input_chunks = list(torch.split(x_to_split, token_splits, dim=split_dim))
 
@@ -1375,7 +1527,7 @@ class OFTLinear(AdapterWrapper):
         # synchronous inside the call, and popping immediately afterwards means
         # a later allocation reusing the freed address can never be mistaken
         # for a registered weight. Peak = ONE dequantized expert at a time.
-        ptr_to_handle: Dict[int, tuple] = {}
+        ptr_to_handle: dict[int, tuple] = {}
 
         def pack(tensor):
             handle = ptr_to_handle.get(tensor.data_ptr())
@@ -1457,7 +1609,7 @@ class OFTLinear(AdapterWrapper):
                     w_compute.dtype,
                 )
                 try:
-                    bias = _get_active_bias_tensor(self.to_wrap, f"bias{idx}")
+                    bias = self._grouped_gemm_bias(idx, returned_biases)
                     # F.linear expects [..., in_features]; for split_dim==1 the chunk is
                     # [hidden, tokens] so transpose to [tokens, hidden] for the GEMM, then
                     # transpose back when concatenating.
@@ -1481,7 +1633,7 @@ class OFTLinear(AdapterWrapper):
                 dtype=output.dtype,
             )
             output = torch.cat([output, pad], dim=0)
-        return output, None
+        return output, returned_biases
 
     @staticmethod
     def _normalize_tokens_per_expert(tokens_per_expert: Any) -> list[int]:
@@ -1491,7 +1643,7 @@ class OFTLinear(AdapterWrapper):
 
     def _forward_int4_grouped_chunked(
         self, x: torch.Tensor, tokens_per_expert: Any
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Grouped expert INT4 forward that dequantizes only active experts in chunks.
 
         This keeps the current low-memory behavior but prefers a chunk-local
@@ -1652,9 +1804,9 @@ class OFTLinear(AdapterWrapper):
             TERowParallelGroupedLinear,
         )
 
-        if HAVE_TE_COL_GRP_LINEAR and isinstance(self.to_wrap, TEColumnParallelGroupedLinear):
+        if _is_available_type_instance(self.to_wrap, TEColumnParallelGroupedLinear, HAVE_TE_COL_GRP_LINEAR):
             return TEColumnParallelGroupedLinear, "column"
-        if HAVE_TE_ROW_GRP_LINEAR and isinstance(self.to_wrap, TERowParallelGroupedLinear):
+        if _is_available_type_instance(self.to_wrap, TERowParallelGroupedLinear, HAVE_TE_ROW_GRP_LINEAR):
             return TERowParallelGroupedLinear, "row"
         return None, None
 
@@ -1682,7 +1834,7 @@ class OFTLinear(AdapterWrapper):
         local_output_size: int,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> Optional[nn.Module]:
+    ) -> nn.Module | None:
         chunk_cls, parallel_mode = self._get_int4_te_grouped_chunk_cls_and_mode()
         if chunk_cls is None or parallel_mode is None:
             return None
@@ -1752,13 +1904,13 @@ class OFTLinear(AdapterWrapper):
 
     def _forward_int4_eager(
         self, x: torch.Tensor, *args: Any, **kwargs: Any
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Original eager INT4 path that materializes all local weights for the wrapped module."""
         from megatron.bridge.orbit.low_precision.int4 import dequantize_int4
 
         weight_param = getattr(self.to_wrap, self._weight_names[0], None) if self._weight_names else None
         if len(self._weight_names) == 1 and (
-            (HAVE_TE_LINEAR and isinstance(self.to_wrap, TELinear))
+            _is_available_type_instance(self.to_wrap, TELinear, HAVE_TE_LINEAR)
             or (weight_param is not None and type(weight_param) is not nn.Parameter)
         ):
             return self._forward_int4_te_linear(x)
@@ -1800,7 +1952,7 @@ class OFTLinear(AdapterWrapper):
                 weight_param = getattr(self.to_wrap, name)
                 weight_param.data = _empty_storage_view(weight_param.data)
 
-    def _forward_int4_te_linear(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _forward_int4_te_linear(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """INT4 forward for TE-backed single-weight linears.
 
         TE linear weights are tensor subclasses, so rebinding ``weight.data`` to a
@@ -1844,7 +1996,7 @@ class OFTLinear(AdapterWrapper):
 
         try:
             with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
-                if HAVE_TE_ROW_LINEAR and isinstance(self.to_wrap, TERowParallelLinear):
+                if _is_available_type_instance(self.to_wrap, TERowParallelLinear, HAVE_TE_ROW_LINEAR):
                     output_parallel = F.linear(x.to(w_compute.dtype), w_compute, None)
                     if getattr(self.to_wrap, "explicit_expert_comm", False):
                         output_ = output_parallel
@@ -1857,16 +2009,8 @@ class OFTLinear(AdapterWrapper):
                         return output_, bias
                     return output_ + bias if has_bias else output_, None
 
-                if HAVE_TE_COL_LINEAR and isinstance(self.to_wrap, TEColumnParallelLinear):
-                    if (
-                        getattr(self.to_wrap, "allreduce_dgrad", False)
-                        or getattr(self.to_wrap, "sequence_parallel", False)
-                        or getattr(self.to_wrap, "explicit_expert_comm", False)
-                        or getattr(self.to_wrap, "disable_grad_reduce", False)
-                    ):
-                        input_parallel = x
-                    else:
-                        input_parallel = copy_to_tensor_model_parallel_region(x, group=tp_group)
+                if _is_available_type_instance(self.to_wrap, TEColumnParallelLinear, HAVE_TE_COL_LINEAR):
+                    input_parallel = _prepare_raw_column_parallel_input(self.to_wrap, x)
 
                     output_parallel = F.linear(
                         input_parallel.to(w_compute.dtype),
@@ -1891,7 +2035,7 @@ class OFTLinear(AdapterWrapper):
         finally:
             del w_compute
 
-    def _forward_int4(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _forward_int4(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward with INT4 base weight — no BF16 copy held by autograd.
 
         Same ``saved_tensors_hooks`` pattern as ``_forward_fp8`` but dequants
@@ -1904,12 +2048,12 @@ class OFTLinear(AdapterWrapper):
 
     def _is_te_single_weight_linear(self) -> bool:
         return (
-            (HAVE_TE_LINEAR and isinstance(self.to_wrap, TELinear))
-            or (HAVE_TE_ROW_LINEAR and isinstance(self.to_wrap, TERowParallelLinear))
-            or (HAVE_TE_COL_LINEAR and isinstance(self.to_wrap, TEColumnParallelLinear))
+            _is_available_type_instance(self.to_wrap, TELinear, HAVE_TE_LINEAR)
+            or _is_available_type_instance(self.to_wrap, TERowParallelLinear, HAVE_TE_ROW_LINEAR)
+            or _is_available_type_instance(self.to_wrap, TEColumnParallelLinear, HAVE_TE_COL_LINEAR)
         )
 
-    def _forward_fp8_te_linear(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _forward_fp8_te_linear(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """FP8 forward for TE-backed single-weight linears.
 
         TE linear weights can be tensor subclasses/cached by TE internals, so
@@ -2002,7 +2146,7 @@ class OFTLinear(AdapterWrapper):
 
         try:
             with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
-                if HAVE_TE_ROW_LINEAR and isinstance(self.to_wrap, TERowParallelLinear):
+                if _is_available_type_instance(self.to_wrap, TERowParallelLinear, HAVE_TE_ROW_LINEAR):
                     output_parallel = native_linear_or_none(
                         x,
                         native_bias=None,
@@ -2023,16 +2167,8 @@ class OFTLinear(AdapterWrapper):
                         return output_, bias
                     return output_ + bias if has_bias else output_, None
 
-                if HAVE_TE_COL_LINEAR and isinstance(self.to_wrap, TEColumnParallelLinear):
-                    if (
-                        getattr(self.to_wrap, "allreduce_dgrad", False)
-                        or getattr(self.to_wrap, "sequence_parallel", False)
-                        or getattr(self.to_wrap, "explicit_expert_comm", False)
-                        or getattr(self.to_wrap, "disable_grad_reduce", False)
-                    ):
-                        input_parallel = x
-                    else:
-                        input_parallel = copy_to_tensor_model_parallel_region(x, group=tp_group)
+                if _is_available_type_instance(self.to_wrap, TEColumnParallelLinear, HAVE_TE_COL_LINEAR):
+                    input_parallel = _prepare_raw_column_parallel_input(self.to_wrap, x)
 
                     native_bias = (
                         None if getattr(self.to_wrap, "te_return_bias", False) else (bias if has_bias else None)
@@ -2077,9 +2213,7 @@ class OFTLinear(AdapterWrapper):
             if w_compute is not None:
                 del w_compute
 
-    def _forward_fp8_grouped_eager(
-        self, x: torch.Tensor, tokens_per_expert: Any
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _forward_fp8_grouped_eager(self, x: torch.Tensor, tokens_per_expert: Any) -> tuple[torch.Tensor, Any | None]:
         """Grouped expert FP8 forward with native dispatch and F.linear fallback."""
         from megatron.bridge.orbit.quant.fp8_utils import dequant_fp8
 
@@ -2088,15 +2222,13 @@ class OFTLinear(AdapterWrapper):
             raise ValueError(
                 f"Expected {len(self._weight_names)} expert token splits for grouped FP8 path, got {len(token_splits)}"
             )
-        if getattr(self.to_wrap, "te_return_bias", False):
-            raise ValueError("Grouped OFTLinear FP8 fallback does not support te_return_bias=True")
-
         first_w = getattr(self.to_wrap, self._weight_names[0]).data
         out_features = int(first_w.shape[0])
+        returned_biases = self._grouped_return_biases()
         output_chunks = [x.new_empty((split, out_features), dtype=x.dtype) for split in token_splits]
         active_experts = [idx for idx, split in enumerate(token_splits) if split > 0]
         if not active_experts:
-            return x.new_empty((0, out_features), dtype=x.dtype), None
+            return x.new_empty((0, out_features), dtype=x.dtype), returned_biases
 
         input_chunks = list(torch.split(x, token_splits, dim=0))
         use_native = should_attempt_qwen3_native_fp8_gemm()
@@ -2138,7 +2270,7 @@ class OFTLinear(AdapterWrapper):
                         input_chunks[idx],
                         w_fp8,
                         scale_inv,
-                        bias=_get_active_bias_tensor(self.to_wrap, f"bias{idx}"),
+                        bias=self._grouped_gemm_bias(idx, returned_biases),
                         module_name=f"{type(self.to_wrap).__name__}.expert{idx}",
                     )
                 except ValueError:
@@ -2184,7 +2316,7 @@ class OFTLinear(AdapterWrapper):
                 for idx in active_experts:
                     if idx not in expert_weights:
                         continue
-                    bias = _get_active_bias_tensor(self.to_wrap, f"bias{idx}")
+                    bias = self._grouped_gemm_bias(idx, returned_biases)
                     output_chunks[idx] = F.linear(
                         input_chunks[idx].to(expert_weights[idx].dtype),
                         expert_weights[idx],
@@ -2193,9 +2325,9 @@ class OFTLinear(AdapterWrapper):
         finally:
             del expert_weights
 
-        return torch.cat(output_chunks, dim=0), None
+        return torch.cat(output_chunks, dim=0), returned_biases
 
-    def _forward_fp8(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _forward_fp8(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward with FP8 base weight — no BF16 copy held by autograd.
 
         When ``MEGATRON_OFT_FP8_ACTIVATION_QUANT=w8a8`` is set, the post-OFT
@@ -2364,7 +2496,7 @@ class TEOFTLayerNormLinear(nn.Module):
 
         return ln_out
 
-    def _run_linear(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _run_linear(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run just the Linear part using the original module's weight/bias.
 
         For column-parallel with sequence parallelism, the fused TE kernel
@@ -2376,16 +2508,7 @@ class TEOFTLayerNormLinear(nn.Module):
         bias = _get_active_bias_tensor(self._orig_module)
         has_bias = bias is not None
 
-        # Handle sequence parallelism: all-gather input along seq dimension
-        # For ColumnParallel + SP, input is [seq/tp, batch, hidden] and needs
-        # to be gathered to [seq, batch, hidden] before GEMM.
-        if getattr(self._orig_module, "sequence_parallel", False):
-            from megatron.core.tensor_parallel.mappings import (
-                gather_from_sequence_parallel_region,
-            )
-
-            x = gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=True)
-
+        x = _prepare_raw_column_parallel_input(self._orig_module, x)
         x = x.to(weight.dtype)
 
         te_return_bias = getattr(self._orig_module, "te_return_bias", False)

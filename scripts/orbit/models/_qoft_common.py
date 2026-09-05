@@ -803,7 +803,7 @@ class NanTraceCallback(Callback):
                     name if magnitude > worst else where,
                 )
         for group, (worst, count, where) in sorted(buckets.items()):
-            print(
+            logger.info(
                 f"[nan-debug][rank{rank_id}] pre-backward main_grad max|.| for {group} params: "
                 f"{worst:.6g} over {count} params (worst: {where})"
             )
@@ -830,7 +830,7 @@ class NanTraceCallback(Callback):
             f"skipped={context.skipped_iter} lr={lr_text}"
         )
         rank_id = dist.get_rank() if dist.is_initialized() else 0
-        print(
+        logger.info(
             f"[nan-debug][rank{rank_id}] largest finite activation this step: "
             f"{self._max_activation:.6g} at {self._max_activation_where}"
         )
@@ -856,9 +856,14 @@ class NanTraceCallback(Callback):
                 total_sq += norm_value * norm_value
                 grad_norms.append((norm_value, name))
         grad_norms.sort(reverse=True)
-        print(f"[nan-debug][rank{rank}] local param-grad total-norm {total_sq**0.5:.6g} over {len(grad_norms)} params")
+        logger.info(
+            "[nan-debug][rank%d] local param-grad total-norm %.6g over %d params",
+            rank,
+            total_sq**0.5,
+            len(grad_norms),
+        )
         for norm_value, name in grad_norms[:6]:
-            print(f"[nan-debug][rank{rank}]   grad-norm {norm_value:.6g}  {name}")
+            logger.info("[nan-debug][rank%d]   grad-norm %.6g  %s", rank, norm_value, name)
 
         param_issue = _first_nonfinite_named_parameter(context.model, include_grad=False)
         if param_issue is not None:
@@ -923,6 +928,60 @@ def _is_int4_triplet_key(key: str, scope: str) -> bool:
 
 def _drop_extra_state_entries(state_dict: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in state_dict.items() if "._extra_state" not in str(key)}
+
+
+def _load_adapter_only_state_dict(
+    model_module,
+    state_dict: dict[str, Any],
+    *,
+    quantized_keys: frozenset[str],
+    arch_label: str,
+    quant_label: str,
+) -> None:
+    """Load a PEFT run checkpoint without replacing live Parameters.
+
+    Adapter-only checkpoints intentionally omit the frozen base model, and the
+    QOFT save filter emits only trainable adapter Parameters. Validate the
+    complete adapter payload before copying so a missing adapter or any base
+    payload cannot partially mutate the live model. ``assign=False`` is
+    essential: the optimizer was built around these Parameter objects before
+    the run-checkpoint load executes.
+    """
+    model_state_keys = frozenset(str(key) for key in model_module.state_dict())
+    state_keys = frozenset(key for key in state_dict if isinstance(key, str))
+    trainable_keys = frozenset(name for name, param in model_module.named_parameters() if param.requires_grad)
+
+    missing_trainable = sorted(trainable_keys - state_keys)
+    quantized = sorted(state_keys & quantized_keys)
+    unexpected = sorted(state_keys - model_state_keys - quantized_keys)
+    frozen_base = sorted((state_keys & model_state_keys) - trainable_keys - quantized_keys)
+    non_string_keys = [repr(key) for key in state_dict if not isinstance(key, str)]
+    if missing_trainable or unexpected or quantized or frozen_base or non_string_keys:
+        details = []
+        if missing_trainable:
+            details.append("missing trainable adapter keys=" + ", ".join(missing_trainable[:20]))
+        if quantized:
+            details.append("quantized base payload keys=" + ", ".join(quantized[:20]))
+        if frozen_base:
+            details.append("frozen base payload keys=" + ", ".join(frozen_base[:20]))
+        if unexpected:
+            details.append("unexpected keys=" + ", ".join(unexpected[:20]))
+        if non_string_keys:
+            details.append("unexpected non-string keys=" + ", ".join(non_string_keys[:20]))
+        raise RuntimeError(f"Invalid {arch_label} {quant_label} adapter-only checkpoint: " + " | ".join(details))
+
+    load_return = model_module.load_state_dict(state_dict, strict=False, assign=False)
+    missing_trainable = sorted(key for key in load_return.missing_keys if key in trainable_keys)
+    unexpected = sorted(load_return.unexpected_keys)
+    if missing_trainable or unexpected:
+        details = []
+        if missing_trainable:
+            details.append("missing trainable adapter keys=" + ", ".join(missing_trainable[:20]))
+        if unexpected:
+            details.append("unexpected keys=" + ", ".join(unexpected[:20]))
+        raise RuntimeError(
+            f"Invalid {arch_label} {quant_label} adapter-only checkpoint after load: " + " | ".join(details)
+        )
 
 
 def _materialize_meta_sharded_tensors_to_cpu(state_dict, sharded_tensor_cls) -> None:
@@ -1130,7 +1189,24 @@ def install_int4_checkpoint_load_patches(
             _materialize_meta_sharded_tensors_to_cpu(state_dict, MCoreShardedTensor)
         return original_mcore_to_pyt(state_dict, is_loading, **kwargs)
 
-    def _int4_load_model_state_dict(model_module, state_dict, strict=True):
+    def _int4_load_model_state_dict(model_module, state_dict, strict=True, *, adapter_only=False):
+        quantized_keys = frozenset(
+            key
+            for key in state_dict
+            # Adapter checkpoints must never carry a quantized base bundle,
+            # including dense triplets that are outside this runtime's scope.
+            if isinstance(key, str) and _is_int4_triplet_key(key, "all")
+        )
+        if adapter_only:
+            _load_adapter_only_state_dict(
+                model_module,
+                state_dict,
+                quantized_keys=quantized_keys,
+                arch_label=arch_label,
+                quant_label="INT4",
+            )
+            return
+
         if scope == "all":
             state_dict = _drop_extra_state_entries(state_dict)
         register_int4_buffers_after_load(model_module, state_dict)
@@ -1272,6 +1348,7 @@ def ensure_fp8_scale_inv_buffers(model):
 
 def install_fp8_checkpoint_load_patches(*, pretrained_checkpoint: str, arch_label: str) -> None:
     """Load FP8 base weights through the direct converter's checkpoint contract."""
+    import megatron.bridge.orbit.training.modelopt_checkpoint as _modelopt_ckpt_mod
     import megatron.bridge.training.checkpointing as _ckpt_mod
     from megatron.bridge.orbit.quant.fp8_utils import (
         register_fp8_scale_inv_buffers_after_load,
@@ -1326,12 +1403,32 @@ def install_fp8_checkpoint_load_patches(*, pretrained_checkpoint: str, arch_labe
             state_dict[model_key] = model_state
         return state_dict
 
-    def _fp8_load_model_state_dict(model_module, state_dict, strict=True):
+    def _noop_restore_modelopt_state_for_sharded_load(model, checkpoint_path, common_state_dict) -> bool:
+        return False
+
+    def _fp8_load_model_state_dict(model_module, state_dict, strict=True, *, adapter_only=False):
+        if adapter_only:
+            quantized_keys = frozenset(
+                key
+                for key in state_dict
+                if isinstance(key, str)
+                and (key.endswith("_scale_inv") or re.search(r"\.weight\d*_[wv]$", key) is not None)
+            )
+            _load_adapter_only_state_dict(
+                model_module,
+                state_dict,
+                quantized_keys=quantized_keys,
+                arch_label=arch_label,
+                quant_label="FP8",
+            )
+            return
+
         register_fp8_scale_inv_buffers_after_load(model_module, state_dict)
-        original_load_model_sd(model_module, state_dict, strict)
+        original_load_model_sd(model_module, state_dict, strict, adapter_only=adapter_only)
 
     _ckpt_mod._generate_model_state_dict = _fp8_generate_model_state_dict
     _ckpt_mod._load_model_state_dict = _fp8_load_model_state_dict
+    _modelopt_ckpt_mod._maybe_restore_modelopt_state_for_sharded_load = _noop_restore_modelopt_state_for_sharded_load
     _ckpt_mod._qoft_fp8_checkpoint_patches_installed = True
 
 
@@ -1355,6 +1452,21 @@ _EXPECTED_NVFP4_MISSING_KEY_RE = re.compile(
 )
 # Packed per-expert weight buffers installed by register_nvfp4_buffers_after_load.
 _PACKED_EXPERT_BUFFER_RE = re.compile(r"^weight\d+(?:_w|_v)?_packed$")
+
+
+def _nvfp4_dense_payload_keys(string_keys: list[str]) -> frozenset[str]:
+    """Return every loader-only key in each dense NVFP4 tensor family."""
+    dense_modules = {
+        key[: -len(".weight_quantizer._scale")] for key in string_keys if key.endswith(".weight_quantizer._scale")
+    }
+    payload_keys = {
+        f"{module}.{weight_name}" for module in dense_modules for weight_name in ("weight", "weight_w", "weight_v")
+    }
+    for key in string_keys:
+        module, marker, _ = key.partition(".weight_quantizer._")
+        if marker and module in dense_modules:
+            payload_keys.add(key)
+    return frozenset(payload_keys)
 
 
 def _is_expected_nvfp4_missing_key(key: str, handled_dense_weight_keys: frozenset[str]) -> bool:
@@ -1546,7 +1658,23 @@ def install_nvfp4_checkpoint_load_patches(
             _materialize_meta_sharded_tensors_to_cpu(state_dict, MCoreShardedTensor)
         return original_mcore_to_pyt(state_dict, is_loading, **kwargs)
 
-    def _nvfp4_load_model_state_dict(model_module, state_dict, strict=True):
+    def _nvfp4_load_model_state_dict(model_module, state_dict, strict=True, *, adapter_only=False):
+        string_keys = [key for key in state_dict if isinstance(key, str)]
+        dense_payload_keys = _nvfp4_dense_payload_keys(string_keys)
+        handled_dense_weight_keys = frozenset(key for key in dense_payload_keys if key.endswith(".weight"))
+        quantized_keys = frozenset(
+            key for key in string_keys if _EXPERT_NVFP4_ENTRY_RE.match(key) is not None or key in dense_payload_keys
+        )
+        if adapter_only:
+            _load_adapter_only_state_dict(
+                model_module,
+                state_dict,
+                quantized_keys=quantized_keys,
+                arch_label=arch_label,
+                quant_label="NVFP4",
+            )
+            return
+
         register_nvfp4_buffers_after_load_dense(model_module, state_dict)
         register_nvfp4_buffers_after_load(model_module, state_dict)
 
@@ -1563,18 +1691,8 @@ def install_nvfp4_checkpoint_load_patches(
                             zeroed += 1
             print_rank_0(f"[qoft-debug] zeroed {zeroed} packed expert weight buffers")
 
-        string_keys = [key for key in state_dict if isinstance(key, str)]
-        quantized_dense_modules = {
-            key[: -len(".weight_quantizer._scale")] for key in string_keys if key.endswith(".weight_quantizer._scale")
-        }
-        handled_dense_weight_keys = frozenset(f"{module}.weight" for module in quantized_dense_modules)
-        for key in string_keys:
-            if (
-                _EXPERT_NVFP4_ENTRY_RE.match(key) is not None
-                or ".weight_quantizer._" in key
-                or key in handled_dense_weight_keys
-            ):
-                del state_dict[key]
+        for key in quantized_keys:
+            del state_dict[key]
 
         load_return = model_module.load_state_dict(state_dict, strict=False, assign=True)
         missing = [

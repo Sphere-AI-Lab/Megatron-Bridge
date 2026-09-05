@@ -61,18 +61,18 @@ def _benchmark_case(layout: str, tokens: int) -> list[dict[str, object]]:
     ids_tensor = torch.tensor(rotation_ids, device=device, dtype=torch.int32)
     torch.manual_seed(2026 + tokens)
     x = torch.randn(tokens, input_dim, device=device, dtype=torch.bfloat16)
-    weight = (
-        torch.randn(output_dim, input_dim, device=device, dtype=torch.bfloat16)
-        / input_dim**0.5
+    weight = torch.randn(output_dim, input_dim, device=device, dtype=torch.bfloat16) / input_dim**0.5
+    skew = (
+        torch.randn(
+            4,
+            input_dim // block_size,
+            block_size,
+            block_size,
+            device=device,
+            dtype=torch.float32,
+        )
+        * 0.01
     )
-    skew = torch.randn(
-        4,
-        input_dim // block_size,
-        block_size,
-        block_size,
-        device=device,
-        dtype=torch.float32,
-    ) * 0.01
     skew = skew - skew.transpose(-1, -2)
     identity = torch.eye(block_size, device=device).expand_as(skew)
     rotations = torch.linalg.solve(identity + skew, identity - skew).to(torch.bfloat16)
@@ -132,6 +132,7 @@ def _benchmark_case(layout: str, tokens: int) -> list[dict[str, object]]:
 
 
 def main() -> None:
+    """Run all benchmark cases and emit environment and timing records."""
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -143,12 +144,7 @@ def main() -> None:
         "triton": triton.__version__,
     }
     logger.info(json.dumps({"environment": metadata}, sort_keys=True))
-    rows = [
-        row
-        for layout in LAYOUTS
-        for tokens in TOKEN_COUNTS
-        for row in _benchmark_case(layout, tokens)
-    ]
+    rows = [row for layout in LAYOUTS for tokens in TOKEN_COUNTS for row in _benchmark_case(layout, tokens)]
     for row in rows:
         logger.info(
             f"{row['layout']:5s} M={row['tokens']:4d} {row['mode']:16s} "

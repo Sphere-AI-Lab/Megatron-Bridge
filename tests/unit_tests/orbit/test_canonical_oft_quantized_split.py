@@ -38,8 +38,8 @@ import torch
 from megatron.core import parallel_state
 
 import megatron.bridge.orbit.low_precision.nvfp4 as nvfp4_module
-import megatron.bridge.orbit.quant.fp8_utils as fp8_module
 import megatron.bridge.orbit.oft.canonical_oft as canonical_oft_module
+import megatron.bridge.orbit.quant.fp8_utils as fp8_module
 from megatron.bridge.orbit.oft.canonical_oft import (
     CanonicalOFTMerge,
     OFTLinearSplitFC1UpGate,
@@ -304,15 +304,9 @@ def test_gated_q_split_applies_each_logical_adapter() -> None:
     x = torch.randn(5, _IN, requires_grad=True)
 
     actual, bias = wrapper(x)
-    rotated = {
-        name: getattr(wrapper, f"adapter_{name}")(x)
-        for name in ("q", "gate", "k", "v")
-    }
+    rotated = {name: getattr(wrapper, f"adapter_{name}")(x) for name in ("q", "gate", "k", "v")}
     expected = torch.cat(
-        [
-            torch.nn.functional.linear(rotated[name], weight[start:end])
-            for name, start, end in wrapper._segments
-        ],
+        [torch.nn.functional.linear(rotated[name], weight[start:end]) for name, start, end in wrapper._segments],
         dim=-1,
     )
 
@@ -341,10 +335,7 @@ def test_gated_q_merge_uses_each_logical_adapter() -> None:
         input_is_parallel=True,
     )
     _randomize_adapters(wrapper, seed=79, dtype=torch.float32)
-    rotations = {
-        name: getattr(wrapper, f"adapter_{name}").get_delta_weight()
-        for name in ("q", "gate", "k", "v")
-    }
+    rotations = {name: getattr(wrapper, f"adapter_{name}").get_delta_weight() for name in ("q", "gate", "k", "v")}
     expected = weight.clone()
     for name, start, end in wrapper._segments:
         expected[start:end] = expected[start:end] @ rotations[name].T
@@ -478,7 +469,7 @@ _G_TOKENS = (3, 5)
 def _grouped_ref_module(expert_weights: dict[int, torch.Tensor]) -> torch.nn.Module:
     module = torch.nn.Module()
     module.num_gemms = _E
-    module.config = SimpleNamespace(sequence_parallel=False)
+    module.config = SimpleNamespace(sequence_parallel=False, gated_linear_unit=True)
     for idx, w in expert_weights.items():
         setattr(module, f"weight{idx}", torch.nn.Parameter(w.clone(), requires_grad=False))
     return module
@@ -488,7 +479,7 @@ def _grouped_quantized_module(kind: str) -> tuple[torch.nn.Module, dict[int, tor
     device = "cuda" if kind == "int4" else "cpu"
     module = torch.nn.Module()
     module.num_gemms = _E
-    module.config = SimpleNamespace(sequence_parallel=False)
+    module.config = SimpleNamespace(sequence_parallel=False, gated_linear_unit=True)
     reference = {}
     for idx in range(_E):
         torch.manual_seed(300 + idx)
@@ -547,6 +538,50 @@ _GROUPED_FORMATS = [
         marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="INT4 dequant is triton"),
     ),
 ]
+
+
+_GROUPED_BIAS_FORMATS = [pytest.param("bf16", id="bf16"), *_GROUPED_FORMATS]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kind", _GROUPED_BIAS_FORMATS)
+@pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "disabled"])
+def test_grouped_split_applies_real_fused_expert_biases(kind: str, enabled: bool) -> None:
+    """TEGroupedLinear stores one fused ``bias{i}`` for each expert.
+
+    Gate/up are contiguous output-row halves, so their biases must be split by
+    the same association. Invented ``bias_gate{i}``/``bias_up{i}`` names make
+    both enabled and disabled wrappers silently drop the base-model bias.
+    """
+    if kind == "bf16":
+        torch.manual_seed(901)
+        reference = {idx: torch.randn(_G_OUT, _IN) * 0.1 for idx in range(_E)}
+        module = _grouped_ref_module(reference)
+    else:
+        module, reference = _grouped_quantized_module(kind)
+
+    device = reference[0].device
+    dtype = reference[0].dtype
+    biases = {idx: torch.linspace(-0.4 + idx, 0.6 + idx, _G_OUT, device=device, dtype=dtype) for idx in range(_E)}
+    module.use_bias = True
+    for idx, bias in biases.items():
+        setattr(module, f"bias{idx}", torch.nn.Parameter(bias.clone(), requires_grad=False))
+
+    wrapper = _make_grouped(module).to(device)
+    if not enabled:
+        wrapper.disable_adapter_layers()
+    tokens = torch.tensor(_G_TOKENS)
+    x = torch.randn(sum(_G_TOKENS), _IN, device=device, dtype=dtype)
+
+    actual, returned_bias = wrapper(x, tokens)
+    chunks = torch.split(x, _G_TOKENS, dim=0)
+    expected = torch.cat(
+        [torch.nn.functional.linear(chunk, reference[idx], biases[idx]) for idx, chunk in enumerate(chunks)],
+        dim=0,
+    )
+
+    assert returned_bias is None
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.unit

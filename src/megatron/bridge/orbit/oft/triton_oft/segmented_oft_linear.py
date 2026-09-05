@@ -65,10 +65,7 @@ def _segmented_oft_linear_fwd_kernel(
         )
         rotation_base = (rotation_id * NUM_BLOCKS + block_idx) * BLOCK_SIZE * BLOCK_SIZE
         rotation = tl.load(
-            rotations_ptr
-            + rotation_base
-            + offsets_block[:, None] * BLOCK_SIZE
-            + offsets_block[None, :]
+            rotations_ptr + rotation_base + offsets_block[:, None] * BLOCK_SIZE + offsets_block[None, :]
         )
         rotated = tl.dot(x, rotation, input_precision="ieee", out_dtype=tl.float32).to(tl.bfloat16)
         weight = tl.load(
@@ -109,9 +106,7 @@ def _validate_inputs(
     if input_dim != weight_input_dim:
         raise ValueError(f"x input dim {input_dim} does not match weight input dim {weight_input_dim}")
     if rotations.shape[1] * block_size != input_dim:
-        raise ValueError(
-            f"rotation shape covers input dim {rotations.shape[1] * block_size}, expected {input_dim}"
-        )
+        raise ValueError(f"rotation shape covers input dim {rotations.shape[1] * block_size}, expected {input_dim}")
     if segment_offsets.ndim != 1 or rotation_ids.ndim != 1:
         raise ValueError("segment_offsets and rotation_ids must be one-dimensional")
     if segment_offsets.numel() != rotation_ids.numel() + 1:
@@ -143,9 +138,7 @@ def segmented_oft_linear_reference(
     rotation_ids: torch.Tensor,
 ) -> torch.Tensor:
     """Apply independently routed OFT rotations with ordinary PyTorch ops."""
-    input_dim, output_dim, block_size = _validate_inputs(
-        x, weight, rotations, segment_offsets, rotation_ids
-    )
+    input_dim, output_dim, block_size = _validate_inputs(x, weight, rotations, segment_offsets, rotation_ids)
     leading_shape = x.shape[:-1]
     x_2d = x.reshape(-1, input_dim)
     x_blocks = x_2d.to(rotations.dtype).reshape(x_2d.shape[0], -1, block_size)
@@ -231,13 +224,13 @@ class _SegmentedOFTLinearFunction(torch.autograd.Function):
         for start, end, rotation_id in zip(offsets, offsets[1:], ids):
             grad_rotated = torch.matmul(grad_output_2d[:, start:end], weight[start:end])
             grad_rotated_blocks = grad_rotated.to(rotations.dtype).reshape_as(x_blocks)
-            grad_x_contribution = torch.einsum(
-                "mbj,bij->mbi", grad_rotated_blocks, rotations[rotation_id]
-            ).reshape_as(x_2d)
+            grad_x_contribution = torch.einsum("mbj,bij->mbi", grad_rotated_blocks, rotations[rotation_id]).reshape_as(
+                x_2d
+            )
             grad_x.add_(grad_x_contribution.to(grad_x.dtype))
-            grad_rotation = torch.einsum(
-                "mbi,mbj->bij", x_blocks.float(), grad_rotated_blocks.float()
-            ).to(rotations.dtype)
+            grad_rotation = torch.einsum("mbi,mbj->bij", x_blocks.float(), grad_rotated_blocks.float()).to(
+                rotations.dtype
+            )
             grad_rotations[rotation_id].add_(grad_rotation)
 
         return grad_x.reshape_as(x), None, grad_rotations, None, None

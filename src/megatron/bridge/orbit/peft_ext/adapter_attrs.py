@@ -31,7 +31,11 @@ def get_oft_adapter_attributes_from_linear(m: nn.Module, is_expert: bool = False
     """Adapter attributes for OFT: upstream's result minus the LoRA layernorm-output plumbing."""
     attrs = get_adapter_attributes_from_linear(m, is_expert=is_expert)
 
-    if HAVE_TE and isinstance(m, TELayerNormColumnParallelLinear):
+    if (
+        HAVE_TE
+        and isinstance(TELayerNormColumnParallelLinear, type)
+        and isinstance(m, TELayerNormColumnParallelLinear)
+    ):
         # OFT must not consume the layernorm output; give the fused module its
         # default fprop back and recompute the SP-comm flag the way upstream
         # does outside the LoRA-specific branch.

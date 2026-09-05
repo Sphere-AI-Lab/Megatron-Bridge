@@ -21,7 +21,7 @@ are ~92 lines each that differ only in the HF path string and a couple of tuning
 numbers, and ``_peft_common`` documents the contract directly: the caller MUST
 set ``cfg.model`` and ``cfg.tokenizer.tokenizer_model``. That is what this does.
 
-    torchrun --nproc_per_node=8 scripts/orbit/finetune_peft.py \
+    uv run python -m torch.distributed.run --nproc_per_node=8 scripts/orbit/finetune_peft.py \
         --model-path Qwen/Qwen3-14B \
         --pretrained-checkpoint ./checkpoints/Qwen3-14B-NVFP4 \
         --peft oft --quant nvfp4 --tp 1 --pp 1
@@ -148,13 +148,44 @@ def build_peft(args):
     return cls(dim=args.dim, alpha=args.alpha, dropout=args.dropout)
 
 
-def validate_parallelism(args) -> None:
-    """Reject the ModelOpt quantized-MoE layout that cannot work.
+def _bridge_name(architecture) -> str:
+    if isinstance(architecture, str):
+        return architecture
+    return architecture.__name__
+
+
+def validate_parallelism(args, *, world_size: int, etp: int = 1) -> None:
+    """Validate world-size axes and reject unsupported ModelOpt MoE layouts.
 
     ModelOpt's QuantSequentialMLP forbids TP>1 and EP>1 simultaneously for
     quantized MoE. INT4 escapes this (it does not route through
     QuantSequentialMLP) but the ModelOpt-backed formats do not.
     """
+    dimensions = {
+        "WORLD_SIZE": world_size,
+        "TP": args.tp,
+        "EP": args.ep,
+        "PP": args.pp,
+        "CP": args.cp,
+        "ETP": etp,
+    }
+    for name, value in dimensions.items():
+        if value <= 0:
+            raise SystemExit(f"{name} must be a positive integer; received {value}.")
+
+    tp_axis_size = args.tp * args.pp * args.cp
+    expert_axis_size = etp * args.ep * args.pp
+    invalid_axes = []
+    if world_size % tp_axis_size != 0:
+        invalid_axes.append(f"TP*PP*CP={tp_axis_size}")
+    if world_size % expert_axis_size != 0:
+        invalid_axes.append(f"ETP*EP*PP={expert_axis_size}")
+    if invalid_axes:
+        raise SystemExit(
+            f"WORLD_SIZE={world_size} must be divisible by TP*PP*CP={tp_axis_size} and "
+            f"ETP*EP*PP={expert_axis_size}; failed: {', '.join(invalid_axes)}."
+        )
+
     preset = QUANT_PRESETS[args.quant]
     if preset["model"].get("restore_modelopt_state") and args.tp > 1 and args.ep > 1:
         raise SystemExit(
@@ -164,14 +195,29 @@ def validate_parallelism(args) -> None:
         )
 
 
-def build_config(args):
-    validate_parallelism(args)
-
+def build_config(args, *, world_size: int | None = None):
     cfg = _peft_common()
 
     # _peft_common docstring: "The caller MUST set cfg.model and
     # cfg.tokenizer.tokenizer_model before use." The HF path supplies both.
-    cfg.model = AutoBridge.from_hf_pretrained(args.model_path).to_megatron_provider(load_weights=False)
+    auto_bridge = AutoBridge.from_hf_pretrained(args.model_path)
+    cfg.model = auto_bridge.to_megatron_provider(load_weights=False)
+    if _bridge_name(auto_bridge._causal_lm_architecture) == "Qwen3MoeForCausalLM":
+        from megatron.bridge.orbit.model_bridges.qwen3_moe_provider_ext import (
+            apply_qwen3_moe_orbit_provider_settings,
+        )
+
+        apply_qwen3_moe_orbit_provider_settings(cfg.model, auto_bridge.hf_pretrained.config)
+
+    if world_size is None:
+        try:
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        except ValueError as exc:
+            raise SystemExit(f"WORLD_SIZE must be a positive integer; received {os.environ['WORLD_SIZE']!r}.") from exc
+    etp = getattr(cfg.model, "expert_tensor_parallel_size", 1)
+    if etp is None:
+        etp = 1
+    validate_parallelism(args, world_size=world_size, etp=etp)
     cfg.tokenizer.tokenizer_model = args.model_path
 
     cfg.peft = build_peft(args)
@@ -229,7 +275,11 @@ def build_config(args):
 
 def main() -> None:
     args = parse_args()
-    finetune(config=build_config(args), forward_step_func=forward_step)
+    try:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError as exc:
+        raise SystemExit(f"WORLD_SIZE must be a positive integer; received {os.environ['WORLD_SIZE']!r}.") from exc
+    finetune(config=build_config(args, world_size=world_size), forward_step_func=forward_step)
 
 
 if __name__ == "__main__":

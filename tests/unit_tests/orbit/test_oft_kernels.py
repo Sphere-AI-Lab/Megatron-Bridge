@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
+
+
+# This module imports Orbit's Triton launchers at module scope.  Skip before
+# those imports so a CPU-only/minimal environment can collect the suite.
+pytest.importorskip("triton")
+
 import torch
 from megatron.core import parallel_state
 
@@ -26,6 +33,7 @@ from megatron.bridge.orbit.oft.triton_oft.oft_rotation import oft_rotation
 from megatron.bridge.orbit.oft.triton_oft.sgemm_oft_r import sgemm_oft_r_fwd
 from megatron.bridge.orbit.oft.triton_oft.sgemm_oft_r_by_expert import oft_r_by_expert
 from megatron.bridge.orbit.oft.triton_oft.sgemm_oft_r_single import oft_r_single
+from megatron.bridge.orbit.quant.fp8_utils import dequant_fp8
 
 
 pytestmark = [pytest.mark.unit, pytest.mark.run_only_on("gpu")]
@@ -139,6 +147,36 @@ def test_cayley_triton_forward_and_backward_match_torch() -> None:
     torch.testing.assert_close(grad_triton, grad_torch, atol=3e-4, rtol=3e-4)
 
 
+@pytest.mark.parametrize("block_size", [96, 192])
+def test_cayley_non_power_of_two_block_falls_back_to_torch(block_size: int) -> None:
+    """Valid OFT block sizes must not be sent to ``tl.arange`` unchanged."""
+    torch.manual_seed(21 + block_size)
+    raw = torch.randn(1, block_size, block_size, device="cuda", dtype=torch.bfloat16) * 0.001
+    q = (raw - raw.transpose(-1, -2)).detach().requires_grad_(True)
+    q_ref = q.detach().clone().requires_grad_(True)
+    grad = torch.randn_like(q)
+
+    actual = cayley_neumann(q)
+    expected = _torch_cayley_neumann(q_ref)
+    actual_grad = torch.autograd.grad(actual, q, grad)[0]
+    expected_grad = torch.autograd.grad(expected, q_ref, grad)[0]
+
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(actual_grad, expected_grad, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    ("shape", "message"),
+    [
+        ((16, 16), "3-D batch"),
+        ((2, 16, 8), "square"),
+    ],
+)
+def test_cayley_rejects_invalid_shapes(shape: tuple[int, ...], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        cayley_neumann(torch.zeros(shape, device="cuda", dtype=torch.float32))
+
+
 def test_single_rotation_triton_forward_and_backward_match_torch() -> None:
     torch.manual_seed(2)
     x_triton = torch.randn(7, 32, device="cuda", dtype=torch.float32, requires_grad=True)
@@ -155,6 +193,82 @@ def test_single_rotation_triton_forward_and_backward_match_torch() -> None:
     torch.testing.assert_close(out_triton, out_torch, atol=_SGEMM_ATOL, rtol=_SGEMM_RTOL)
     torch.testing.assert_close(grads_triton[0], grads_torch[0], atol=_SGEMM_ATOL, rtol=_SGEMM_RTOL)
     torch.testing.assert_close(grads_triton[1], grads_torch[1], atol=_SGEMM_ATOL, rtol=_SGEMM_RTOL)
+
+
+@pytest.mark.parametrize("block_size", [96, 192])
+def test_single_rotation_non_power_of_two_block_falls_back_to_torch(block_size: int) -> None:
+    """The public launcher accepts every OFT-valid divisor, not only powers of two."""
+    torch.manual_seed(31 + block_size)
+    x = torch.randn(3, block_size, device="cuda", dtype=torch.float32, requires_grad=True)
+    rotation = torch.randn(
+        1,
+        block_size,
+        block_size,
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    x_ref = x.detach().clone().requires_grad_(True)
+    rotation_ref = rotation.detach().clone().requires_grad_(True)
+    grad = torch.randn_like(x)
+
+    actual = oft_r_single(x, rotation)
+    expected = _rotation_reference(x_ref, rotation_ref)
+    actual_grads = torch.autograd.grad(actual, (x, rotation), grad)
+    expected_grads = torch.autograd.grad(expected, (x_ref, rotation_ref), grad)
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_grads[0], expected_grads[0])
+    torch.testing.assert_close(actual_grads[1], expected_grads[1])
+
+
+def test_single_rotation_handles_noncontiguous_input() -> None:
+    """The low-level launcher must honor logical columns of strided views."""
+    torch.manual_seed(41)
+    storage = torch.randn(5, 64, device="cuda", dtype=torch.float32, requires_grad=True)
+    x = storage[:, ::2]
+    assert not x.is_contiguous()
+    rotation = torch.randn(2, 16, 16, device="cuda", dtype=torch.float32, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    rotation_ref = rotation.detach().clone().requires_grad_(True)
+    grad = torch.randn_like(x)
+
+    actual = oft_r_single(x, rotation)
+    expected = _rotation_reference(x_ref, rotation_ref)
+    actual_grads = torch.autograd.grad(actual, (storage, rotation), grad)
+    expected_x_grad, expected_rotation_grad = torch.autograd.grad(
+        expected,
+        (x_ref, rotation_ref),
+        grad,
+    )
+
+    expected_storage_grad = torch.zeros_like(storage)
+    expected_storage_grad[:, ::2] = expected_x_grad
+    torch.testing.assert_close(actual, expected, atol=_SGEMM_ATOL, rtol=_SGEMM_RTOL)
+    torch.testing.assert_close(actual_grads[0], expected_storage_grad, atol=_SGEMM_ATOL, rtol=_SGEMM_RTOL)
+    torch.testing.assert_close(actual_grads[1], expected_rotation_grad, atol=_SGEMM_ATOL, rtol=_SGEMM_RTOL)
+
+
+@pytest.mark.parametrize(
+    ("x_shape", "rotation_shape", "message"),
+    [
+        ((2, 2, 8), (1, 16, 16), "2-D"),
+        ((2, 16), (16, 16), "3-D"),
+        ((2, 0), (0, 16, 16), "nonempty"),
+        ((2, 12), (1, 3, 4), "square"),
+        ((2, 15), (1, 16, 16), "width"),
+    ],
+)
+def test_single_rotation_rejects_invalid_shapes(
+    x_shape: tuple[int, ...],
+    rotation_shape: tuple[int, ...],
+    message: str,
+) -> None:
+    x = torch.zeros(x_shape, device="cuda", dtype=torch.float32)
+    rotation = torch.zeros(rotation_shape, device="cuda", dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=message):
+        oft_r_single(x, rotation)
 
 
 def test_segmented_expert_rotation_forward_and_backward_match_torch() -> None:
@@ -213,6 +327,52 @@ def test_fp8_block_dequant_triton_matches_torch() -> None:
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
 
+def test_fp8_block_dequant_triton_keeps_128_wide_partial_edges() -> None:
+    values = torch.ones((130, 129), device="cuda", dtype=torch.float32)
+    weight = values.to(torch.float8_e4m3fn)
+    scale = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device="cuda", dtype=torch.float32)
+
+    result = dequant_fp8_block_triton(weight, scale, torch.float32, block_size=128)
+
+    expected = torch.ones_like(values)
+    expected[:128, 128:] = 2.0
+    expected[128:, :128] = 3.0
+    expected[128:, 128:] = 4.0
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+def test_fp8_public_dequant_falls_back_when_triton_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triton_dequant = importlib.import_module("megatron.bridge.orbit.oft.triton_oft.dequant_fp8")
+    monkeypatch.setattr(triton_dequant, "_HAS_TRITON", False)
+    weight = torch.ones((130, 129), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device="cuda", dtype=torch.float32)
+
+    result = dequant_fp8(weight, scale, out_dtype=torch.float32)
+
+    expected = torch.ones((130, 129), device="cuda", dtype=torch.float32)
+    expected[:128, 128:] = 2.0
+    expected[128:, :128] = 3.0
+    expected[128:, 128:] = 4.0
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+def test_fp8_public_dequant_propagates_triton_kernel_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    triton_dequant = importlib.import_module("megatron.bridge.orbit.oft.triton_oft.dequant_fp8")
+    monkeypatch.setattr(triton_dequant, "_HAS_TRITON", True)
+
+    def fail_kernel(*args, **kwargs):
+        raise RuntimeError("mock Triton compilation failure")
+
+    monkeypatch.setattr(triton_dequant, "dequant_fp8_block_triton", fail_kernel)
+    weight = torch.ones((128, 256), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    scale = torch.ones((1, 2), device="cuda", dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="mock Triton compilation failure"):
+        dequant_fp8(weight, scale, out_dtype=torch.float32)
+
+
 def test_te_layernorm_linear_oft_identity_matches_transformer_engine() -> None:
     te = pytest.importorskip("transformer_engine.pytorch")
     torch.manual_seed(4)
@@ -242,5 +402,8 @@ def test_te_layernorm_linear_oft_identity_matches_transformer_engine() -> None:
     grad_wrapped = torch.autograd.grad(result, x_wrapped, grad)[0]
 
     assert bias is None
-    torch.testing.assert_close(result, expected, atol=2e-5, rtol=2e-5)
+    # The wrapper must de-fuse TE's LayerNorm+GEMM to insert the rotation, so
+    # its two eager kernels accumulate in a different order from TE's fused
+    # kernel even when the rotation is identity.
+    torch.testing.assert_close(result, expected, atol=1e-4, rtol=5e-4)
     torch.testing.assert_close(grad_wrapped, grad_reference, atol=6e-5, rtol=5e-4)

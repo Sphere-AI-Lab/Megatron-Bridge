@@ -91,6 +91,13 @@ def _installed_quantized_loader(
             pretrained_checkpoint="unused",
             arch_label="test",
         )
+    elif quant == "fp8":
+        fp8_utils = importlib.import_module("megatron.bridge.orbit.quant.fp8_utils")
+        monkeypatch.setattr(fp8_utils, "register_fp8_scale_inv_buffers_after_load", lambda model, state: None)
+        qcommon.install_fp8_checkpoint_load_patches(
+            pretrained_checkpoint="unused",
+            arch_label="test",
+        )
     else:  # pragma: no cover - test helper guard
         raise AssertionError(f"unsupported quant mode: {quant}")
 
@@ -140,7 +147,7 @@ def test_nvfp4_dense_payload_classification_includes_split_weight_family() -> No
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("quant", ["int4", "nvfp4"])
+@pytest.mark.parametrize("quant", ["int4", "nvfp4", "fp8"])
 def test_adapter_only_resume_allows_frozen_base_omission_and_preserves_optimizer_identity(
     monkeypatch: pytest.MonkeyPatch, quant: str
 ) -> None:
@@ -163,7 +170,7 @@ def test_adapter_only_resume_allows_frozen_base_omission_and_preserves_optimizer
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("quant", ["int4", "nvfp4"])
+@pytest.mark.parametrize("quant", ["int4", "nvfp4", "fp8"])
 def test_adapter_only_resume_rejects_missing_trainable_adapter(monkeypatch: pytest.MonkeyPatch, quant: str) -> None:
     model = _TinyQOFTModel()
 
@@ -173,7 +180,7 @@ def test_adapter_only_resume_rejects_missing_trainable_adapter(monkeypatch: pyte
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("quant", ["int4", "nvfp4"])
+@pytest.mark.parametrize("quant", ["int4", "nvfp4", "fp8"])
 def test_adapter_only_resume_rejects_unexpected_payload(monkeypatch: pytest.MonkeyPatch, quant: str) -> None:
     model = _TinyQOFTModel()
     state_dict = {
@@ -188,7 +195,7 @@ def test_adapter_only_resume_rejects_unexpected_payload(monkeypatch: pytest.Monk
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("quant", ["int4", "nvfp4"])
+@pytest.mark.parametrize("quant", ["int4", "nvfp4", "fp8"])
 def test_adapter_only_resume_rejects_known_frozen_base_payload(monkeypatch: pytest.MonkeyPatch, quant: str) -> None:
     model = _TinyQOFTModel()
     state_dict = {
@@ -209,6 +216,7 @@ def test_adapter_only_resume_rejects_known_frozen_base_payload(monkeypatch: pyte
     [
         ("int4", "decoder.layers.0.self_attention.linear_qkv.weight_packed"),
         ("nvfp4", "decoder.layers.0.mlp.experts.linear_fc1.weight0_w"),
+        ("fp8", "decoder.layers.0.mlp.experts.linear_fc1.weight0_scale_inv"),
     ],
 )
 def test_adapter_only_resume_rejects_quantized_base_payload(
@@ -293,7 +301,7 @@ def test_non_strict_full_load_still_assigns_meta_base_state(monkeypatch: pytest.
 
 
 @pytest.mark.unit
-def test_fp8_installer_disables_sidecar_restore_and_forwards_adapter_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fp8_installer_disables_sidecar_restore_and_forwards_full_load(monkeypatch: pytest.MonkeyPatch) -> None:
     qcommon = _load_qoft_common()
     checkpointing = importlib.import_module("megatron.bridge.training.checkpointing")
     modelopt_checkpoint = importlib.import_module("megatron.bridge.orbit.training.modelopt_checkpoint")
@@ -319,8 +327,8 @@ def test_fp8_installer_disables_sidecar_restore_and_forwards_adapter_mode(monkey
 
         assert modelopt_checkpoint._maybe_restore_modelopt_state_for_sharded_load is not original_modelopt_seam
         assert modelopt_checkpoint._maybe_restore_modelopt_state_for_sharded_load(object(), "unused", None) is False
-        installed_loader("model", {"oft_r": "value"}, strict=False, adapter_only=True)
-        assert calls == [("model", {"oft_r": "value"}, False, True)]
+        installed_loader("model", {"oft_r": "value"}, strict=False, adapter_only=False)
+        assert calls == [("model", {"oft_r": "value"}, False, False)]
     finally:
         checkpointing._generate_model_state_dict = original_generate
         checkpointing._load_model_state_dict = original_loader

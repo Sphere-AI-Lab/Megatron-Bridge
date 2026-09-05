@@ -21,7 +21,11 @@ import torch.nn as nn
 from megatron.bridge.orbit.conversion.compressed_tensors_int4 import CompressedTensorsINT4DequantMixin
 from megatron.bridge.orbit.conversion.fp8_preserve import BlockFP8PreserveMixin
 from megatron.bridge.orbit.conversion.modelopt_nvfp4 import ModelOptNVFP4DequantMixin
-from megatron.bridge.orbit.model_bridges import deepseek_v3_int4_bridge, kimi_k25_vl_nvfp4_bridge
+from megatron.bridge.orbit.model_bridges import (
+    deepseek_v3_int4_bridge,
+    kimi_k25_vl_nvfp4_bridge,
+    qwen3_moe_provider_ext,
+)
 from megatron.bridge.orbit.model_bridges.deepseek_v3_int4_bridge import DeepSeekV3INT4Bridge
 from megatron.bridge.orbit.model_bridges.kimi_k25_vl_nvfp4_bridge import KimiK25VLNVFP4Bridge
 from megatron.bridge.orbit.model_bridges.llama_int4_bridge import LlamaINT4Bridge
@@ -69,11 +73,37 @@ def test_qwen3_moe_provider_derives_sparse_layer_pattern() -> None:
 
 
 @pytest.mark.unit
+def test_qwen3_moe_provider_mixin_delegates_to_shared_settings_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = SimpleNamespace()
+    hf_config = SimpleNamespace()
+
+    class _Base:
+        def provider_bridge(self, hf_pretrained):
+            return provider
+
+    class _Bridge(Qwen3MoEOrbitProviderMixin, _Base):
+        pass
+
+    calls = []
+
+    def apply_settings(actual_provider, actual_config):
+        calls.append((actual_provider, actual_config))
+        return actual_provider
+
+    monkeypatch.setattr(qwen3_moe_provider_ext, "apply_qwen3_moe_orbit_provider_settings", apply_settings)
+
+    assert _Bridge().provider_bridge(SimpleNamespace(config=hf_config)) is provider
+    assert calls == [(provider, hf_config)]
+
+
+@pytest.mark.unit
 def test_deepseek_requantize_registers_source_scale_buffers(monkeypatch: pytest.MonkeyPatch) -> None:
     packed = torch.tensor([[1, 2]], dtype=torch.int32)
-    scale = torch.tensor([[0.25]], dtype=torch.bfloat16)
+    scale = torch.tensor([[0.25]], dtype=torch.float16)
     shape = torch.tensor([1, 16], dtype=torch.int32)
-    source_scale = torch.tensor([[0.5]], dtype=torch.bfloat16)
+    source_scale = torch.tensor([[0.5]], dtype=torch.float16)
     calls = []
 
     def fake_requantize(weight, supplied_scale):

@@ -22,27 +22,38 @@ support for every fused QKV layout is completed.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Iterable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from megatron.core import parallel_state
-from megatron.core.tensor_parallel.mappings import (
-    copy_to_tensor_model_parallel_region,
-    gather_from_sequence_parallel_region,
-)
+from megatron.core.tensor_parallel.mappings import copy_to_tensor_model_parallel_region
 from megatron.core.utils import get_pg_rank, get_pg_size
 
-from megatron.bridge.orbit.oft.oft import _SplitLNOFTLinear
+from megatron.bridge.orbit.oft.oft import (
+    OFTMerge,
+    _apply_oft_merge_plan,
+    _collect_oft_merge_wrappers,
+    _localize_oft_row_parallel_geometry,
+    _OFTMergeUpdate,
+    _OFTWrapperMergePlan,
+    _replace_oft_merge_wrappers,
+    _set_oft_merged_model_mode,
+    _SplitLNOFTLinear,
+    _validate_unaliased_merge_weights,
+)
 from megatron.bridge.orbit.oft.oft_layers import (
     OFTLinear,
     OFTRotationModule,
     OFTVocabParallelEmbedding,
     _clear_disabled_bias_parameters,
+    _is_available_type_instance,
     _is_direct_fp8_runtime_weight,
     _make_expert_ep_sharded_tensor,
     _module_bias_enabled,
+    _prepare_raw_column_parallel_input,
+    _validate_oft_hyperparameters,
 )
 from megatron.bridge.orbit.peft_ext.adapter_attrs import get_oft_adapter_attributes_from_linear
 from megatron.bridge.orbit.peft_ext.meta_init import to_empty_if_meta_device
@@ -67,7 +78,7 @@ def _split_wrapper_sharded_state_dict(
     module: nn.Module,
     prefix: str = "",
     sharded_offsets: tuple = (),
-    metadata: Optional[dict] = None,
+    metadata: dict | None = None,
 ):
     """Build a sharded state dict by delegating to each child module.
 
@@ -205,6 +216,7 @@ def _single_weight_dequant_hooks(w_storage_ptr: int, rebuild) -> torch.autograd.
 
 def _fused_base_linear(to_wrap: nn.Module, x: torch.Tensor, W: torch.Tensor):
     """Adapter-disabled base behavior on a transient dequantized weight."""
+    x = _prepare_raw_column_parallel_input(to_wrap, x)
     bias = getattr(to_wrap, "bias", None)
     out = F.linear(x, W, None)
     if bias is not None and not getattr(to_wrap, "skip_bias_add", False):
@@ -248,6 +260,28 @@ def _oft_fast_path_supported(modules: list[OFTRotationModule]) -> bool:
         ):
             return False
     return True
+
+
+def _normalize_split_adapter_names(
+    active_adapters: Iterable[str] | None,
+    supported_adapters: tuple[str, ...],
+    wrapper_name: str,
+) -> tuple[str, ...]:
+    """Validate and deterministically order a requested fused-projection subset."""
+    if active_adapters is None:
+        return supported_adapters
+    if isinstance(active_adapters, str):
+        raise ValueError(f"{wrapper_name} active_adapters must be an iterable of names, not a string")
+    requested = set(active_adapters)
+    unsupported = requested.difference(supported_adapters)
+    if unsupported:
+        raise ValueError(
+            f"{wrapper_name} received unsupported active adapters {sorted(unsupported)}; "
+            f"expected a subset of {list(supported_adapters)}"
+        )
+    if not requested:
+        raise ValueError(f"{wrapper_name} requires at least one active adapter")
+    return tuple(name for name in supported_adapters if name in requested)
 
 
 def _stack_oft_r_for_tp(modules: list[OFTRotationModule]) -> torch.Tensor:
@@ -348,32 +382,6 @@ def _batched_equal_output_linear_with_bias(
     return out.reshape(*leading_shape, num_slices * H)
 
 
-def _prepare_split_column_parallel_input(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """Restore the input-gradient collective bypassed by split ``F.linear`` calls.
-
-    Megatron's column-parallel kernels all-reduce dgrad internally when
-    ``allreduce_dgrad`` is enabled. CanonicalOFT replaces that kernel with local
-    split GEMMs, so one copy-region autograd node must surround the shared input.
-    """
-    sequence_parallel = getattr(
-        module,
-        "sequence_parallel",
-        getattr(getattr(module, "config", None), "sequence_parallel", False),
-    )
-    disable_grad_reduce = getattr(module, "disable_grad_reduce", False)
-    explicit_expert_comm = getattr(module, "explicit_expert_comm", False)
-    allreduce_dgrad = getattr(module, "allreduce_dgrad", None)
-    if allreduce_dgrad is None:
-        # Transformer-Engine column-parallel wrappers perform dgrad reduction
-        # internally but do not expose MCore's ``allreduce_dgrad`` attribute.
-        allreduce_dgrad = getattr(module, "tp_size", 1) > 1 and not sequence_parallel
-
-    if allreduce_dgrad and not sequence_parallel and not explicit_expert_comm and not disable_grad_reduce:
-        tp_group = getattr(module, "tp_group", None) or getattr(module, "_tp_group", None)
-        return copy_to_tensor_model_parallel_region(x, group=tp_group)
-    return x
-
-
 class OFTLinearSplitFC1UpGate(nn.Module):
     """Wraps a fused ``linear_fc1`` (ColumnParallelLinear producing ``[gate; up]``)
     with two independent input rotations applied per output slice.
@@ -395,9 +403,16 @@ class OFTLinearSplitFC1UpGate(nn.Module):
         model_parallel_config: Any = None,
         input_is_parallel: bool = False,
         is_expert: bool = False,
+        active_adapters: Iterable[str] | None = None,
     ) -> None:
         super().__init__()
         self.to_wrap = orig_module
+        self._logical_adapter_names = ("gate", "up")
+        self._adapter_names = _normalize_split_adapter_names(
+            active_adapters,
+            self._logical_adapter_names,
+            type(self).__name__,
+        )
 
         def _make_R() -> OFTRotationModule:
             return OFTRotationModule(
@@ -413,8 +428,8 @@ class OFTLinearSplitFC1UpGate(nn.Module):
                 is_expert=is_expert,
             )
 
-        self.adapter_gate = _make_R()
-        self.adapter_up = _make_R()
+        for adapter_name in self._adapter_names:
+            setattr(self, f"adapter_{adapter_name}", _make_R())
         self._adapter_enabled = True
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -431,7 +446,9 @@ class OFTLinearSplitFC1UpGate(nn.Module):
         same dtype, same block_size, same num_blocks, no per-block share. The
         fast path falls back to the eager loop otherwise.
         """
-        return _oft_fast_path_supported([self.adapter_gate, self.adapter_up])
+        return self._adapter_names == self._logical_adapter_names and _oft_fast_path_supported(
+            [self.adapter_gate, self.adapter_up]
+        )
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
         # Quantized fused base: dequantize once (the same cost the retired
@@ -452,7 +469,7 @@ class OFTLinearSplitFC1UpGate(nn.Module):
             del w_compute
 
     def _forward_with_weight(self, x: torch.Tensor, W: torch.Tensor):
-        x = _prepare_split_column_parallel_input(self.to_wrap, x).contiguous()
+        x = _prepare_raw_column_parallel_input(self.to_wrap, x).contiguous()
         bias = getattr(self.to_wrap, "bias", None)
 
         if self._fused_fast_path_supported():
@@ -473,11 +490,21 @@ class OFTLinearSplitFC1UpGate(nn.Module):
             out = _batched_equal_output_linear_with_bias(x_stack, W_stack, None)
         else:
             W_gate, W_up = self._split_output_weight(W)
-            x_gate = self.adapter_gate(x)
-            x_up = self.adapter_up(x)
-            out_gate = F.linear(x_gate, W_gate)
-            out_up = F.linear(x_up, W_up)
-            out = torch.cat([out_gate, out_up], dim=-1)
+            if self._adapter_names == self._logical_adapter_names:
+                x_gate = self.adapter_gate(x)
+                x_up = self.adapter_up(x)
+                out_gate = F.linear(x_gate, W_gate)
+                out_up = F.linear(x_up, W_up)
+                out = torch.cat([out_gate, out_up], dim=-1)
+            else:
+                # Build the inactive span through the exact fused base GEMM,
+                # then replace only the requested logical projection.
+                out = F.linear(x, W)
+                half = W_gate.shape[0]
+                if "gate" in self._adapter_names:
+                    out[..., :half] = F.linear(self.adapter_gate(x), W_gate)
+                if "up" in self._adapter_names:
+                    out[..., half:] = F.linear(self.adapter_up(x), W_up)
 
         if bias is not None and not getattr(self.to_wrap, "skip_bias_add", False):
             return out + bias, None
@@ -634,7 +661,7 @@ class GroupedOFTRotation(nn.Module):
         R = self._template._cayley_batch(flat, self.block_size)
         return R.reshape(E, num_blocks, self.block_size, self.block_size)
 
-    def sharded_state_dict(self, prefix: str = "", sharded_offsets: Tuple = (), metadata: Optional[Dict] = None):
+    def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata: dict | None = None):
         """Create the sharded state dict for the stacked per-expert ``oft_r``.
 
         ``oft_r`` is one ``(num_local_experts, num_blocks, n_elements)`` parameter:
@@ -696,6 +723,41 @@ class GroupedOFTRotation(nn.Module):
             )
         return {key: sharded_tensor}
 
+    def _compute_rotation(
+        self,
+        expert_idx: int,
+        *,
+        apply_dropout: bool = True,
+        project_coft_in_place: bool = True,
+    ) -> torch.Tensor:
+        """Compute one expert's rotation, optionally applying dropout or persisting COFT projection."""
+        oft_r = self.oft_r[expert_idx]
+        if self.coft:
+            if project_coft_in_place:
+                with torch.no_grad():
+                    oft_r.copy_(self._template._project_batch(oft_r, eps=self.eps))
+                oft_r = self.oft_r[expert_idx]
+            else:
+                oft_r = self._template._project_batch(oft_r, eps=self.eps)
+
+        if self.input_is_parallel and not self.block_share:
+            oft_r_parallel = oft_r
+        else:
+            oft_r_parallel = copy_to_tensor_model_parallel_region(oft_r, group=self.tp_group)
+        # Reuse the template's _cayley_batch which honors triton when available.
+        R = self._template._cayley_batch(oft_r_parallel, self.block_size)
+        if apply_dropout:
+            R = self._template.dropout(R)
+        return R
+
+    def get_delta_weight(self, expert_idx: int) -> torch.Tensor:
+        """Return this expert's deterministic merge rotation without mutating adapter state."""
+        R = self._compute_rotation(expert_idx, apply_dropout=False, project_coft_in_place=False)
+        rank = self.in_features // self.block_size if self.block_share else self.r
+        if self.block_share:
+            R = R.repeat(rank, 1, 1)
+        return torch.block_diag(*[R[index] for index in range(rank)])
+
     def forward(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
         """Apply this expert's rotation to ``x``. Eager-loop fallback only —
         the fast path uses ``compute_rotation_bank`` once and the
@@ -705,18 +767,7 @@ class GroupedOFTRotation(nn.Module):
         if required_dtype != self.oft_r.dtype:
             x = x.to(self.oft_r.dtype)
 
-        if self.coft:
-            with torch.no_grad():
-                oft_r = self.oft_r[expert_idx]
-                oft_r.copy_(self._template._project_batch(oft_r, eps=self.eps))
-
-        if self.input_is_parallel and not self.block_share:
-            oft_r = self.oft_r[expert_idx]
-        else:
-            oft_r = copy_to_tensor_model_parallel_region(self.oft_r[expert_idx], group=self.tp_group)
-        # Reuse the template's _cayley_batch which honors triton when available.
-        R = self._template._cayley_batch(oft_r, self.block_size)
-        R = self._template.dropout(R)
+        R = self._compute_rotation(expert_idx)
 
         rank = self.in_features // self.block_size if self.block_share else self.r
         if self.block_share:
@@ -795,12 +846,19 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
         model_parallel_config: Any = None,
         input_is_parallel: bool = False,
         is_expert: bool = True,
+        active_adapters: Iterable[str] | None = None,
     ) -> None:
         super().__init__()
         self.to_wrap = orig_module
         self.num_gemms = int(getattr(orig_module, "num_gemms", 0))
         if self.num_gemms <= 0:
             raise ValueError(f"{type(self).__name__} requires a grouped expert module with num_gemms > 0")
+        self._logical_adapter_names = ("gate", "up")
+        self._adapter_names = _normalize_split_adapter_names(
+            active_adapters,
+            self._logical_adapter_names,
+            type(self).__name__,
+        )
 
         def _make_R() -> GroupedOFTRotation:
             return GroupedOFTRotation(
@@ -820,8 +878,8 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
         # Single 3D ``oft_r`` per side: shape (num_local_experts, num_blocks, n_elements).
         # The export path recognizes this layout and ships one tensor per (layer, side)
         # through the existing grouped 3D EP-gather instead of one tensor per expert.
-        self.adapter_gate = _make_R()
-        self.adapter_up = _make_R()
+        for adapter_name in self._adapter_names:
+            setattr(self, f"adapter_{adapter_name}", _make_R())
         self._adapter_enabled = True
         self._te_grouped_half_modules: dict[tuple[Any, ...], nn.Module] = {}
 
@@ -861,7 +919,7 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
             getattr(self.to_wrap, f"weight{expert_idx}_shape"),
         )
 
-    def _nvfp4_scale_suffix_for(self, expert_idx: int) -> Optional[str]:
+    def _nvfp4_scale_suffix_for(self, expert_idx: int) -> str | None:
         """Buffer suffix carrying this local expert's NVFP4 scales.
 
         Direct-checkpoint buffers are usually keyed by local index
@@ -920,7 +978,7 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
             )
         return "bf16"
 
-    def _quantizer_buffer(self, attr: str, expert_idx: int) -> Optional[torch.Tensor]:
+    def _quantizer_buffer(self, attr: str, expert_idx: int) -> torch.Tensor | None:
         """Fetch a per-expert ModelOpt quantizer buffer (suffixed or stacked)."""
         quantizer = self.to_wrap.weight_quantizer
         value = getattr(quantizer, f"{attr}{expert_idx}", None)
@@ -1076,7 +1134,7 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
 
         outputs: list[torch.Tensor] = []
         offset = 0
-        first_out_features: Optional[int] = None
+        first_out_features: int | None = None
         with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
             for expert_idx, token_count in enumerate(tokens_per_expert):
                 token_count = int(token_count)
@@ -1091,8 +1149,7 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
                     first_out_features = int(gate_w.shape[0]) + int(up_w.shape[0])
                 ptr_to_rebuild.update(entries)
                 try:
-                    gate_bias = self._bias_for(f"bias_gate{expert_idx}")
-                    up_bias = self._bias_for(f"bias_up{expert_idx}")
+                    gate_bias, up_bias = self._split_expert_bias(expert_idx)
                     outputs.append(
                         torch.cat(
                             [
@@ -1115,6 +1172,20 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
     def _bias_for(self, name: str) -> torch.Tensor | None:
         return getattr(self.to_wrap, name, None)
 
+    def _split_expert_bias(self, expert_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return the gate/up halves of TEGroupedLinear's fused ``bias{i}``."""
+        if not _module_bias_enabled(self.to_wrap):
+            return None, None
+        bias = self._bias_for(f"bias{expert_idx}")
+        if bias is None or (isinstance(bias, torch.Tensor) and bias.numel() == 0):
+            return None, None
+        if bias.ndim != 1 or bias.shape[0] % 2 != 0:
+            raise ValueError(
+                f"grouped linear_fc1 bias{expert_idx} must be a 1-D fused gate/up tensor "
+                f"with even length, got shape {tuple(bias.shape)}"
+            )
+        return self._split_output_weight(bias)
+
     def _grouped_base_weights_require_grad(self) -> bool:
         """True if any base expert weight is trainable — disables the fast path
         because the ``.data`` aliasing in ``_bind_te_grouped_half_weights`` would
@@ -1127,9 +1198,8 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
 
     def _has_active_split_bias(self) -> bool:
         for expert_idx in range(self.num_gemms):
-            if self._bias_for(f"bias_gate{expert_idx}") is not None:
-                return True
-            if self._bias_for(f"bias_up{expert_idx}") is not None:
+            gate_bias, up_bias = self._split_expert_bias(expert_idx)
+            if gate_bias is not None or up_bias is not None:
                 return True
         return False
 
@@ -1144,9 +1214,9 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
             TERowParallelGroupedLinear,
         )
 
-        if HAVE_TE_COL_GRP_LINEAR and isinstance(self.to_wrap, TEColumnParallelGroupedLinear):
+        if _is_available_type_instance(self.to_wrap, TEColumnParallelGroupedLinear, HAVE_TE_COL_GRP_LINEAR):
             return TEColumnParallelGroupedLinear, "column"
-        if HAVE_TE_ROW_GRP_LINEAR and isinstance(self.to_wrap, TERowParallelGroupedLinear):
+        if _is_available_type_instance(self.to_wrap, TERowParallelGroupedLinear, HAVE_TE_ROW_GRP_LINEAR):
             return TERowParallelGroupedLinear, "row"
         return None, None
 
@@ -1262,6 +1332,8 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
         gate_x: torch.Tensor,
         up_x: torch.Tensor,
     ) -> bool:
+        if self._adapter_names != self._logical_adapter_names:
+            return False
         if not gate_x.is_cuda or not up_x.is_cuda:
             return False
         if self._grouped_base_weights_require_grad():
@@ -1309,6 +1381,49 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
             raise RuntimeError("TE grouped split-OFT half GEMM unexpectedly returned bias")
         return torch.cat([gate_out, up_out], dim=-1), None
 
+    def _forward_dense_subset_exact(
+        self,
+        x: torch.Tensor,
+        gate_x: torch.Tensor,
+        up_x: torch.Tensor,
+        tokens_per_expert: list[int],
+        *args: Any,
+        **kwargs: Any,
+    ):
+        """Replace active grouped halves in one exact unadapted base result."""
+        base_result = self.to_wrap(x, *args, **kwargs)
+        if isinstance(base_result, tuple):
+            base_out, base_bias = base_result
+        else:
+            base_out, base_bias = base_result, None
+        out = base_out.clone()
+        half = out.shape[-1] // 2
+        offset = 0
+        for expert_idx, token_count in enumerate(tokens_per_expert):
+            token_count = int(token_count)
+            if token_count <= 0:
+                continue
+            output_slice = slice(offset, offset + token_count)
+            weight = getattr(self.to_wrap, f"weight{expert_idx}")
+            gate_weight, up_weight = self._split_output_weight(weight)
+            gate_bias, up_bias = self._split_expert_bias(expert_idx)
+            if base_bias is not None:
+                gate_bias = up_bias = None
+            if "gate" in self._adapter_names:
+                out[output_slice, :half] = F.linear(
+                    gate_x[output_slice].to(gate_weight.dtype),
+                    gate_weight,
+                    gate_bias,
+                )
+            if "up" in self._adapter_names:
+                out[output_slice, half:] = F.linear(
+                    up_x[output_slice].to(up_weight.dtype),
+                    up_weight,
+                    up_bias,
+                )
+            offset += token_count
+        return out, base_bias
+
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
         quant_kind = self._grouped_quant_kind()
         if len(args) == 0:
@@ -1326,7 +1441,8 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
             up_x = x
         else:
             can_segment = (
-                oft_r_by_expert is not None
+                self._adapter_names == self._logical_adapter_names
+                and oft_r_by_expert is not None
                 and x.is_cuda
                 and not self.adapter_gate.coft
                 and not self.adapter_gate.block_share
@@ -1357,13 +1473,25 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
                         continue
                     chunk = x[offset : offset + token_count].contiguous()
                     offset += token_count
-                    gate_chunks.append(self.adapter_gate(chunk, expert_idx))
-                    up_chunks.append(self.adapter_up(chunk, expert_idx))
+                    gate_chunks.append(
+                        self.adapter_gate(chunk, expert_idx) if "gate" in self._adapter_names else chunk
+                    )
+                    up_chunks.append(self.adapter_up(chunk, expert_idx) if "up" in self._adapter_names else chunk)
                 gate_x = torch.cat(gate_chunks, dim=0) if gate_chunks else x.new_empty(x.shape)
                 up_x = torch.cat(up_chunks, dim=0) if up_chunks else x.new_empty(x.shape)
 
         if quant_kind != "bf16":
             return self._forward_dequant_split_eager(quant_kind, gate_x, up_x, tokens_per_expert)
+
+        if self._adapter_enabled and self._adapter_names != self._logical_adapter_names:
+            return self._forward_dense_subset_exact(
+                x,
+                gate_x,
+                up_x,
+                tokens_per_expert,
+                *args,
+                **kwargs,
+            )
 
         if self._can_use_te_grouped_half_gemm(gate_x, up_x):
             try:
@@ -1387,8 +1515,7 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
 
             weight = getattr(self.to_wrap, f"weight{expert_idx}")
             gate_w, up_w = self._split_output_weight(weight)
-            gate_bias = self._bias_for(f"bias_gate{expert_idx}")
-            up_bias = self._bias_for(f"bias_up{expert_idx}")
+            gate_bias, up_bias = self._split_expert_bias(expert_idx)
 
             outputs.append(
                 torch.cat(
@@ -1435,10 +1562,21 @@ class OFTLinearSplitQKV(nn.Module):
         model_parallel_config: Any = None,
         input_is_parallel: bool = False,
         is_expert: bool = False,
+        active_adapters: Iterable[str] | None = None,
     ) -> None:
         super().__init__()
         self.to_wrap = orig_module
         self._provider = provider
+        logical_adapter_names = ["q"]
+        if getattr(provider, "attention_output_gate", False):
+            logical_adapter_names.append("gate")
+        logical_adapter_names.extend(("k", "v"))
+        self._logical_adapter_names = tuple(logical_adapter_names)
+        self._adapter_names = _normalize_split_adapter_names(
+            active_adapters,
+            self._logical_adapter_names,
+            type(self).__name__,
+        )
 
         def _make_R() -> OFTRotationModule:
             return OFTRotationModule(
@@ -1454,16 +1592,8 @@ class OFTLinearSplitQKV(nn.Module):
                 is_expert=is_expert,
             )
 
-        self.adapter_q = _make_R()
-        if getattr(provider, "attention_output_gate", False):
-            self.adapter_gate = _make_R()
-        self.adapter_k = _make_R()
-        self.adapter_v = _make_R()
-        adapter_names = ["q"]
-        if hasattr(self, "adapter_gate"):
-            adapter_names.append("gate")
-        adapter_names.extend(("k", "v"))
-        self._adapter_names = tuple(adapter_names)
+        for adapter_name in self._adapter_names:
+            setattr(self, f"adapter_{adapter_name}", _make_R())
 
         head_size = provider.kv_channels or (provider.hidden_size // provider.num_attention_heads)
         heads_per_group = provider.num_attention_heads // provider.num_query_groups
@@ -1474,9 +1604,7 @@ class OFTLinearSplitQKV(nn.Module):
         tp_group = getattr(orig_module, "tp_group", None) or getattr(orig_module, "_tp_group", None)
         tp_size = get_pg_size(tp_group)
         if global_packed_dim % tp_size != 0:
-            raise ValueError(
-                f"linear_qkv global packed dim {global_packed_dim} is not divisible by TP={tp_size}"
-            )
+            raise ValueError(f"linear_qkv global packed dim {global_packed_dim} is not divisible by TP={tp_size}")
         self._packed_dim = global_packed_dim // tp_size
         self._segments = tuple(self._qkv_weight_segments(self._packed_dim))
         rotation_index = {name: index for index, name in enumerate(self._adapter_names)}
@@ -1487,7 +1615,7 @@ class OFTLinearSplitQKV(nn.Module):
         )
         self.register_buffer(
             "_rotation_ids",
-            torch.tensor([rotation_index[name] for name, _, _ in self._segments], dtype=torch.int32),
+            torch.tensor([rotation_index.get(name, 0) for name, _, _ in self._segments], dtype=torch.int32),
             persistent=False,
         )
         self._adapter_enabled = True
@@ -1549,7 +1677,9 @@ class OFTLinearSplitQKV(nn.Module):
 
     def _fused_fast_path_supported(self) -> bool:
         """All logical rotation banks must share the segmented-kernel contract."""
-        return _oft_fast_path_supported([getattr(self, f"adapter_{name}") for name in self._adapter_names])
+        return self._adapter_names == self._logical_adapter_names and _oft_fast_path_supported(
+            [getattr(self, f"adapter_{name}") for name in self._adapter_names]
+        )
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
         # Quantized fused base: dequantize once (the same cost the retired
@@ -1570,7 +1700,7 @@ class OFTLinearSplitQKV(nn.Module):
             del w_compute
 
     def _forward_with_weight(self, x: torch.Tensor, W: torch.Tensor):
-        x = _prepare_split_column_parallel_input(self.to_wrap, x).contiguous()
+        x = _prepare_raw_column_parallel_input(self.to_wrap, x).contiguous()
         bias = getattr(self.to_wrap, "bias", None)
         if W.shape[0] != self._packed_dim:
             raise ValueError(
@@ -1592,23 +1722,22 @@ class OFTLinearSplitQKV(nn.Module):
                 required_dtype = x.dtype
                 x_for_einsum = x.to(R.dtype) if R.dtype != x.dtype else x
                 x_stack = _apply_precomputed_oft_rotation_to_x(x_for_einsum, R).to(required_dtype)
-                rotated_inputs = {
-                    name: x_stack[index] for index, name in enumerate(self._adapter_names)
-                }
-                outputs = [
-                    F.linear(rotated_inputs[name], W[start:end])
-                    for name, start, end in self._segments
-                ]
+                rotated_inputs = {name: x_stack[index] for index, name in enumerate(self._adapter_names)}
+                outputs = [F.linear(rotated_inputs[name], W[start:end]) for name, start, end in self._segments]
                 out = torch.cat(outputs, dim=-1)
         else:
-            rotated_inputs = {
-                name: getattr(self, f"adapter_{name}")(x) for name in self._adapter_names
-            }
-            outputs = [
-                F.linear(rotated_inputs[name], W[start:end])
-                for name, start, end in self._segments
-            ]
-            out = torch.cat(outputs, dim=-1)
+            if self._adapter_names == self._logical_adapter_names:
+                rotated_inputs = {name: getattr(self, f"adapter_{name}")(x) for name in self._adapter_names}
+                outputs = [F.linear(rotated_inputs[name], W[start:end]) for name, start, end in self._segments]
+                out = torch.cat(outputs, dim=-1)
+            else:
+                # Preserve every inactive row exactly as the fused base GEMM
+                # produced it, replacing only segments with requested adapters.
+                out = F.linear(x, W)
+                rotated_inputs = {name: getattr(self, f"adapter_{name}")(x) for name in self._adapter_names}
+                for name, start, end in self._segments:
+                    if name in rotated_inputs:
+                        out[..., start:end] = F.linear(rotated_inputs[name], W[start:end])
 
         if bias is not None and not getattr(self.to_wrap, "skip_bias_add", False):
             return out + bias, None
@@ -1643,8 +1772,6 @@ class _SplitLNCanonicalOFTQKV(nn.Module):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
         ln_out = self._ln_ref._apply_norm(x)
-        if getattr(self._orig_module, "sequence_parallel", False):
-            ln_out = gather_from_sequence_parallel_region(ln_out, tensor_parallel_output_grad=True)
         ln_out = ln_out.contiguous()
         return self._qkv(ln_out)
 
@@ -1681,8 +1808,6 @@ class _SplitLNCanonicalOFTFC1(nn.Module):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
         ln_out = self._ln_ref._apply_norm(x)
-        if getattr(self._orig_module, "sequence_parallel", False):
-            ln_out = gather_from_sequence_parallel_region(ln_out, tensor_parallel_output_grad=True)
         ln_out = ln_out.contiguous()
         return self._fc1(ln_out)
 
@@ -1708,13 +1833,13 @@ class _SplitLNCanonicalOFTFC1(nn.Module):
 # Fused Megatron leaf -> the canonical split suffixes that replace it. This is the
 # inverse of ``CanonicalOFT._SPLIT_SUFFIX_TO_FUSED``, kept at module level so a
 # launcher can translate a legacy target list without building the PEFT object.
-_FUSED_TO_SPLIT_SUFFIXES: Dict[str, Tuple[str, ...]] = {
+_FUSED_TO_SPLIT_SUFFIXES: dict[str, tuple[str, ...]] = {
     "linear_qkv": ("linear_q", "linear_k", "linear_v"),
     "linear_fc1": ("linear_fc1_gate", "linear_fc1_up"),
 }
 
 
-def canonical_target_modules(target_modules: Iterable[str]) -> List[str]:
+def canonical_target_modules(target_modules: Iterable[str]) -> list[str]:
     """Translate a legacy ``OFT`` target list into ``CanonicalOFT`` split names.
 
     ``CanonicalOFT.__post_init__`` rejects the fused leaves ``linear_qkv`` and
@@ -1731,7 +1856,7 @@ def canonical_target_modules(target_modules: Iterable[str]) -> List[str]:
     (``linear_proj``, ``linear_fc2``, Kimi's MLA projections), pass through
     unchanged. Order is preserved and duplicates are dropped.
     """
-    expanded: List[str] = []
+    expanded: list[str] = []
     for target in target_modules:
         for fused, split_suffixes in _FUSED_TO_SPLIT_SUFFIXES.items():
             if target.endswith(fused):
@@ -1772,7 +1897,7 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
         module_dropout: Multiplicative dropout probability for blocks.
     """
 
-    target_modules: List[str] = field(
+    target_modules: list[str] = field(
         default_factory=lambda: [
             "linear_q",
             "linear_k",
@@ -1801,27 +1926,57 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
     }
 
     def __post_init__(self) -> None:
-        for target in self.target_modules:
-            assert not target.endswith("linear_qkv"), (
-                "CanonicalOFT does not accept target 'linear_qkv'. Use 'linear_q', 'linear_k', "
-                "'linear_v' (split). Legacy `OFT` with 'linear_qkv' is mathematically "
-                "incorrect for fused projections — use CanonicalOFT."
-            )
-            assert not target.endswith("linear_fc1"), (
-                "CanonicalOFT does not accept target 'linear_fc1'. Use 'linear_fc1_up', "
-                "'linear_fc1_gate' (split). Legacy `OFT` with 'linear_fc1' is mathematically "
-                "incorrect for fused projections — use CanonicalOFT."
-            )
+        self._init_target_match_state()
+
+    def _init_target_match_state(self) -> None:
+        """Rebuild split mappings and aliases from the current target list.
+
+        Each user split target is credited by either its fused Megatron module
+        or an architecture's real unfused module. Rebuilding here is essential
+        because recipes may replace ``target_modules`` after construction.
+        """
+        _validate_oft_hyperparameters(
+            r=self.r,
+            block_size=self.block_size,
+            coft=self.coft,
+            eps=self.eps,
+            module_dropout=self.module_dropout,
+        )
+        self.canonical_mapping.clear()
+        self._pattern_to_alias.clear()
+        self._alias_to_pattern.clear()
+        self._alias_matches.clear()
+
+        for target in self.target_modules or []:
+            if target.endswith("linear_qkv"):
+                raise ValueError(
+                    "CanonicalOFT does not accept target 'linear_qkv'. Use 'linear_q', 'linear_k', "
+                    "'linear_v' (split). Legacy `OFT` with 'linear_qkv' is mathematically "
+                    "incorrect for fused projections — use CanonicalOFT."
+                )
+            if target.endswith("linear_fc1"):
+                raise ValueError(
+                    "CanonicalOFT does not accept target 'linear_fc1'. Use 'linear_fc1_up', "
+                    "'linear_fc1_gate' (split). Legacy `OFT` with 'linear_fc1' is mathematically "
+                    "incorrect for fused projections — use CanonicalOFT."
+                )
 
             for suffix, fused_leaf in self._SPLIT_SUFFIX_TO_FUSED.items():
                 if target.endswith(suffix):
-                    self.canonical_mapping[target.replace(suffix, fused_leaf)].add(suffix)
+                    canonical_target = target[: -len(suffix)] + fused_leaf
+                    self.canonical_mapping[canonical_target].add(suffix)
                     self.canonical_mapping[target].add(suffix)
+                    self.register_target_alias(target, canonical_target)
+                    if target != canonical_target:
+                        # One logical request may be satisfied by either layout;
+                        # keep a single alias match-set while crediting both patterns.
+                        self._pattern_to_alias[target].add(target)
                     break
             else:
                 self.canonical_mapping[target].add(target)
+                self.register_target_alias(target, target)
 
-    def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
+    def transform(self, module: nn.Module, name: str | None = None, prefix: str | None = None) -> nn.Module:
         """Apply CanonicalOFT to a module: split wrappers for fused linears,
         plain OFTLinear for everything else."""
         if isinstance(
@@ -1842,19 +1997,53 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
         if ans is None:
             return module
         matched_pattern, full_name = ans
+        module_leaf = full_name.rsplit(".", 1)[-1]
+        if module_leaf == "linear_qkv" and getattr(getattr(module, "config", None), "attention_output_gate", False):
+            raise ValueError(
+                "CanonicalOFT linear_qkv with attention_output_gate=True is not supported: "
+                "the Hugging Face q_proj combines query and output-gate rows, so its adapter "
+                "cannot represent independent Megatron query/gate rotations."
+            )
+        canonical_submodules = self.canonical_mapping.get(matched_pattern)
+        if canonical_submodules is None:
+            # Empty target_modules uses ModuleMatcher's match-all mode. Preserve
+            # its historical full-bank behavior rather than inventing a subset.
+            qkv_active_adapters = None
+            fc1_active_adapters = None
+        else:
+            qkv_active_adapters = tuple(
+                name
+                for name, suffix in (("q", "linear_q"), ("k", "linear_k"), ("v", "linear_v"))
+                if suffix in canonical_submodules
+            )
+            fc1_active_adapters = tuple(
+                name
+                for name, suffix in (("gate", "linear_fc1_gate"), ("up", "linear_fc1_up"))
+                if suffix in canonical_submodules
+            )
+
+        if (
+            matched_pattern.endswith("linear_fc1")
+            and getattr(getattr(module, "config", None), "gated_linear_unit", True) is False
+        ):
+            raise ValueError(
+                f"CanonicalOFT gate/up targets require gated_linear_unit=True, but {full_name} "
+                "is a non-gated linear_fc1 projection"
+            )
 
         # word_embeddings (VocabParallelEmbedding) — rotation lives on the
         # hidden dim (replicated across TP). Routed here BEFORE the linear-attrs
         # extraction below because get_adapter_attributes_from_linear assumes a
         # Linear-shaped module and would fail on a VocabParallelEmbedding.
-        # NOTE: no tied-embedding guard here — share_embeddings_and_output_weights
-        # lives on the GPTModel, not on VocabParallelEmbedding.config. Tied
-        # models will silently double-rotate; Qwen2.5-7B is tie_word_embeddings:false.
-        if matched_pattern == "word_embeddings":
+        # Tied storage is safe while the two adapters remain separate at runtime.
+        # CanonicalOFTMerge's model-wide alias preflight rejects folding either
+        # adapter into a weight that is also consumed through another path.
+        if module_leaf == "word_embeddings":
             embedding_dim = getattr(module, "embedding_dim", None)
             if embedding_dim is None and hasattr(module, "weight"):
                 embedding_dim = module.weight.shape[-1]
-            assert embedding_dim is not None, f"Cannot infer embedding_dim from {type(module).__name__} at {full_name}"
+            if embedding_dim is None:
+                raise ValueError(f"Cannot infer embedding_dim from {type(module).__name__} at {full_name}")
             adapter = OFTRotationModule(
                 in_features=embedding_dim,
                 r=self.r,
@@ -1871,6 +2060,7 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
             return OFTVocabParallelEmbedding(module, adapter)
 
         model_parallel_config = getattr(module, "config", None)
+        rotation_r = self.r
         if model_parallel_config is not None:
             is_expert = is_expert_linear(full_name)
             attrs = get_oft_adapter_attributes_from_linear(module, is_expert=is_expert)
@@ -1879,7 +2069,9 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
                     tp_size = parallel_state.get_expert_tensor_parallel_world_size()
                 else:
                     tp_size = parallel_state.get_tensor_model_parallel_world_size()
-                rotation_in_features = attrs.in_features // tp_size
+                rotation_in_features, rotation_r = _localize_oft_row_parallel_geometry(
+                    attrs.in_features, self.r, tp_size
+                )
             else:
                 rotation_in_features = attrs.in_features
             input_is_parallel = attrs.input_is_parallel
@@ -1890,7 +2082,7 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
 
         kwargs = dict(
             in_features=rotation_in_features,
-            r=self.r,
+            r=rotation_r,
             block_size=self.block_size,
             coft=self.coft,
             eps=self.eps,
@@ -1903,7 +2095,11 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
 
         if matched_pattern.endswith("linear_fc1") and is_grouped_expert_linear(full_name):
             logger.info("CanonicalOFT: OFTLinearGroupedSplitFC1UpGate at %s", full_name)
-            return OFTLinearGroupedSplitFC1UpGate(module, **kwargs)
+            return OFTLinearGroupedSplitFC1UpGate(
+                module,
+                active_adapters=fc1_active_adapters,
+                **kwargs,
+            )
 
         if matched_pattern.endswith("linear_fc1") and _should_treat_linear_fc1_as_unfused(full_name):
             logger.info(
@@ -1912,25 +2108,43 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
             adapter = OFTRotationModule(**kwargs)
             return OFTLinear(module, adapter)
 
-        if HAVE_TE_LN_COL_LINEAR and isinstance(module, TELayerNormColumnParallelLinear):
+        if _is_available_type_instance(module, TELayerNormColumnParallelLinear, HAVE_TE_LN_COL_LINEAR):
             if matched_pattern.endswith("linear_qkv"):
                 logger.debug("CanonicalOFT: _SplitLNCanonicalOFTQKV at %s", full_name)
-                qkv = OFTLinearSplitQKV(module, provider=model_parallel_config, **kwargs)
+                qkv = OFTLinearSplitQKV(
+                    module,
+                    provider=model_parallel_config,
+                    active_adapters=qkv_active_adapters,
+                    **kwargs,
+                )
                 return _SplitLNCanonicalOFTQKV(module, qkv)
             if matched_pattern.endswith("linear_fc1"):
                 logger.debug("CanonicalOFT: _SplitLNCanonicalOFTFC1 at %s", full_name)
-                fc1 = OFTLinearSplitFC1UpGate(module, **kwargs)
+                fc1 = OFTLinearSplitFC1UpGate(
+                    module,
+                    active_adapters=fc1_active_adapters,
+                    **kwargs,
+                )
                 return _SplitLNCanonicalOFTFC1(module, fc1)
             # Fall through for linear_proj / linear_fc2 (RowParallel — never LN-fused).
 
         if matched_pattern.endswith("linear_qkv"):
             assert model_parallel_config is not None, "linear_qkv must be a Megatron parallel linear"
             logger.debug("CanonicalOFT: OFTLinearSplitQKV at %s", full_name)
-            return OFTLinearSplitQKV(module, provider=model_parallel_config, **kwargs)
+            return OFTLinearSplitQKV(
+                module,
+                provider=model_parallel_config,
+                active_adapters=qkv_active_adapters,
+                **kwargs,
+            )
 
         if matched_pattern.endswith("linear_fc1"):
             logger.debug("CanonicalOFT: OFTLinearSplitFC1UpGate at %s", full_name)
-            return OFTLinearSplitFC1UpGate(module, **kwargs)
+            return OFTLinearSplitFC1UpGate(
+                module,
+                active_adapters=fc1_active_adapters,
+                **kwargs,
+            )
 
         logger.debug("CanonicalOFT: OFTLinear at %s", full_name)
         adapter = OFTRotationModule(**kwargs)
@@ -1939,41 +2153,290 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
 
 @dataclass
 class CanonicalOFTMerge(OrbitPEFTMixin, PEFT):
-    """Folds each projection's rotation into its local fused-weight row spans."""
+    """Folds every supported canonical rotation into its base and removes wrappers."""
+
+    _WRAPPER_TYPES = (
+        OFTLinear,
+        OFTLinearSplitQKV,
+        OFTLinearSplitFC1UpGate,
+        OFTLinearGroupedSplitFC1UpGate,
+        OFTVocabParallelEmbedding,
+        _SplitLNCanonicalOFTQKV,
+        _SplitLNCanonicalOFTFC1,
+    )
+
+    @staticmethod
+    def _validate_single_rotation_wrapper(wrapper: nn.Module, base: nn.Module, adapter: nn.Module) -> None:
+        """Validate a canonical wrapper with one dense base weight and rotation."""
+        weight = OFTMerge._merge_weight_or_raise(base, "weight", wrapper)
+        OFTMerge._validate_rotation_shape(adapter, weight, wrapper, "weight")
+
+    @classmethod
+    def _validate_wrapper(cls, wrapper: nn.Module) -> None:
+        """Validate every weight span and rotation owned by one canonical wrapper."""
+        if isinstance(wrapper, OFTLinear):
+            OFTMerge._validate_wrapper(wrapper)
+            return
+        if isinstance(wrapper, OFTVocabParallelEmbedding):
+            cls._validate_single_rotation_wrapper(wrapper, wrapper.to_wrap, wrapper.adapter)
+            return
+        if isinstance(wrapper, OFTLinearSplitQKV):
+            weight = OFTMerge._merge_weight_or_raise(wrapper.to_wrap, "weight", wrapper)
+            if weight.shape[0] != wrapper._packed_dim:
+                raise ValueError(
+                    f"OFT merge shape mismatch for {type(wrapper).__name__}.weight: "
+                    f"configured packed rows are {wrapper._packed_dim}, weight has {weight.shape[0]}"
+                )
+            cursor = 0
+            for adapter_name, start, end in wrapper._segments:
+                if start != cursor or end <= start or adapter_name not in wrapper._logical_adapter_names:
+                    raise ValueError(
+                        f"OFT merge found invalid QKV segment {(adapter_name, start, end)} at row {cursor}"
+                    )
+                cursor = end
+            if cursor != weight.shape[0]:
+                raise ValueError(f"OFT merge QKV segments cover {cursor} rows but weight has {weight.shape[0]}")
+            for adapter_name in wrapper._adapter_names:
+                OFTMerge._validate_rotation_shape(
+                    getattr(wrapper, f"adapter_{adapter_name}"),
+                    weight,
+                    wrapper,
+                    f"adapter_{adapter_name}",
+                )
+            return
+        if isinstance(wrapper, OFTLinearSplitFC1UpGate):
+            weight = OFTMerge._merge_weight_or_raise(wrapper.to_wrap, "weight", wrapper)
+            if weight.shape[0] % 2 != 0:
+                raise ValueError(
+                    f"OFT merge requires even fused gate/up rows, got {weight.shape[0]} on {type(wrapper).__name__}"
+                )
+            for adapter_name in wrapper._adapter_names:
+                attribute_name = f"adapter_{adapter_name}"
+                OFTMerge._validate_rotation_shape(
+                    getattr(wrapper, attribute_name),
+                    weight,
+                    wrapper,
+                    attribute_name,
+                )
+            return
+        if isinstance(wrapper, OFTLinearGroupedSplitFC1UpGate):
+            for adapter_name in wrapper._adapter_names:
+                adapter = getattr(wrapper, f"adapter_{adapter_name}")
+                if wrapper.num_gemms != len(adapter):
+                    raise ValueError(
+                        f"OFT merge grouped expert count mismatch for {adapter_name}: "
+                        f"base={wrapper.num_gemms}, adapter={len(adapter)}"
+                    )
+            for expert_idx in range(wrapper.num_gemms):
+                name = f"weight{expert_idx}"
+                weight = OFTMerge._merge_weight_or_raise(wrapper.to_wrap, name, wrapper)
+                if weight.shape[0] % 2 != 0:
+                    raise ValueError(f"OFT merge requires even fused gate/up rows for {name}, got {weight.shape[0]}")
+                for adapter_name in wrapper._adapter_names:
+                    attribute_name = f"adapter_{adapter_name}"
+                    OFTMerge._validate_rotation_shape(
+                        getattr(wrapper, attribute_name),
+                        weight,
+                        wrapper,
+                        attribute_name,
+                    )
+            return
+        if isinstance(wrapper, _SplitLNCanonicalOFTQKV):
+            if wrapper._qkv.to_wrap is not wrapper._orig_module:
+                raise ValueError("Canonical OFT fused-LN QKV wrapper does not own its original module")
+            cls._validate_wrapper(wrapper._qkv)
+            return
+        if isinstance(wrapper, _SplitLNCanonicalOFTFC1):
+            if wrapper._fc1.to_wrap is not wrapper._orig_module:
+                raise ValueError("Canonical OFT fused-LN FC1 wrapper does not own its original module")
+            cls._validate_wrapper(wrapper._fc1)
+            return
+        raise ValueError(f"CanonicalOFTMerge does not support wrapper {type(wrapper).__name__}")
+
+    @staticmethod
+    def _computed_rotation(
+        adapter: nn.Module,
+        weight: torch.Tensor,
+        wrapper: nn.Module,
+        name: str,
+    ) -> torch.Tensor:
+        """Materialize and validate one full input rotation for a merge plan."""
+        rotation = adapter.get_delta_weight().to(weight.device, weight.dtype)
+        expected_shape = (weight.shape[1], weight.shape[1])
+        if rotation.ndim != 2 or tuple(rotation.shape) != expected_shape:
+            raise ValueError(
+                f"OFT merge rotation shape mismatch for {type(wrapper).__name__}.{name}: "
+                f"expected {expected_shape}, got {tuple(rotation.shape)}"
+            )
+        return rotation
+
+    @classmethod
+    @torch.no_grad()
+    def _prepare_wrapper(cls, wrapper: nn.Module) -> _OFTWrapperMergePlan:
+        """Compute every canonical merged weight without mutating the model."""
+        cls._validate_wrapper(wrapper)
+        if isinstance(wrapper, OFTLinear):
+            return OFTMerge._prepare_wrapper(wrapper)
+        if isinstance(wrapper, OFTVocabParallelEmbedding):
+            weight = wrapper.to_wrap.weight
+            rotation = cls._computed_rotation(wrapper.adapter, weight, wrapper, "weight")
+            update = _OFTMergeUpdate(
+                holder=wrapper.to_wrap,
+                name="weight",
+                weight=weight,
+                # Embedding runtime rotates lookup output as ``weight[row] @ R``.
+                merged_weight=weight @ rotation,
+            )
+            return _OFTWrapperMergePlan(wrapper, wrapper.to_wrap, (update,))
+        if isinstance(wrapper, OFTLinearSplitQKV):
+            return _OFTWrapperMergePlan(wrapper, wrapper.to_wrap, cls._prepare_qkv_updates(wrapper))
+        if isinstance(wrapper, OFTLinearSplitFC1UpGate):
+            return _OFTWrapperMergePlan(wrapper, wrapper.to_wrap, cls._prepare_fc1_updates(wrapper))
+        if isinstance(wrapper, OFTLinearGroupedSplitFC1UpGate):
+            return _OFTWrapperMergePlan(wrapper, wrapper.to_wrap, cls._prepare_grouped_fc1_updates(wrapper))
+        if isinstance(wrapper, _SplitLNCanonicalOFTQKV):
+            return _OFTWrapperMergePlan(
+                wrapper,
+                wrapper._orig_module,
+                cls._prepare_qkv_updates(wrapper._qkv),
+            )
+        if isinstance(wrapper, _SplitLNCanonicalOFTFC1):
+            return _OFTWrapperMergePlan(
+                wrapper,
+                wrapper._orig_module,
+                cls._prepare_fc1_updates(wrapper._fc1),
+            )
+        raise ValueError(f"CanonicalOFTMerge does not support wrapper {type(wrapper).__name__}")
+
+    @classmethod
+    def _preflight_model(cls, model) -> tuple[_OFTWrapperMergePlan, ...]:
+        """Prepare the complete canonical merge set and reject aliases before writes."""
+        wrappers = _collect_oft_merge_wrappers(model, cls._WRAPPER_TYPES)
+        plans = tuple(cls._prepare_wrapper(wrapper) for wrapper in wrappers)
+        _validate_unaliased_merge_weights(model, plans)
+        return plans
+
+    @classmethod
+    @torch.no_grad()
+    def _merge_wrapper(cls, wrapper: nn.Module) -> nn.Module:
+        """Prepare and fold one wrapper for direct-call compatibility."""
+        return _apply_oft_merge_plan(cls._prepare_wrapper(wrapper))
+
+    def __call__(self, model, training: bool = True):
+        """Atomically preflight, merge, unwrap, freeze, and return the model."""
+        plans = self._preflight_model(model)
+        plan_by_wrapper = {id(plan.wrapper): plan for plan in plans}
+        merged = _replace_oft_merge_wrappers(
+            model,
+            self._WRAPPER_TYPES,
+            lambda wrapper: _apply_oft_merge_plan(plan_by_wrapper[id(wrapper)]),
+        )
+        self.freeze_model(merged, training=training)
+        _set_oft_merged_model_mode(merged, training)
+        return merged
 
     @torch.no_grad()
-    def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
-        if isinstance(module, OFTLinearSplitQKV):
-            self._merge_qkv(module)
+    def transform(self, module: nn.Module, name: str | None = None, prefix: str | None = None) -> nn.Module:
+        """Merge and unwrap one supported wrapper for direct-call compatibility."""
+        if not isinstance(module, self._WRAPPER_TYPES):
             return module
-        if isinstance(module, OFTLinearSplitFC1UpGate):
-            self._merge_fc1(module)
-            return module
-        return module
+        self._validate_wrapper(module)
+        return self._merge_wrapper(module)
 
     @staticmethod
     @torch.no_grad()
     def _merge_qkv(wrapper: OFTLinearSplitQKV) -> None:
+        for update in CanonicalOFTMerge._prepare_qkv_updates(wrapper):
+            update.weight.copy_(update.merged_weight)
+
+    @staticmethod
+    @torch.no_grad()
+    def _prepare_qkv_updates(wrapper: OFTLinearSplitQKV) -> tuple[_OFTMergeUpdate, ...]:
+        """Return a complete, uncommitted QKV merge update."""
         W = wrapper.to_wrap.weight
         # OFTRotationModule.forward applies rotation as ``x @ R``. For
         # ``F.linear(x, W_merged) == F.linear(x @ R, W)`` we need
         # ``W_merged = W @ R.T`` (so ``x @ W_merged.T = x @ R @ W.T``).
         rotations = {
-            name: getattr(wrapper, f"adapter_{name}").get_delta_weight().to(W.device, W.dtype)
+            name: CanonicalOFTMerge._computed_rotation(
+                getattr(wrapper, f"adapter_{name}"),
+                W,
+                wrapper,
+                f"adapter_{name}",
+            )
             for name in wrapper._adapter_names
         }
+        merged_weight = W.clone()
         for name, start, end in wrapper._qkv_weight_segments(W.shape[0]):
-            W[start:end].copy_(W[start:end] @ rotations[name].T)
+            if name in rotations:
+                merged_weight[start:end] = W[start:end] @ rotations[name].T
+        return (_OFTMergeUpdate(wrapper.to_wrap, "weight", W, merged_weight),)
 
     @staticmethod
     @torch.no_grad()
     def _merge_fc1(wrapper: OFTLinearSplitFC1UpGate) -> None:
+        for update in CanonicalOFTMerge._prepare_fc1_updates(wrapper):
+            update.weight.copy_(update.merged_weight)
+
+    @staticmethod
+    @torch.no_grad()
+    def _prepare_fc1_updates(wrapper: OFTLinearSplitFC1UpGate) -> tuple[_OFTMergeUpdate, ...]:
+        """Return a complete, uncommitted fused gate/up merge update."""
         W = wrapper.to_wrap.weight
         half = W.shape[0] // 2
         # See ``_merge_qkv``: forward uses ``x @ R``, so the merged base weight
         # must be ``W @ R.T``.
-        R_gate = wrapper.adapter_gate.get_delta_weight().to(W.device, W.dtype)
-        R_up = wrapper.adapter_up.get_delta_weight().to(W.device, W.dtype)
-        W_gate_new = W[:half] @ R_gate.T
-        W_up_new = W[half:] @ R_up.T
-        W.data.copy_(torch.cat([W_gate_new, W_up_new], dim=0))
+        merged_weight = W.clone()
+        if "gate" in wrapper._adapter_names:
+            R_gate = CanonicalOFTMerge._computed_rotation(wrapper.adapter_gate, W, wrapper, "adapter_gate")
+            merged_weight[:half] = W[:half] @ R_gate.T
+        if "up" in wrapper._adapter_names:
+            R_up = CanonicalOFTMerge._computed_rotation(wrapper.adapter_up, W, wrapper, "adapter_up")
+            merged_weight[half:] = W[half:] @ R_up.T
+        return (_OFTMergeUpdate(wrapper.to_wrap, "weight", W, merged_weight),)
+
+    @staticmethod
+    @torch.no_grad()
+    def _merge_grouped_fc1(wrapper: OFTLinearGroupedSplitFC1UpGate) -> None:
+        for update in CanonicalOFTMerge._prepare_grouped_fc1_updates(wrapper):
+            update.weight.copy_(update.merged_weight)
+
+    @staticmethod
+    @torch.no_grad()
+    def _prepare_grouped_fc1_updates(
+        wrapper: OFTLinearGroupedSplitFC1UpGate,
+    ) -> tuple[_OFTMergeUpdate, ...]:
+        """Fold each local expert's independent gate/up rotations."""
+        updates: list[_OFTMergeUpdate] = []
+        for expert_idx in range(wrapper.num_gemms):
+            name = f"weight{expert_idx}"
+            weight = getattr(wrapper.to_wrap, name)
+            gate_weight, up_weight = wrapper._split_output_weight(weight)
+            expected_shape = (weight.shape[1], weight.shape[1])
+            rotations = {
+                adapter_name: getattr(wrapper, f"adapter_{adapter_name}")
+                .get_delta_weight(expert_idx)
+                .to(weight.device, weight.dtype)
+                for adapter_name in wrapper._adapter_names
+            }
+            for adapter_name, rotation in rotations.items():
+                if rotation.ndim != 2 or tuple(rotation.shape) != expected_shape:
+                    raise ValueError(
+                        f"OFT merge rotation shape mismatch for {type(wrapper).__name__}.adapter_{adapter_name}"
+                        f"[{expert_idx}]: expected {expected_shape}, got {tuple(rotation.shape)}"
+                    )
+            merged_weight = weight.clone()
+            half = gate_weight.shape[0]
+            if "gate" in rotations:
+                merged_weight[:half] = gate_weight @ rotations["gate"].T
+            if "up" in rotations:
+                merged_weight[half:] = up_weight @ rotations["up"].T
+            updates.append(
+                _OFTMergeUpdate(
+                    wrapper.to_wrap,
+                    name,
+                    weight,
+                    merged_weight,
+                )
+            )
+        return tuple(updates)

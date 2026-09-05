@@ -23,6 +23,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -107,7 +108,107 @@ def test_peft_canonical_oft_remains_an_explicit_opt_in(tmp_path: Path) -> None:
     entrypoint = _load_peft_entrypoint()
 
     model_path = _model_dir(tmp_path, {"num_experts": 128})
-    peft = entrypoint.build_peft(
-        _args(entrypoint, model_path, "--quant", "nvfp4", "--oft-type", "canonical_oft")
-    )
+    peft = entrypoint.build_peft(_args(entrypoint, model_path, "--quant", "nvfp4", "--oft-type", "canonical_oft"))
     assert isinstance(peft, entrypoint.CanonicalOFT)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("architecture", ["Qwen3MoeForCausalLM", type("Qwen3MoeForCausalLM", (), {})])
+def test_peft_build_config_applies_qwen3_moe_provider_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    architecture: object,
+) -> None:
+    entrypoint = _load_peft_entrypoint()
+    hf_config = SimpleNamespace(
+        decoder_sparse_step=2,
+        mlp_only_layers=[3],
+        num_experts=8,
+        num_hidden_layers=6,
+    )
+    provider = SimpleNamespace(expert_tensor_parallel_size=1)
+    auto_bridge = SimpleNamespace(
+        _causal_lm_architecture=architecture,
+        hf_pretrained=SimpleNamespace(config=hf_config),
+        to_megatron_provider=lambda **kwargs: provider,
+    )
+    config = SimpleNamespace(
+        model=None,
+        tokenizer=SimpleNamespace(),
+        checkpoint=SimpleNamespace(),
+        dataset=SimpleNamespace(),
+        train=SimpleNamespace(),
+    )
+    monkeypatch.setattr(entrypoint.AutoBridge, "from_hf_pretrained", lambda path: auto_bridge)
+    monkeypatch.setattr(entrypoint, "_peft_common", lambda: config)
+    args = _args(entrypoint, str(tmp_path / "qwen3-moe"), "--peft", "none")
+
+    result = entrypoint.build_config(args, world_size=1)
+
+    assert result.model is provider
+    assert provider.moe_router_dtype == "fp32"
+    assert provider.moe_layer_freq == [0, 1, 0, 0, 0, 1]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("world_size", "tp", "ep", "pp", "cp", "etp", "valid", "error_axis"),
+    [
+        (4, 2, 4, 1, 1, 1, True, None),
+        (8, 4, 4, 2, 1, 1, True, None),
+        (3, 2, 1, 1, 1, 1, False, r"TP\*PP\*CP"),
+        (6, 3, 4, 1, 1, 1, False, r"ETP\*EP\*PP"),
+        (8, 2, 2, 2, 2, 1, True, None),
+        (4, 2, 3, 1, 1, 2, False, r"ETP\*EP\*PP"),
+    ],
+)
+def test_peft_parallelism_validates_tensor_and_expert_axes_independently(
+    world_size: int,
+    tp: int,
+    ep: int,
+    pp: int,
+    cp: int,
+    etp: int,
+    valid: bool,
+    error_axis: str | None,
+) -> None:
+    entrypoint = _load_peft_entrypoint()
+    args = SimpleNamespace(quant="none", tp=tp, ep=ep, pp=pp, cp=cp)
+
+    if valid:
+        entrypoint.validate_parallelism(args, world_size=world_size, etp=etp)
+    else:
+        with pytest.raises(SystemExit, match=error_axis):
+            entrypoint.validate_parallelism(args, world_size=world_size, etp=etp)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("WORLD_SIZE", 0),
+        ("TP", 0),
+        ("EP", -1),
+        ("PP", 0),
+        ("CP", 0),
+        ("ETP", 0),
+    ],
+)
+def test_peft_parallelism_rejects_nonpositive_dimensions(name: str, value: int) -> None:
+    entrypoint = _load_peft_entrypoint()
+    dimensions = {"WORLD_SIZE": 1, "TP": 1, "EP": 1, "PP": 1, "CP": 1, "ETP": 1}
+    dimensions[name] = value
+    args = SimpleNamespace(
+        quant="none",
+        tp=dimensions["TP"],
+        ep=dimensions["EP"],
+        pp=dimensions["PP"],
+        cp=dimensions["CP"],
+    )
+
+    with pytest.raises(SystemExit, match=rf"{name}.*positive|positive.*{name}"):
+        entrypoint.validate_parallelism(
+            args,
+            world_size=dimensions["WORLD_SIZE"],
+            etp=dimensions["ETP"],
+        )

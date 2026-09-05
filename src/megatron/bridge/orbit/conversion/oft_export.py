@@ -13,12 +13,15 @@ the architecture's registered model-bridge class with
 
 from __future__ import annotations
 
+import hashlib
 import itertools
+import json
 import math
 import re
 from dataclasses import dataclass
-from enum import StrEnum
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, TypeVar, Union
+from enum import Enum
+from importlib import metadata as importlib_metadata
+from typing import TYPE_CHECKING, Callable, Iterable, TypeVar
 
 import torch
 from megatron.core import parallel_state
@@ -45,12 +48,14 @@ MegatronModel = TypeVar("MegatronModel", bound=MegatronModule)
 MEGATRON_TO_HF_OFT_SUFFIX = {
     ".oft_r": ".oft_R.weight",
 }
+HF_OFT_EMBEDDING_SUFFIX = ".oft_embedding_R.weight"
 
 GDN_IN_PROJ_KEYS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
 _DSV4_NATIVE_EXPERT_OFT_BASE_PREFIX_RE = re.compile(r"^(?P<head>.*\.mlp\.experts\.)(?P<expert>\d+)(?P<tail>\.w[123])$")
 _DSV4_GROUPED_EXPERT_OFT_PARAM_RE = re.compile(r"^(?P<base>.*\.mlp\.(?P<proj>w[123]))_oft_r$")
 _DSV4_GROUPED_EXPERT_OFT_BASE_PREFIX_RE = re.compile(r"^(?P<base>.*\.mlp\.(?P<proj>w[123]))$")
 _DSV4_GROUPED_EXPERT_OFT_LAYER_RE = re.compile(r"(?:^|\.)decoder\.layers\.(?P<layer>\d+)\.mlp\.(?P<proj>w[123])$")
+_DSV4_PROJ_TO_HF_LEAF = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 
 
 def _infer_oft_block_size_from_n_elements(n_elements: int) -> int:
@@ -63,6 +68,127 @@ def _infer_oft_block_size_from_n_elements(n_elements: int) -> int:
     return block_size
 
 
+def _distributed_error(stage: str, local_error: str | None) -> None:
+    """Raise one coordinated error before any OFT tensor collective.
+
+    OFT export is a world-rank operation. Discovery and mapping are deliberately
+    exchanged through the default process group so a rank-local Python failure
+    cannot leave a peer waiting in a later PP/TP/EP tensor collective.
+    """
+
+    dist = torch.distributed
+    if not dist.is_available() or not dist.is_initialized():
+        if local_error is not None:
+            raise RuntimeError(f"{stage} failed: {local_error}")
+        return
+
+    payload = None if local_error is None else {"rank": dist.get_rank(), "error": local_error[:2000]}
+    gathered: list[dict[str, object] | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, payload)
+    failures = [item for item in gathered if item is not None]
+    if failures:
+        details = "; ".join(f"rank {item['rank']}: {item['error']}" for item in failures)
+        raise RuntimeError(f"{stage} failed: {details}")
+
+
+def _agree_oft_task_plan(tasks: list["OFTAdapterConversionTask"]) -> bool:
+    """Require every world rank to discover the same ordered OFT task plan."""
+
+    dist = torch.distributed
+    if not dist.is_available() or not dist.is_initialized():
+        return bool(tasks)
+
+    local_contract = (len(tasks), _contract_digest([_oft_task_contract(task) for task in tasks]))
+    gathered: list[tuple[int, str] | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, local_contract)
+    reference = gathered[0]
+    if reference is None:
+        raise RuntimeError("OFT task-plan agreement received no plan from rank 0")
+    mismatches = [rank for rank, task_contract in enumerate(gathered) if task_contract != reference]
+    if mismatches:
+        raise RuntimeError(
+            f"OFT task plan differs from rank 0 on ranks {mismatches}; "
+            f"rank 0 contract is count={reference[0]}, digest={reference[1]}"
+        )
+    return reference[0] > 0
+
+
+def _exception_summary(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _contract_digest(value: object) -> str:
+    """Return a stable fixed-size digest for JSON-serializable export metadata."""
+
+    encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _bounded_error_summary(errors: list[str], *, limit: int = 8) -> str | None:
+    """Bound rank diagnostics before exchanging them through an object collective."""
+
+    if not errors:
+        return None
+    shown = [error[:1000] for error in errors[:limit]]
+    if len(errors) > limit:
+        shown.append(f"... {len(errors) - limit} additional errors omitted")
+    return "; ".join(shown)
+
+
+def _expected_local_expert_count(num_moe_experts: int) -> int:
+    """Return the exact local expert count for the active EP topology."""
+
+    ep_size = int(parallel_state.get_expert_model_parallel_world_size())
+    if ep_size < 1:
+        raise ValueError(f"expert model parallel size must be positive, got {ep_size}")
+    if num_moe_experts < 1:
+        raise ValueError(f"num_moe_experts must be positive for expert OFT export, got {num_moe_experts}")
+    if num_moe_experts % ep_size != 0:
+        raise ValueError(f"num_moe_experts={num_moe_experts} must be divisible by ep_size={ep_size}")
+    return num_moe_experts // ep_size
+
+
+def _receive_spec_for_task(task: "OFTAdapterConversionTask") -> tuple[torch.dtype, torch.device]:
+    """Resolve a rank-local receive dtype/device from an agreed task record."""
+
+    supported_dtypes = {
+        str(torch.float16): torch.float16,
+        str(torch.bfloat16): torch.bfloat16,
+        str(torch.float32): torch.float32,
+        str(torch.float64): torch.float64,
+    }
+    dtype = supported_dtypes.get(task.tensor_dtype)
+    if dtype is None:
+        raise ValueError(f"unsupported OFT adapter dtype {task.tensor_dtype!r}")
+    if task.device_type == "cpu":
+        return dtype, torch.device("cpu")
+    if task.device_type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("OFT adapter task requires CUDA, but CUDA is unavailable on this rank")
+        return dtype, torch.device("cuda", torch.cuda.current_device())
+    raise ValueError(f"unsupported OFT adapter device type {task.device_type!r}")
+
+
+def _materialize_oft_task_outputs(
+    outputs: list[tuple[str, torch.Tensor]],
+    *,
+    cpu: bool,
+) -> list[tuple[str, torch.Tensor]]:
+    """Materialize one task's outputs before any later tensor collective."""
+
+    if not cpu:
+        return outputs
+
+    materialized: list[tuple[str, torch.Tensor]] = []
+    local_error: str | None = None
+    try:
+        materialized = [(name, tensor.detach().to(device="cpu").contiguous().clone()) for name, tensor in outputs]
+    except Exception as exc:
+        local_error = _exception_summary(exc)
+    _distributed_error("OFT task CPU materialization", local_error)
+    return materialized
+
+
 def _is_dsv4_native_expert_oft_base_prefix(global_base_prefix: str) -> bool:
     """Return whether ``global_base_prefix`` is a native DSV4 per-expert OFT prefix."""
 
@@ -72,7 +198,7 @@ def _is_dsv4_native_expert_oft_base_prefix(global_base_prefix: str) -> bool:
 def _globalize_dsv4_native_expert_oft_base_prefix(
     global_base_prefix: str,
     num_moe_experts: int,
-    ep_rank: Optional[int] = None,
+    ep_rank: int | None = None,
 ) -> str:
     """Map EP-local native DSV4 expert prefixes to global expert IDs for HF export.
 
@@ -89,8 +215,7 @@ def _globalize_dsv4_native_expert_oft_base_prefix(
     if ep_size <= 1:
         return global_base_prefix
 
-    assert num_moe_experts % ep_size == 0, f"num_moe_experts={num_moe_experts} must be divisible by ep_size={ep_size}"
-    num_experts_per_rank = num_moe_experts // ep_size
+    num_experts_per_rank = _expected_local_expert_count(num_moe_experts)
     expert_id = int(match.group("expert"))
     if expert_id >= num_experts_per_rank:
         return global_base_prefix
@@ -155,10 +280,40 @@ class OFTAdapterConversionTask:
     block_share: bool
     pp_rank: int
     vp_stage: int
-    slice_name: Optional[str] = None
+    slice_name: str | None = None
     # Set when the slice adapter is a per-expert ``nn.ModuleList`` (grouped split FC1):
     # the task owns one expert's rotation and emits a single per-expert HF name.
-    expert_idx: Optional[int] = None
+    expert_idx: int | None = None
+    # PEFT stores embedding rotations under ``oft_embedding_R`` rather than
+    # the linear layer's ``oft_R`` parameter name.
+    is_embedding: bool = False
+    # A non-None value identifies an explicit leading local-expert tensor axis.
+    grouped_expert_count: int | None = None
+    # String metadata stays process-safe while making receive buffers exact.
+    tensor_dtype: str = ""
+    device_type: str = ""
+
+
+def _oft_task_contract(task: OFTAdapterConversionTask) -> tuple[object, ...]:
+    """Convert one task to deterministic primitive metadata for agreement."""
+
+    return (
+        task.global_base_prefix,
+        task.local_base_prefix,
+        task.is_expert,
+        task.input_is_parallel,
+        task.block_size,
+        task.r,
+        task.block_share,
+        task.pp_rank,
+        task.vp_stage,
+        task.slice_name,
+        task.expert_idx,
+        task.is_embedding,
+        task.grouped_expert_count,
+        task.tensor_dtype,
+        task.device_type,
+    )
 
 
 _CANONICAL_OFT_SLICE_TO_HF_LEAF = {
@@ -180,11 +335,30 @@ _CANONICAL_OFT_SLICE_TO_CHILD_WRAPPER = {
 _CANONICAL_OFT_SLICE_SORT_ORDER = {slice_name: index for index, slice_name in enumerate(("q", "k", "v", "gate", "up"))}
 
 
-class OFTExportFormat(StrEnum):
+class OFTExportFormat(str, Enum):
     """Consumer-specific layouts for exported OFT adapter weights."""
 
     SGLANG = "sglang"
     HF_PEFT = "hf_peft"
+
+    def __str__(self) -> str:
+        """Return the serialized string value, matching Python 3.11 StrEnum."""
+        return self.value
+
+
+def _dsv4_grouped_oft_name(
+    *,
+    layer: str,
+    expert_idx: int,
+    projection: str,
+    export_format: OFTExportFormat,
+) -> str:
+    """Return the consumer-specific name for one grouped DSV4 rotation."""
+
+    if export_format == OFTExportFormat.HF_PEFT:
+        leaf = _DSV4_PROJ_TO_HF_LEAF[projection]
+        return f"model.layers.{layer}.mlp.experts.{expert_idx}.{leaf}.oft_R.weight"
+    return f"layers.{layer}.ffn.experts.{expert_idx}.{projection}.oft_R.weight"
 
 
 def _filter_legacy_grouped_oft_weight_names(
@@ -198,13 +372,13 @@ def _filter_legacy_grouped_oft_weight_names(
     key. HF PEFT instead attaches OFT independently to both unfused projections,
     so its adapter directory needs both names even though the tensors are equal.
     """
-    if export_format is OFTExportFormat.HF_PEFT:
+    if export_format == OFTExportFormat.HF_PEFT:
         return base_hf_weight_names
     gate_only = [name for name in base_hf_weight_names if ".up_proj." not in name]
     return gate_only or base_hf_weight_names
 
 
-def _canonical_oft_export_base_prefix(global_base_prefix: str, slice_name: Optional[str]) -> str:
+def _canonical_oft_export_base_prefix(global_base_prefix: str, slice_name: str | None) -> str:
     if slice_name is None:
         return global_base_prefix
     child_suffix = _CANONICAL_OFT_SLICE_TO_CHILD_WRAPPER[slice_name]
@@ -226,6 +400,10 @@ def _oft_adapter_info_sort_key(info: tuple) -> tuple:
 
     slice_name = info[9]
     expert_idx = info[10] if len(info) > 10 else None
+    is_embedding = info[11] if len(info) > 11 else False
+    grouped_expert_count = info[12] if len(info) > 12 else None
+    tensor_dtype = info[13] if len(info) > 13 else ""
+    device_type = info[14] if len(info) > 14 else ""
     slice_order = _CANONICAL_OFT_SLICE_SORT_ORDER.get(slice_name, -1)
     expert_order = -1 if expert_idx is None else int(expert_idx)
     return (
@@ -235,6 +413,10 @@ def _oft_adapter_info_sort_key(info: tuple) -> tuple:
         info[1],
         info[7],
         info[8],
+        is_embedding,
+        -1 if grouped_expert_count is None else int(grouped_expert_count),
+        tensor_dtype,
+        device_type,
     )
 
 
@@ -270,7 +452,7 @@ class OrbitOFTExportMixin:
         return False
 
     @staticmethod
-    def _parse_canonical_oft_slice(param_name: str) -> Optional[str]:
+    def _parse_canonical_oft_slice(param_name: str) -> str | None:
         """If ``param_name`` is a CanonicalOFT split-adapter param, return its
         slice name (``"q"`` / ``"k"`` / ``"v"`` / ``"gate"`` / ``"up"``).
         Otherwise return ``None``."""
@@ -279,24 +461,40 @@ class OrbitOFTExportMixin:
                 return slice_name
         return None
 
-    def _make_oft_param_name(self, base_name: str, megatron_oft_suffix: str = ".oft_r") -> Optional[str]:
+    def _make_oft_param_name(
+        self,
+        base_name: str,
+        megatron_oft_suffix: str = ".oft_r",
+        *,
+        is_embedding: bool = False,
+        export_format: OFTExportFormat = OFTExportFormat.SGLANG,
+    ) -> str | None:
         """Translate a base HF weight name into its OFT-specific counterpart.
 
         Example:
             ``model.layers.0.self_attn.q_proj.weight`` → ``model.layers.0.self_attn.q_proj.oft_R.weight``
         """
-        if not base_name.endswith(".weight"):
-            return None
-        hf_suffix = MEGATRON_TO_HF_OFT_SUFFIX.get(megatron_oft_suffix)
+        hf_suffix = (
+            HF_OFT_EMBEDDING_SUFFIX
+            if is_embedding and megatron_oft_suffix == ".oft_r"
+            else MEGATRON_TO_HF_OFT_SUFFIX.get(megatron_oft_suffix)
+        )
         if hf_suffix is None:
             return None
-        return base_name[: -len(".weight")] + hf_suffix
+        if base_name.endswith(".weight"):
+            return base_name[: -len(".weight")] + hf_suffix
+        # Some grouped-expert mappings name a tensor container without the
+        # final ``.weight`` component (for example Qwen3.5 gate_up_proj).
+        # Neither PEFT nor SGLang can attach an OFT rotation to that bare
+        # parameter: both consumers require concrete per-module/per-expert
+        # names. Fail closed instead of emitting a plausible but misrouted key.
+        raise ValueError(f"{export_format.value} OFT export requires a module weight mapping, got {base_name!r}")
 
     def _gather_dsv4_grouped_expert_oft_weight(
         self,
         weight: torch.Tensor,
         *,
-        proj: Optional[str] = None,
+        proj: str | None = None,
     ) -> torch.Tensor:
         """Gather grouped DSV4 compact OFT tensors into HF expert layout.
 
@@ -326,11 +524,11 @@ class OrbitOFTExportMixin:
     def _get_oft_adapter_wrap_module(
         self,
         local_base_prefix: str,
-        megatron_model: Union[MegatronModel, List[MegatronModel]],
+        megatron_model: MegatronModel | list[MegatronModel],
         vp_stage: int,
-        slice_name: Optional[str] = None,
-        expert_idx: Optional[int] = None,
-    ) -> Optional[torch.nn.Module]:
+        slice_name: str | None = None,
+        expert_idx: int | None = None,
+    ) -> torch.nn.Module | None:
         """Locate the OFTRotationModule adapter for a given base prefix.
 
         ``get_module_and_param_from_name`` returns ``(parent_module, target_attr)``
@@ -367,9 +565,107 @@ class OrbitOFTExportMixin:
             return adapter
         return None
 
+    def _local_oft_adapter_info_for_parameter(
+        self,
+        *,
+        megatron_model: list[MegatronModel],
+        model_config,
+        local_param_name: str,
+        param: torch.Tensor,
+        vp_stage: int,
+        pp_rank: int,
+        local_to_global,
+    ) -> tuple | None:
+        """Build one dependency-free discovery record for an OFT parameter."""
+
+        from megatron.bridge.orbit.oft.oft_layers import OFTVocabParallelEmbedding
+
+        if "_extra_state" in local_param_name:
+            return None
+        local_param_name = self._unwrap_name(local_param_name)
+        global_param_name = local_to_global(megatron_model, model_config, local_param_name, vp_stage)
+
+        dsv4_grouped_match = _DSV4_GROUPED_EXPERT_OFT_PARAM_RE.match(global_param_name)
+        if dsv4_grouped_match is not None:
+            if param.dim() != 3:
+                raise ValueError(
+                    f"Expected grouped DSV4 OFT param {global_param_name} to be 3D, got {tuple(param.shape)}"
+                )
+            return (
+                dsv4_grouped_match.group("base"),
+                local_param_name[: -len("_oft_r")],
+                True,
+                False,
+                _infer_oft_block_size_from_n_elements(int(param.shape[-1])),
+                int(param.shape[1]),
+                False,
+                pp_rank,
+                vp_stage,
+                None,
+                None,
+                False,
+                int(param.shape[0]),
+                str(param.dtype),
+                param.device.type,
+            )
+
+        if not self._is_adapter_param_name(global_param_name) or not global_param_name.endswith(".oft_r"):
+            return None
+
+        slice_name = self._parse_canonical_oft_slice(global_param_name)
+        expert_idx: int | None = None
+        if slice_name is not None:
+            sub_token = f".adapter_{slice_name}."
+            local_base_prefix = local_param_name.partition(sub_token)[0]
+            suffix_after_slice = global_param_name.split(sub_token, 1)[1]
+            grouped_match = re.match(r"^(\d+)\.oft_r$", suffix_after_slice)
+            if grouped_match is not None:
+                expert_idx = int(grouped_match.group(1))
+                strip = f".adapter_{slice_name}.{expert_idx}.oft_r"
+            else:
+                strip = f".adapter_{slice_name}.oft_r"
+            global_base_prefix = global_param_name[: -len(strip)]
+            global_base_prefix = _canonical_oft_export_base_prefix(global_base_prefix, slice_name)
+        else:
+            local_base_prefix = local_param_name.partition(".adapter.")[0]
+            global_base_prefix = global_param_name[: -len(".adapter.oft_r")]
+
+        adapter = self._get_oft_adapter_wrap_module(
+            local_base_prefix,
+            megatron_model,
+            vp_stage,
+            slice_name=slice_name,
+            expert_idx=expert_idx,
+        )
+        if adapter is None:
+            raise RuntimeError(
+                f"Discovered OFT parameter {global_param_name!r}, but could not resolve "
+                f"its adapter wrapper at {local_base_prefix!r}"
+            )
+
+        _, wrapper = get_module_and_param_from_name(megatron_model, local_base_prefix, vp_stage)
+        grouped_expert_count = int(param.shape[0]) if param.ndim == 3 else None
+        return (
+            global_base_prefix,
+            local_base_prefix,
+            adapter.is_expert,
+            adapter.input_is_parallel,
+            adapter.block_size,
+            adapter.r,
+            adapter.block_share,
+            pp_rank,
+            vp_stage,
+            slice_name,
+            expert_idx,
+            isinstance(wrapper, OFTVocabParallelEmbedding),
+            grouped_expert_count,
+            str(param.dtype),
+            param.device.type,
+        )
+
     def _megatron_global_oft_adapters_info_all_pp_ranks(
-        self, megatron_model: Union[MegatronModel, List[MegatronModel]]
-    ) -> List[OFTAdapterConversionTask]:
+        self, megatron_model: MegatronModel | list[MegatronModel]
+    ) -> list[OFTAdapterConversionTask]:
         """Collect OFT adapter information across all pipeline parallel ranks.
 
         Returns a sorted, deduplicated list of :class:`OFTAdapterConversionTask` entries,
@@ -382,93 +678,31 @@ class OrbitOFTExportMixin:
         if not isinstance(megatron_model, list):
             megatron_model = [megatron_model]
 
-        from megatron.bridge.models.conversion.model_bridge import _megatron_local_name_to_global
+        local_info: list[tuple] = []
+        discovery_error: str | None = None
+        try:
+            from megatron.bridge.models.conversion.model_bridge import _megatron_local_name_to_global
 
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pp_rank = get_pg_rank(pp_group)
-        model_config = unwrap_model(megatron_model)[0].config
-        local_info: List[tuple] = []
-
-        for vp_stage, model in enumerate(megatron_model):
-            for local_param_name, param in itertools.chain(model.named_parameters(), persistent_buffers(model)):
-                if "_extra_state" in local_param_name:
-                    continue
-                local_param_name = self._unwrap_name(local_param_name)
-                global_param_name = _megatron_local_name_to_global(
-                    megatron_model, model_config, local_param_name, vp_stage
-                )
-
-                dsv4_grouped_match = _DSV4_GROUPED_EXPERT_OFT_PARAM_RE.match(global_param_name)
-                if dsv4_grouped_match is not None:
-                    dsv4_grouped_global_base_prefix = dsv4_grouped_match.group("base")
-                    local_base_prefix = local_param_name[: -len("_oft_r")]
-                    if param.dim() != 3:
-                        raise ValueError(
-                            f"Expected grouped DSV4 OFT param {global_param_name} to be 3D, got {tuple(param.shape)}"
-                        )
-                    local_info.append(
-                        (
-                            dsv4_grouped_global_base_prefix,
-                            local_base_prefix,
-                            True,
-                            False,
-                            _infer_oft_block_size_from_n_elements(int(param.shape[-1])),
-                            int(param.shape[1]),
-                            False,
-                            pp_rank,
-                            vp_stage,
-                            None,
-                            None,
-                        )
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            pp_rank = get_pg_rank(pp_group)
+            model_config = unwrap_model(megatron_model)[0].config
+            for vp_stage, model in enumerate(megatron_model):
+                for local_param_name, param in itertools.chain(model.named_parameters(), persistent_buffers(model)):
+                    info = self._local_oft_adapter_info_for_parameter(
+                        megatron_model=megatron_model,
+                        model_config=model_config,
+                        local_param_name=local_param_name,
+                        param=param,
+                        vp_stage=vp_stage,
+                        pp_rank=pp_rank,
+                        local_to_global=_megatron_local_name_to_global,
                     )
-                    continue
+                    if info is not None:
+                        local_info.append(info)
+        except Exception as exc:
+            discovery_error = _exception_summary(exc)
 
-                if not self._is_adapter_param_name(global_param_name) or not global_param_name.endswith(".oft_r"):
-                    continue
-
-                slice_name = self._parse_canonical_oft_slice(global_param_name)
-                expert_idx: Optional[int] = None
-                if slice_name is not None:
-                    sub_token = f".adapter_{slice_name}."
-                    local_base_prefix = local_param_name.partition(sub_token)[0]
-                    suffix_after_slice = global_param_name.split(sub_token, 1)[1]
-                    grouped_match = re.match(r"^(\d+)\.oft_r$", suffix_after_slice)
-                    if grouped_match is not None:
-                        expert_idx = int(grouped_match.group(1))
-                        strip = f".adapter_{slice_name}.{expert_idx}.oft_r"
-                    else:
-                        strip = f".adapter_{slice_name}.oft_r"
-                    global_base_prefix = global_param_name[: -len(strip)]
-                    global_base_prefix = _canonical_oft_export_base_prefix(global_base_prefix, slice_name)
-                else:
-                    local_base_prefix = local_param_name.partition(".adapter.")[0]
-                    global_base_prefix = global_param_name[: -len(".adapter.oft_r")]
-
-                adapter = self._get_oft_adapter_wrap_module(
-                    local_base_prefix,
-                    megatron_model,
-                    vp_stage,
-                    slice_name=slice_name,
-                    expert_idx=expert_idx,
-                )
-                if adapter is None:
-                    continue
-
-                local_info.append(
-                    (
-                        global_base_prefix,
-                        local_base_prefix,
-                        adapter.is_expert,
-                        adapter.input_is_parallel,
-                        adapter.block_size,
-                        adapter.r,
-                        adapter.block_share,
-                        pp_rank,
-                        vp_stage,
-                        slice_name,
-                        expert_idx,
-                    )
-                )
+        _distributed_error("OFT adapter discovery", discovery_error)
 
         gathered_info = [None] * pp_group.size()
         torch.distributed.all_gather_object(gathered_info, local_info, group=pp_group)
@@ -489,12 +723,265 @@ class OrbitOFTExportMixin:
                 vp_stage=t[8],
                 slice_name=t[9],
                 expert_idx=t[10],
+                is_embedding=t[11],
+                grouped_expert_count=t[12],
+                tensor_dtype=t[13],
+                device_type=t[14],
             )
             for t in sorted_info
         ]
 
         self._cached_oft_adapter_info = result
         return result
+
+    def _planned_hf_names_for_oft_task(
+        self,
+        task: OFTAdapterConversionTask,
+        mapping_registry,
+        num_moe_experts: int,
+        export_format: OFTExportFormat,
+    ) -> list[str]:
+        """Resolve every HF key a task will emit without touching tensor data."""
+
+        if task.is_expert:
+            ep_size = int(parallel_state.get_expert_model_parallel_world_size())
+            expected_local_experts = _expected_local_expert_count(num_moe_experts)
+            is_rank_local_layout = ".local_experts." in task.global_base_prefix or task.expert_idx is not None
+            if ep_size > 1 and is_rank_local_layout:
+                raise ValueError(
+                    f"rank-local expert OFT layout {task.global_base_prefix!r} is not safe to export with "
+                    f"ep_size={ep_size}"
+                )
+            if task.grouped_expert_count is not None and task.grouped_expert_count != expected_local_experts:
+                raise ValueError(
+                    f"grouped expert axis for {task.global_base_prefix!r} has "
+                    f"{task.grouped_expert_count} local experts, expected {expected_local_experts}"
+                )
+
+        dsv4_grouped_match = _DSV4_GROUPED_EXPERT_OFT_BASE_PREFIX_RE.match(task.global_base_prefix)
+        if dsv4_grouped_match is not None:
+            layer_match = _DSV4_GROUPED_EXPERT_OFT_LAYER_RE.search(task.global_base_prefix)
+            if layer_match is None:
+                return []
+            return [
+                _dsv4_grouped_oft_name(
+                    layer=layer_match.group("layer"),
+                    expert_idx=expert_idx,
+                    projection=layer_match.group("proj"),
+                    export_format=export_format,
+                )
+                for expert_idx in range(num_moe_experts)
+            ]
+
+        is_canonical_split_grouped = task.grouped_expert_count is not None and task.slice_name is not None
+        if is_canonical_split_grouped:
+            leaf = _CANONICAL_OFT_SLICE_TO_HF_LEAF[task.slice_name]
+            names: list[str] = []
+            for expert_idx in range(num_moe_experts):
+                base_names = self._get_base_hf_param_names_for_adapter(
+                    mapping_registry,
+                    task.global_base_prefix,
+                    None,
+                    f".weight{expert_idx}",
+                )
+                for base_name in base_names:
+                    if f".{leaf}." not in base_name:
+                        continue
+                    hf_name = self._make_oft_param_name(
+                        base_name,
+                        is_embedding=task.is_embedding,
+                        export_format=export_format,
+                    )
+                    if hf_name is not None:
+                        names.append(hf_name)
+            return names
+
+        is_dsv4_native_expert = _is_dsv4_native_expert_oft_base_prefix(task.global_base_prefix)
+        if is_dsv4_native_expert:
+            ep_size = parallel_state.get_expert_model_parallel_world_size()
+            export_prefixes = [
+                _globalize_dsv4_native_expert_oft_base_prefix(
+                    task.global_base_prefix,
+                    num_moe_experts,
+                    ep_rank=ep_rank,
+                )
+                for ep_rank in range(ep_size)
+            ]
+        else:
+            export_prefixes = [task.global_base_prefix]
+
+        is_grouped_expert = (
+            task.is_expert
+            and ".local_experts." not in task.global_base_prefix
+            and not is_dsv4_native_expert
+            and task.expert_idx is None
+        )
+        if is_grouped_expert:
+            base_suffixes = [f".weight{expert_idx}" for expert_idx in range(num_moe_experts)]
+        elif task.expert_idx is not None:
+            base_suffixes = [f".weight{task.expert_idx}"]
+        else:
+            base_suffixes = [".weight"]
+
+        names = []
+        for export_prefix in export_prefixes:
+            for base_suffix in base_suffixes:
+                base_names = self._get_base_hf_param_names_for_adapter(
+                    mapping_registry,
+                    export_prefix,
+                    None,
+                    base_suffix,
+                )
+                if task.slice_name is not None:
+                    leaf = _CANONICAL_OFT_SLICE_TO_HF_LEAF[task.slice_name]
+                    base_names = [name for name in base_names if f".{leaf}." in name]
+                if is_grouped_expert and task.slice_name is None:
+                    base_names = _filter_legacy_grouped_oft_weight_names(
+                        base_names,
+                        export_format=export_format,
+                    )
+                for base_name in base_names:
+                    hf_name = self._make_oft_param_name(
+                        base_name,
+                        is_embedding=task.is_embedding,
+                        export_format=export_format,
+                    )
+                    if hf_name is not None:
+                        names.append(hf_name)
+        return names
+
+    def _validate_oft_export_preflight(
+        self,
+        megatron_model: list[MegatronModel],
+        tasks: list[OFTAdapterConversionTask],
+        mapping_registry,
+        num_moe_experts: int,
+        export_format: OFTExportFormat,
+    ) -> list[str]:
+        """Validate wrappers, compact geometry, and final names before tensors move."""
+
+        local_errors: list[str] = []
+        planned_names: list[str] = []
+        try:
+            for task in tasks:
+                task_names = self._planned_hf_names_for_oft_task(
+                    task,
+                    mapping_registry,
+                    num_moe_experts,
+                    export_format,
+                )
+                if not task_names:
+                    local_errors.append(f"{task.global_base_prefix!r} maps to no HF OFT parameter")
+                planned_names.extend(task_names)
+
+            seen_names: set[str] = set()
+            duplicate_names: set[str] = set()
+            for name in planned_names:
+                if name in seen_names:
+                    duplicate_names.add(name)
+                seen_names.add(name)
+            if duplicate_names:
+                examples = sorted(duplicate_names)[:8]
+                local_errors.append(f"{len(duplicate_names)} duplicate HF OFT output keys; examples: {examples}")
+        except Exception as exc:
+            local_errors.append(_exception_summary(exc))
+
+        my_pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        for task in tasks:
+            if my_pp_rank != task.pp_rank:
+                continue
+            try:
+                dsv4_grouped = _DSV4_GROUPED_EXPERT_OFT_BASE_PREFIX_RE.match(task.global_base_prefix) is not None
+                canonical_grouped = task.grouped_expert_count is not None and task.slice_name is not None
+                grouped_layout = task.grouped_expert_count is not None
+                if grouped_layout and not (dsv4_grouped or canonical_grouped):
+                    raise ValueError("unsupported OFT tensor with a leading expert axis")
+                if dsv4_grouped:
+                    _, param = get_module_and_param_from_name(
+                        megatron_model,
+                        f"{task.local_base_prefix}_oft_r",
+                        task.vp_stage,
+                    )
+                    oft_r = param.data
+                else:
+                    adapter = self._get_oft_adapter_wrap_module(
+                        task.local_base_prefix,
+                        megatron_model,
+                        task.vp_stage,
+                        slice_name=task.slice_name,
+                        expert_idx=task.expert_idx,
+                    )
+                    if adapter is None:
+                        raise RuntimeError(f"adapter wrapper {task.local_base_prefix!r} is unresolved")
+                    oft_r = adapter.oft_r.data
+
+                expected_ndim = 3 if grouped_layout else 2
+                if oft_r.ndim != expected_ndim:
+                    raise ValueError(f"expected {expected_ndim}D oft_r, got shape {tuple(oft_r.shape)}")
+                if task.tensor_dtype != str(oft_r.dtype):
+                    raise ValueError(
+                        f"oft_r dtype {oft_r.dtype} does not match discovered dtype {task.tensor_dtype!r}"
+                    )
+                if task.device_type != oft_r.device.type:
+                    raise ValueError(
+                        f"oft_r device {oft_r.device.type!r} does not match discovered device {task.device_type!r}"
+                    )
+                if grouped_layout:
+                    expected_local_experts = _expected_local_expert_count(num_moe_experts)
+                    if int(oft_r.shape[0]) != expected_local_experts:
+                        raise ValueError(
+                            f"oft_r expert axis {oft_r.shape[0]} does not match expected local expert count "
+                            f"{expected_local_experts}"
+                        )
+                if task.block_size < 2 or task.r < 1:
+                    raise ValueError(f"invalid OFT geometry block_size={task.block_size}, r={task.r}")
+                expected_elements = task.block_size * (task.block_size - 1) // 2
+                if int(oft_r.shape[-1]) != expected_elements:
+                    raise ValueError(
+                        f"oft_r last dimension {oft_r.shape[-1]} does not encode block_size={task.block_size}"
+                    )
+                expected_blocks = 1 if task.block_share else task.r
+                if int(oft_r.shape[-2]) != expected_blocks:
+                    raise ValueError(
+                        f"oft_r block dimension {oft_r.shape[-2]} does not match expected {expected_blocks}"
+                    )
+                if not torch.is_floating_point(oft_r) or not bool(torch.isfinite(oft_r).all().item()):
+                    raise ValueError("oft_r must contain finite floating-point values")
+                if task.is_embedding and (task.is_expert or task.input_is_parallel or task.slice_name is not None):
+                    raise ValueError("embedding OFT task has incompatible expert/parallel/slice metadata")
+            except Exception as exc:
+                local_errors.append(f"{task.global_base_prefix!r}: {_exception_summary(exc)}")
+
+        dist = torch.distributed
+        if not dist.is_available() or not dist.is_initialized():
+            if local_errors:
+                raise RuntimeError(f"OFT export preflight failed: {'; '.join(local_errors)}")
+            return planned_names
+
+        local_record = (
+            _bounded_error_summary(local_errors),
+            len(planned_names),
+            _contract_digest(planned_names),
+        )
+        world_records: list[tuple[str | None, int, str] | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(world_records, local_record)
+        if any(record is None for record in world_records):
+            empty_ranks = [rank for rank, record in enumerate(world_records) if record is None]
+            raise RuntimeError(f"OFT export preflight received empty contracts from ranks {empty_ranks}")
+        records = [record for record in world_records if record is not None]
+        failures = [f"rank {rank}: {record[0]}" for rank, record in enumerate(records) if record[0]]
+        reference = records[0]
+        name_mismatches = [rank for rank, record in enumerate(records) if record[1:] != reference[1:]]
+        if failures or name_mismatches:
+            details = failures
+            if name_mismatches:
+                details.append(
+                    f"HF key plan differs from rank 0 on ranks {name_mismatches}; "
+                    f"rank 0 contract is count={reference[1]}, digest={reference[2]}"
+                )
+            raise RuntimeError(f"OFT export preflight failed: {'; '.join(details)}")
+
+        return planned_names
 
     def _gather_oft_r_across_tp(
         self,
@@ -527,7 +1014,7 @@ class OrbitOFTExportMixin:
 
     def stream_oft_adapter_weights_megatron_to_hf(
         self,
-        megatron_model: Union[MegatronModel, List[MegatronModel]],
+        megatron_model: MegatronModel | list[MegatronModel],
         cpu: bool = True,
         show_progress: bool = True,
         export_format: OFTExportFormat = OFTExportFormat.SGLANG,
@@ -563,30 +1050,80 @@ class OrbitOFTExportMixin:
         if not isinstance(megatron_model, list):
             megatron_model = [megatron_model]
 
-        num_moe_experts = megatron_model[0].config.num_moe_experts
+        num_moe_experts = 0
+        normalized_export_format = OFTExportFormat.SGLANG
+        model_setup_error: str | None = None
+        try:
+            normalized_export_format = OFTExportFormat(export_format)
+            if not megatron_model:
+                raise ValueError("OFT export requires at least one model chunk")
+            model_config = unwrap_model(megatron_model)[0].config
+            raw_num_moe_experts = getattr(model_config, "num_moe_experts", None)
+            num_moe_experts = 0 if raw_num_moe_experts is None else int(raw_num_moe_experts)
+            if num_moe_experts < 0:
+                raise ValueError(f"num_moe_experts must be nonnegative, got {num_moe_experts}")
+        except Exception as exc:
+            model_setup_error = _exception_summary(exc)
+        _distributed_error("OFT export model setup", model_setup_error)
+        export_format = normalized_export_format
+
         tasks = self._megatron_global_oft_adapters_info_all_pp_ranks(megatron_model)
-        if not tasks:
+        if not _agree_oft_task_plan(tasks):
             return
 
-        assert hasattr(self, "mapping_registry"), "MegatronModelBridge must define mapping_registry"
-        mapping_registry = self.mapping_registry()
+        setup_error: str | None = None
+        mapping_registry = None
+        pp_group = None
+        my_pp_rank = 0
+        pp_global_ranks: list[int] = []
+        receive_specs: dict[OFTAdapterConversionTask, tuple[torch.dtype, torch.device, tuple[int, ...]]] = {}
+        try:
+            if not hasattr(self, "mapping_registry"):
+                raise RuntimeError("MegatronModelBridge must define mapping_registry")
+            mapping_registry = self.mapping_registry()
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            my_pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            pp_global_ranks = torch.distributed.get_process_group_ranks(pp_group)
+            pp_size = pp_group.size()
+            if len(pp_global_ranks) != pp_size:
+                raise RuntimeError(f"pipeline group reports size {pp_size}, but has global ranks {pp_global_ranks}")
 
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        my_pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        pp_global_ranks = torch.distributed.get_process_group_ranks(pp_group)
+            for task in tasks:
+                if not 0 <= task.pp_rank < pp_size:
+                    raise ValueError(
+                        f"OFT task {task.global_base_prefix!r} has invalid PP owner {task.pp_rank} for size {pp_size}"
+                    )
+                dtype, device = _receive_spec_for_task(task)
+                n_elements = task.block_size * (task.block_size - 1) // 2
+                num_blocks = 1 if task.block_share else task.r
+                if task.grouped_expert_count is not None:
+                    shape = (task.grouped_expert_count, num_blocks, n_elements)
+                elif task.input_is_parallel and not task.block_share:
+                    tp_size = (
+                        parallel_state.get_expert_tensor_parallel_world_size()
+                        if task.is_expert
+                        else parallel_state.get_tensor_model_parallel_world_size()
+                    )
+                    if tp_size < 1:
+                        raise ValueError(f"tensor parallel size must be positive, got {tp_size}")
+                    shape = (num_blocks * tp_size, n_elements)
+                else:
+                    shape = (num_blocks, n_elements)
+                receive_specs[task] = (dtype, device, shape)
+        except Exception as exc:
+            setup_error = _exception_summary(exc)
+        _distributed_error("OFT export collective setup", setup_error)
 
-        # Determine parameter dtype from model config for buffer allocation
-        model_config = unwrap_model(megatron_model)[0].config
-        if model_config.bf16:
-            param_dtype = torch.bfloat16
-        elif model_config.fp16:
-            param_dtype = torch.float16
-        else:
-            param_dtype = torch.float32
+        planned_names = self._validate_oft_export_preflight(
+            megatron_model,
+            tasks,
+            mapping_registry,
+            num_moe_experts,
+            export_format,
+        )
+        emitted_names: list[str] = []
 
         for task in self._with_progress_tracking(tasks, "Streaming OFT adapter weights", show_progress):
-            n_elements = task.block_size * (task.block_size - 1) // 2
-            num_blocks_local = 1 if task.block_share else task.r
             dsv4_grouped_match = _DSV4_GROUPED_EXPERT_OFT_BASE_PREFIX_RE.match(task.global_base_prefix)
             dsv4_grouped_expert_projection = (
                 dsv4_grouped_match.group("proj") if dsv4_grouped_match is not None else None
@@ -615,33 +1152,8 @@ class OrbitOFTExportMixin:
                     )
             else:
                 # Allocate a receive buffer with the correct gathered shape
-                is_canonical_split_grouped_recv = task.slice_name is not None and task.expert_idx is None
-                if is_dsv4_grouped_expert or is_canonical_split_grouped_recv:
-                    ep_size = parallel_state.get_expert_model_parallel_world_size()
-                    num_experts_per_rank = num_moe_experts // max(ep_size, 1)
-                    total_blocks = num_blocks_local
-                    oft_r_tensor = torch.zeros(
-                        num_experts_per_rank,
-                        total_blocks,
-                        n_elements,
-                        device=torch.cuda.current_device(),
-                        dtype=param_dtype,
-                    )
-                elif task.input_is_parallel and not task.block_share:
-                    tp_size = (
-                        parallel_state.get_expert_tensor_parallel_world_size()
-                        if task.is_expert
-                        else parallel_state.get_tensor_model_parallel_world_size()
-                    )
-                    total_blocks = num_blocks_local * tp_size
-                    oft_r_tensor = torch.zeros(
-                        total_blocks, n_elements, device=torch.cuda.current_device(), dtype=param_dtype
-                    )
-                else:
-                    total_blocks = num_blocks_local
-                    oft_r_tensor = torch.zeros(
-                        total_blocks, n_elements, device=torch.cuda.current_device(), dtype=param_dtype
-                    )
+                receive_dtype, receive_device, receive_shape = receive_specs[task]
+                oft_r_tensor = torch.zeros(receive_shape, device=receive_device, dtype=receive_dtype)
 
             # ------------------------------------------------------------------
             # Step 2: broadcast from the owning PP rank to all other PP ranks
@@ -659,15 +1171,19 @@ class OrbitOFTExportMixin:
                     proj=dsv4_grouped_expert_projection,
                 )
                 dsv4_grouped_layer_match = _DSV4_GROUPED_EXPERT_OFT_LAYER_RE.search(task.global_base_prefix)
+                task_outputs: list[tuple[str, torch.Tensor]] = []
                 for expert_idx, current_oft_r in enumerate(expert_oft_r):
-                    if cpu:
-                        current_oft_r = current_oft_r.cpu()
                     if dsv4_grouped_layer_match is not None:
-                        hf_oft_name = (
-                            f"layers.{dsv4_grouped_layer_match.group('layer')}.ffn.experts."
-                            f"{expert_idx}.{dsv4_grouped_layer_match.group('proj')}.oft_R.weight"
+                        hf_oft_name = _dsv4_grouped_oft_name(
+                            layer=dsv4_grouped_layer_match.group("layer"),
+                            expert_idx=expert_idx,
+                            projection=dsv4_grouped_layer_match.group("proj"),
+                            export_format=export_format,
                         )
-                        yield HFWeightTuple(hf_oft_name, current_oft_r)
+                        task_outputs.append((hf_oft_name, current_oft_r))
+                for hf_oft_name, current_oft_r in _materialize_oft_task_outputs(task_outputs, cpu=cpu):
+                    emitted_names.append(hf_oft_name)
+                    yield HFWeightTuple(hf_oft_name, current_oft_r)
                 continue
 
             # CanonicalOFT grouped split FC1 (gate / up) — single 3D
@@ -675,19 +1191,16 @@ class OrbitOFTExportMixin:
             # EP-gather across the expert-parallel group, then emit one HF
             # tuple per global expert with the matching slice leaf
             # (``gate_proj`` / ``up_proj``).
-            is_canonical_split_grouped = (
-                task.slice_name is not None and task.expert_idx is None and oft_r_tensor.ndim == 3
-            )
+            is_canonical_split_grouped = task.grouped_expert_count is not None and task.slice_name is not None
             if is_canonical_split_grouped:
                 expert_oft_r = self._gather_dsv4_grouped_expert_oft_weight(
                     oft_r_tensor,
                     proj=None,
                 )
                 leaf = _CANONICAL_OFT_SLICE_TO_HF_LEAF[task.slice_name]
+                task_outputs = []
                 for expert_idx in range(expert_oft_r.shape[0]):
                     current_oft_r = expert_oft_r[expert_idx]
-                    if cpu:
-                        current_oft_r = current_oft_r.cpu()
                     base_hf_weight_names = self._get_base_hf_param_names_for_adapter(
                         mapping_registry,
                         task.global_base_prefix,
@@ -696,9 +1209,16 @@ class OrbitOFTExportMixin:
                     )
                     base_hf_weight_names = [name for name in base_hf_weight_names if f".{leaf}." in name]
                     for base_name in base_hf_weight_names:
-                        hf_oft_name = self._make_oft_param_name(base_name)
+                        hf_oft_name = self._make_oft_param_name(
+                            base_name,
+                            is_embedding=task.is_embedding,
+                            export_format=export_format,
+                        )
                         if hf_oft_name is not None:
-                            yield HFWeightTuple(hf_oft_name, current_oft_r)
+                            task_outputs.append((hf_oft_name, current_oft_r))
+                for hf_oft_name, current_oft_r in _materialize_oft_task_outputs(task_outputs, cpu=cpu):
+                    emitted_names.append(hf_oft_name)
+                    yield HFWeightTuple(hf_oft_name, current_oft_r)
                 continue
 
             is_dsv4_native_expert = _is_dsv4_native_expert_oft_base_prefix(task.global_base_prefix)
@@ -735,6 +1255,7 @@ class OrbitOFTExportMixin:
             # Step 4: map to HF names and yield (once per EP variant for native
             # per-expert tasks; a single pass otherwise)
             # ------------------------------------------------------------------
+            task_outputs = []
             for export_base_prefix, emit_oft_r in emit_variants:
                 for base_suffix in base_suffixes:
                     current_oft_r = emit_oft_r
@@ -743,9 +1264,6 @@ class OrbitOFTExportMixin:
                         current_oft_r = self._select_expert_adapter_weight(
                             emit_oft_r, expert_oft_r_gathered, expert_idx, num_moe_experts
                         )
-
-                    if cpu:
-                        current_oft_r = current_oft_r.cpu()
 
                     base_hf_weight_names = self._get_base_hf_param_names_for_adapter(
                         mapping_registry,
@@ -778,9 +1296,33 @@ class OrbitOFTExportMixin:
                     # shared-R OFT, the same rotation applies to every
                     # sub-projection – emit oft_r for each.
                     for base_name in base_hf_weight_names:
-                        hf_oft_name = self._make_oft_param_name(base_name)
+                        hf_oft_name = self._make_oft_param_name(
+                            base_name,
+                            is_embedding=task.is_embedding,
+                            export_format=export_format,
+                        )
                         if hf_oft_name is not None:
-                            yield HFWeightTuple(hf_oft_name, current_oft_r)
+                            task_outputs.append((hf_oft_name, current_oft_r))
+
+            for hf_oft_name, current_oft_r in _materialize_oft_task_outputs(task_outputs, cpu=cpu):
+                emitted_names.append(hf_oft_name)
+                yield HFWeightTuple(hf_oft_name, current_oft_r)
+
+        stream_error = None
+        if emitted_names != planned_names:
+            mismatch_index = next(
+                (
+                    index
+                    for index, (planned, emitted) in enumerate(zip(planned_names, emitted_names))
+                    if planned != emitted
+                ),
+                min(len(planned_names), len(emitted_names)),
+            )
+            stream_error = (
+                "emitted HF keys differ from the validated plan at index "
+                f"{mismatch_index} (planned_count={len(planned_names)}, emitted_count={len(emitted_names)})"
+            )
+        _distributed_error("OFT export stream verification", stream_error)
 
     # ------------------------------------------------------------------
     # OFT merge helpers
@@ -836,15 +1378,15 @@ class OrbitOFTExportMixin:
 
     def _merge_oft_adapter_weights(
         self,
-        megatron_model: List[MegatronModel],
-        converted_weights_dict: Dict[str, torch.Tensor],
+        megatron_model: list[MegatronModel],
+        converted_weights_dict: dict[str, torch.Tensor],
         oft_r: torch.Tensor,
         block_size: int,
         block_share: bool,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """Merge an OFT rotation into the base weights for HF export.
 
-        Applies ``W_merged = W @ R`` where R is the full block-diagonal orthogonal
+        Applies ``W_merged = W @ R.T`` where R is the full block-diagonal orthogonal
         matrix reconstructed from ``oft_r``.  For fused layers (QKV, gate/up) the same
         rotation is applied to every sub-projection weight in *converted_weights_dict*.
 
@@ -872,7 +1414,7 @@ class OrbitOFTExportMixin:
 
         for hf_name, base_weight in list(converted_weights_dict.items()):
             R_dev = R.to(base_weight.device, base_weight.dtype)
-            converted_weights_dict[hf_name] = base_weight @ R_dev
+            converted_weights_dict[hf_name] = base_weight @ R_dev.transpose(-1, -2)
 
         return converted_weights_dict
 
@@ -885,9 +1427,9 @@ class OrbitOFTExportMixin:
 # and exposes free-function entrypoints below.
 # ---------------------------------------------------------------------------
 
-_HF_OFT_SUFFIXES = (".oft_R.weight",)
+_HF_OFT_SUFFIXES = (".oft_R.weight", HF_OFT_EMBEDDING_SUFFIX)
 
-_OFT_BRIDGE_CLASS_CACHE: Dict[type, type] = {}
+_OFT_BRIDGE_CLASS_CACHE: dict[type, type] = {}
 
 
 def oft_export_bridge_for(auto_bridge) -> "MegatronModule":
@@ -940,33 +1482,62 @@ def export_oft_adapter_weights(
     )
 
 
-def infer_oft_target_modules(adapter_weight_names: Iterable[str]) -> List[str]:
-    """Derive HF ``target_modules`` from HF-format OFT adapter weight names."""
+def infer_oft_target_modules(adapter_weight_names: Iterable[str]) -> list[str]:
+    """Derive exact PEFT module paths from HF-format OFT adapter names.
+
+    Leaf-only targets (for example ``q_proj``) would broaden a layer-specific
+    Bridge adapter to every matching module in the HF model. PEFT accepts exact
+    paths, so preserve the entire path after its serialization-only prefix.
+    """
     modules: set[str] = set()
     for name in adapter_weight_names:
         for suffix in _HF_OFT_SUFFIXES:
             if name.endswith(suffix):
-                modules.add(name[: -len(suffix)].rsplit(".", 1)[-1])
+                module_name = name[: -len(suffix)]
+                if module_name.startswith("base_model.model."):
+                    module_name = module_name[len("base_model.model.") :]
+                if module_name:
+                    modules.add(module_name)
+                break
     return sorted(modules)
+
+
+def _installed_peft_version() -> str:
+    """Return a PEFT version compatible with Bridge's emitted parameterization."""
+
+    try:
+        version = importlib_metadata.version("peft")
+    except importlib_metadata.PackageNotFoundError as exc:
+        raise RuntimeError("HF OFT export requires the project's peft dependency") from exc
+
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        parsed = Version(version)
+    except InvalidVersion as exc:
+        raise RuntimeError(f"Cannot serialize an invalid installed peft version: {version!r}") from exc
+    if parsed < Version("0.18.0"):
+        raise RuntimeError(f"HF OFT export requires peft>=0.18.0 for Cayley-Neumann compatibility; found {version}")
+    return version
 
 
 def build_oft_adapter_config_dict(
     peft_config,
-    target_modules: List[str],
-    base_model_name_or_path: Optional[str] = None,
-) -> Dict[str, object]:
+    target_modules: list[str],
+    base_model_name_or_path: str | None = None,
+) -> dict[str, object]:
     """Build a HF-PEFT-compatible ``adapter_config.json`` dict for an OFT adapter.
 
-    Inherits every field from the megatron-bridge ``peft_config`` dataclass,
-    remaps Megatron names to HF names (``block_size`` → ``oft_block_size``) and
-    adds the HF boilerplate fields (``peft_type`` …) the dataclass lacks. The
-    result loads with ``peft.PeftModel.from_pretrained`` without depending on
-    the ``peft`` pip package here.
+    Bridge OFT objects also inherit matcher caches, checkpoint policy, and VLM
+    freeze controls. Serializing the dataclass wholesale leaks those private
+    fields into PEFT's schema, so construct the accepted PEFT 0.19 fields
+    explicitly.
     """
-    import dataclasses as _dataclasses
 
     def _json_sanitize(value):
         # JSON has no sets/tuples; normalize them anywhere in the tree.
+        if isinstance(value, Enum):
+            return value.value
         if isinstance(value, (set, frozenset)):
             return sorted(value)
         if isinstance(value, tuple):
@@ -977,30 +1548,145 @@ def build_oft_adapter_config_dict(
             return {k: _json_sanitize(v) for k, v in value.items()}
         return value
 
-    config: Dict[str, object] = {}
-    if _dataclasses.is_dataclass(peft_config):
-        config.update(_dataclasses.asdict(peft_config))
-
-    config["base_model_name_or_path"] = base_model_name_or_path or ""
-    # ``target_modules`` must be the HF-format names (q_proj, gate_proj, ...).
-    config["target_modules"] = target_modules
-    config.setdefault("task_type", "CAUSAL_LM")
-    config.setdefault("inference_mode", True)
-    config.setdefault("auto_mapping", None)
-    config.setdefault("revision", None)
-    config.setdefault("modules_to_save", None)
-
-    config["peft_type"] = "OFT"
-    if "block_size" in config:
-        config["oft_block_size"] = config.pop("block_size")
-    config.setdefault("num_cayley_neumann_terms", 5)
-    config.setdefault("use_cayley_neumann", True)
-    config.setdefault("init_weights", True)
-    config.setdefault("bias", "none")
-    config.setdefault("fan_in_fan_out", False)
-    config.setdefault("layers_pattern", None)
-    config.setdefault("layers_to_transform", None)
+    config: dict[str, object] = {
+        "task_type": "CAUSAL_LM",
+        "peft_type": "OFT",
+        "auto_mapping": None,
+        "peft_version": _installed_peft_version(),
+        "base_model_name_or_path": base_model_name_or_path or "",
+        "revision": None,
+        "inference_mode": True,
+        "r": int(getattr(peft_config, "r", 0)),
+        "oft_block_size": int(getattr(peft_config, "block_size", 0)),
+        "module_dropout": float(getattr(peft_config, "module_dropout", 0.0)),
+        "target_modules": list(target_modules),
+        "fan_in_fan_out": False,
+        "bias": "none",
+        # Exact target paths already encode Bridge's matcher selection. Carrying
+        # Bridge patterns or layer filters would apply a second, incompatible
+        # filter inside PEFT.
+        "exclude_modules": None,
+        "init_weights": True,
+        "layers_to_transform": None,
+        "layers_pattern": None,
+        "modules_to_save": None,
+        "coft": bool(getattr(peft_config, "coft", False)),
+        "eps": float(getattr(peft_config, "eps", 6e-5)),
+        "block_share": bool(getattr(peft_config, "block_share", False)),
+        "use_cayley_neumann": True,
+        "num_cayley_neumann_terms": 5,
+    }
     return _json_sanitize(config)
+
+
+def _validate_serialized_oft_state_geometry(
+    adapter_state: dict[str, torch.Tensor],
+    peft_config,
+) -> None:
+    """Validate final compact tensors against the one serialized PEFT config."""
+
+    configured_r = int(getattr(peft_config, "r", 0))
+    configured_block_size = int(getattr(peft_config, "block_size", 0))
+    block_share = bool(getattr(peft_config, "block_share", False))
+    if (configured_r > 0) == (configured_block_size > 0):
+        raise ValueError("exactly one of r and block_size must be positive")
+    for name, tensor in adapter_state.items():
+        if tensor.ndim != 2:
+            raise ValueError(f"{name!r} must be a 2D compact OFT tensor, got {tuple(tensor.shape)}")
+        if tensor.shape[0] < 1:
+            raise ValueError(f"{name!r} must contain at least one OFT block")
+        block_size = _infer_oft_block_size_from_n_elements(int(tensor.shape[-1]))
+        if block_size < 2:
+            raise ValueError(f"{name!r} encodes degenerate block_size={block_size}")
+        if configured_block_size > 0 and block_size != configured_block_size:
+            raise ValueError(
+                f"{name!r} encodes block_size={block_size}, not configured block_size={configured_block_size}"
+            )
+        expected_blocks = 1 if block_share else configured_r
+        if configured_r > 0 and int(tensor.shape[0]) != expected_blocks:
+            raise ValueError(
+                f"{name!r} contains {tensor.shape[0]} blocks, not the configured PEFT count {expected_blocks}"
+            )
+        if block_share and int(tensor.shape[0]) != 1:
+            raise ValueError(f"{name!r} is block-shared but stores {tensor.shape[0]} blocks")
+        if not torch.is_floating_point(tensor) or not bool(torch.isfinite(tensor).all().item()):
+            raise ValueError(f"{name!r} must contain finite floating-point values")
+
+
+def _run_rank0_stage(
+    stage: str,
+    *,
+    is_distributed: bool,
+    is_rank0: bool,
+    operation: Callable[[], None],
+) -> None:
+    """Run one filesystem stage on rank zero and broadcast its terminal result."""
+
+    outcome: dict[str, object] | None = None
+    if is_rank0:
+        try:
+            operation()
+            outcome = {"ok": True}
+        except Exception as exc:
+            outcome = {"ok": False, "error_type": type(exc).__name__, "message": str(exc)}
+
+    if is_distributed:
+        payload = [outcome]
+        torch.distributed.broadcast_object_list(payload, src=0)
+        outcome = payload[0]
+
+    if outcome is None:
+        raise RuntimeError(f"{stage} failed: rank-zero outcome was not broadcast")
+    if not outcome["ok"]:
+        message = f"{stage} failed: {outcome['error_type']}: {outcome['message']}"
+        if outcome["error_type"] == "FileExistsError":
+            raise FileExistsError(message)
+        raise RuntimeError(message)
+
+
+def _publish_hf_oft_adapter_directory(
+    save_dir,
+    adapter_state: dict[str, torch.Tensor],
+    adapter_config: dict[str, object],
+) -> None:
+    """Build both adapter files in a sibling and publish them together."""
+
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    save_dir = Path(save_dir)
+    if save_dir.exists() or save_dir.is_symlink():
+        raise FileExistsError(f"OFT adapter destination already exists: {save_dir}")
+    save_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(prefix=f".{save_dir.name}.oft-staging-", dir=str(save_dir.parent)))
+    published = False
+    try:
+        config_path = staging_dir / "adapter_config.json"
+        weights_path = staging_dir / "adapter_model.safetensors"
+        with config_path.open("w", encoding="utf-8") as config_file:
+            json.dump(adapter_config, config_file, indent=2, sort_keys=True)
+            config_file.write("\n")
+        save_file(adapter_state, str(weights_path))
+
+        with config_path.open(encoding="utf-8") as config_file:
+            if json.load(config_file) != adapter_config:
+                raise RuntimeError("staged adapter_config.json did not round-trip")
+        with safe_open(str(weights_path), framework="pt", device="cpu") as weights_file:
+            if set(weights_file.keys()) != set(adapter_state):
+                raise RuntimeError("staged safetensors keys do not match the export plan")
+
+        if save_dir.exists() or save_dir.is_symlink():
+            raise FileExistsError(f"OFT adapter destination appeared during export: {save_dir}")
+        os.rename(staging_dir, save_dir)
+        published = True
+    finally:
+        if not published:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def save_hf_oft_adapter(
@@ -1008,7 +1694,7 @@ def save_hf_oft_adapter(
     model,
     path,
     peft_config,
-    base_model_name_or_path: Optional[str] = None,
+    base_model_name_or_path: str | None = None,
     show_progress: bool = True,
 ) -> None:
     """Save OFT adapter weights as a HuggingFace PEFT-compatible directory.
@@ -1016,43 +1702,66 @@ def save_hf_oft_adapter(
     The output directory contains ``adapter_config.json`` and
     ``adapter_model.safetensors`` and loads directly with
     ``peft.PeftModel.from_pretrained(base_model, path)``. Peer of upstream's
-    ``AutoBridge.save_hf_adapter`` (which handles LoRA / DoRA).
+    ``AutoBridge.save_hf_adapter`` (which handles LoRA / DoRA). ``path`` must
+    not already exist: the complete directory is published in one rename so
+    readers cannot observe a config/weights pair from different exports.
     """
-    import json
     from pathlib import Path
 
     import torch.distributed as dist
-    from safetensors.torch import save_file
 
     is_distributed = dist.is_available() and dist.is_initialized()
     is_rank0 = (not is_distributed) or dist.get_rank() == 0
+    save_dir = Path(path)
 
-    if is_distributed:
-        dist.barrier()
+    def _check_destination() -> None:
+        if save_dir.exists() or save_dir.is_symlink():
+            raise FileExistsError(f"OFT adapter destination already exists: {save_dir}")
 
-    # The OFT exporter keeps tensors on GPU during the per-rank gather because
-    # it relies on collective broadcasts; non-rank0 ranks must still consume
-    # the generator to participate in the TP/PP/EP collectives.
-    adapter_state: Dict[str, torch.Tensor] = {}
+    _run_rank0_stage(
+        "OFT adapter destination preflight",
+        is_distributed=is_distributed,
+        is_rank0=is_rank0,
+        operation=_check_destination,
+    )
+
+    # Every rank must consume the generator to participate in TP/PP/EP
+    # collectives. Each task is copied to CPU under a coordinated error check
+    # before the exporter advances to the next task.
+    adapter_state: dict[str, torch.Tensor] = {}
+    seen_names: set[str] = set()
     for name, tensor in export_oft_adapter_weights(
         auto_bridge,
         model,
-        cpu=False,
+        cpu=True,
         show_progress=show_progress,
         export_format=OFTExportFormat.HF_PEFT,
     ):
+        final_name = f"base_model.model.{name}"
+        if final_name in seen_names:
+            raise RuntimeError(f"duplicate OFT adapter output key: {final_name}")
+        seen_names.add(final_name)
         if is_rank0:
-            adapter_state[f"base_model.model.{name}"] = tensor.detach().cpu()
+            # The exporter coordinates and completes each task's host copy
+            # before advancing to any later tensor collective.
+            adapter_state[final_name] = tensor.detach()
 
-    if is_rank0:
-        if not adapter_state:
-            raise RuntimeError(
-                "No adapter weights were found on the model. "
-                "Ensure the model has OFT adapters applied before calling save_hf_oft_adapter()."
-            )
+    if not seen_names:
+        raise RuntimeError(
+            "No adapter weights were found on the model. "
+            "Ensure the model has OFT adapters applied before calling save_hf_oft_adapter()."
+        )
 
-        save_dir = Path(path)
-        save_dir.mkdir(parents=True, exist_ok=True)
+    def _validate_and_publish() -> None:
+        nonlocal base_model_name_or_path
+
+        # Fused source modules intentionally emit one rotation under multiple
+        # HF keys. Materialize independent CPU storage because safetensors
+        # rejects aliases even when every logical key is valid.
+        for name, tensor in adapter_state.items():
+            adapter_state[name] = tensor.detach().to(device="cpu").contiguous().clone()
+        cpu_adapter_state = adapter_state
+        _validate_serialized_oft_state_geometry(cpu_adapter_state, peft_config)
 
         if base_model_name_or_path is None:
             hf_pretrained = getattr(auto_bridge, "hf_pretrained", None)
@@ -1060,16 +1769,19 @@ def save_hf_oft_adapter(
                 getattr(hf_pretrained, "model_name_or_path", None) or getattr(hf_pretrained, "name_or_path", "")
             )
 
-        target_modules = infer_oft_target_modules(adapter_state.keys())
+        target_modules = infer_oft_target_modules(cpu_adapter_state.keys())
+        if not target_modules:
+            raise RuntimeError("exported weights contain no recognized OFT adapter keys")
         adapter_config = build_oft_adapter_config_dict(
             peft_config,
             target_modules=target_modules,
             base_model_name_or_path=base_model_name_or_path,
         )
-        with open(save_dir / "adapter_config.json", "w") as f:
-            json.dump(adapter_config, f, indent=2, sort_keys=True)
+        _publish_hf_oft_adapter_directory(save_dir, cpu_adapter_state, adapter_config)
 
-        save_file(adapter_state, str(save_dir / "adapter_model.safetensors"))
-
-    if is_distributed:
-        dist.barrier()
+    _run_rank0_stage(
+        "OFT adapter publication",
+        is_distributed=is_distributed,
+        is_rank0=is_rank0,
+        operation=_validate_and_publish,
+    )
