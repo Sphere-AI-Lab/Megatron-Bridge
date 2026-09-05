@@ -26,10 +26,9 @@ from typing import Any, Dict
 import torch
 
 
-# Canonical INT4 checkpoint triplet suffixes -- the single source of truth every
-# INT4 checkpoint reader/writer in orbit should use instead of hand-spelling
-# these strings (see docs/orbit/MIGRATION_MEMORY.md for why: this exact class of
-# drift risk already caused two real bugs in the FP8/NVFP4 equivalents).
+# Canonical INT4 checkpoint triplet suffixes. All Orbit INT4 checkpoint
+# readers and writers should use these instead of spelling the strings
+# independently.
 INT4_PACKED_SUFFIX = "_packed"
 INT4_SCALE_SUFFIX = "_scale"
 INT4_SHAPE_SUFFIX = "_shape"

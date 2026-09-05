@@ -292,12 +292,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     oft.add_argument(
         "--oft-type",
         choices=("canonical_oft", "oft"),
-        default="canonical_oft",
-        help="canonical_oft (default): independent rotations per Q/K/V and per gate/up, "
+        default="oft",
+        help="oft (default): one rotation for each matched fused projection. "
+        "canonical_oft: experimental independent rotations per Q/K/V and per gate/up, "
         "on BF16 and quantized bases alike, grouped experts included (the base weight "
         "is dequantized for the split GEMMs, with autograd hooks keeping only the "
-        "low-bit handle). oft: the legacy shared-R class, one rotation for the whole "
-        "fused projection.",
+        "low-bit handle).",
     )
     oft.add_argument("--block-size", type=int, default=32)
     oft.add_argument("--coft", action="store_true", default=False)
@@ -372,9 +372,9 @@ def _fill_arch_defaults(args, spec: dict, *, world_size: int | None = None) -> N
 def build_oft(args, spec: dict):
     """Build the OFT adapter for a quantized base model.
 
-    ``--oft-type canonical_oft`` (the default) attaches independent rotations to
-    each of Q/K/V and to gate/up. ``--oft-type oft`` selects the legacy class,
-    which applies one shared rotation to the whole fused projection.
+    ``--oft-type oft`` (the default) applies one rotation to each matched fused
+    projection. ``--oft-type canonical_oft`` explicitly opts into independent
+    rotations for Q/K/V and gate/up.
     """
     kwargs = {
         "block_size": args.block_size,

@@ -15,8 +15,6 @@ from megatron.core import dist_checkpointing
 from megatron.core.transformer import MegatronModule
 from modelopt.torch.opt.plugins import restore_modelopt_state, save_sharded_modelopt_state
 
-from megatron.bridge.utils.common_utils import print_rank_0
-
 
 def _save_sharded_modelopt_state_with_async_strategy(
     model: list[torch.nn.Module],
@@ -112,7 +110,7 @@ def restore_sharded_modelopt_state_via_common_reader(
         return
 
     common_modelopt_state = dist_checkpointing.load_common_state_dict(modelopt_checkpoint_name)
-    print_rank_0(f"nvidia-modelopt ckpt version: {common_modelopt_state.get('modelopt_version')}")
+    print(f"nvidia-modelopt ckpt version: {common_modelopt_state.get('modelopt_version')}")
 
     model[0] = mto.restore_from_modelopt_state(model[0], common_modelopt_state)
     _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name, prefix, metadata=metadata)

@@ -14,12 +14,10 @@
 
 """CanonicalOFT — per-projection input rotations on Megatron's fused QKV / FC1.
 
-Unlike the legacy ``OFT`` class (one shared rotation R for the fused linear_qkv),
-CanonicalOFT attaches three independent rotations (R_q, R_k, R_v) and applies
-each to its own projection slice. This is the only correct OFT semantics for
-fused projections, and is what ``--oft-type canonical_oft`` -- the default on
-both orbit launchers -- selects. ``--oft-type oft`` opts back into the legacy
-class.
+Unlike ``OFT`` (one rotation R for a matched fused ``linear_qkv``), CanonicalOFT
+attaches three independent rotations (R_q, R_k, R_v) and applies each to its own
+projection slice. It is an explicit ``--oft-type canonical_oft`` opt-in while
+support for every fused QKV layout is completed.
 """
 
 import logging
@@ -34,6 +32,7 @@ from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
 )
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 from megatron.bridge.orbit.oft.oft import _SplitLNOFTLinear
 from megatron.bridge.orbit.oft.oft_layers import (
@@ -55,9 +54,10 @@ from megatron.bridge.utils.import_utils import safe_import_from
 
 
 try:
-    from megatron.bridge.orbit.oft.triton_oft import oft_r_by_expert
+    from megatron.bridge.orbit.oft.triton_oft import oft_r_by_expert, segmented_oft_linear
 except ImportError:
     oft_r_by_expert = None
+    segmented_oft_linear = None
 
 
 logger = logging.getLogger(__name__)
@@ -174,17 +174,17 @@ def _dequantize_single_weight_base(module: nn.Module, dtype: torch.dtype):
     return None
 
 
-def _single_weight_dequant_hooks(w_ptr: int, rebuild) -> torch.autograd.graph.saved_tensors_hooks:
+def _single_weight_dequant_hooks(w_storage_ptr: int, rebuild) -> torch.autograd.graph.saved_tensors_hooks:
     """saved_tensors_hooks that swap one dequantized weight for its rebuild handle.
 
-    ``pack`` recognizes the transient dequantized copy by data pointer and hands
-    autograd the closure instead, so the BF16 copy dies with the forward frame;
-    ``unpack`` re-dequantizes during backward and restores whatever view autograd
-    had saved. Same discipline as OFTLinear's per-format forwards.
+    ``pack`` recognizes any view of the transient dequantized copy by its base
+    storage pointer and hands autograd the closure instead, so the BF16 copy dies
+    with the forward frame. ``unpack`` re-dequantizes during backward and restores
+    the exact view autograd saved. Same discipline as OFTLinear's per-format forwards.
     """
 
     def pack(tensor: torch.Tensor):
-        if tensor.data_ptr() == w_ptr:
+        if tensor.untyped_storage().data_ptr() == w_storage_ptr:
             return (
                 _DEQUANT_HANDLE_TAG,
                 rebuild,
@@ -444,7 +444,7 @@ class OFTLinearSplitFC1UpGate(nn.Module):
             return self._forward_with_weight(x, self.to_wrap.weight)
         w_compute, rebuild = dequant
         try:
-            with _single_weight_dequant_hooks(w_compute.data_ptr(), rebuild):
+            with _single_weight_dequant_hooks(w_compute.untyped_storage().data_ptr(), rebuild):
                 if not self._adapter_enabled:
                     return _fused_base_linear(self.to_wrap, x.contiguous(), w_compute)
                 return self._forward_with_weight(x, w_compute)
@@ -1419,8 +1419,7 @@ class OFTLinearGroupedSplitFC1UpGate(nn.Module):
 
 
 class OFTLinearSplitQKV(nn.Module):
-    """Wraps a fused ``linear_qkv`` with three independent input rotations applied
-    per Q/K/V slice in Megatron's GQA-interleaved layout."""
+    """Apply independent Q/gate/K/V rotations to a fused GQA projection."""
 
     def __init__(
         self,
@@ -1456,100 +1455,99 @@ class OFTLinearSplitQKV(nn.Module):
             )
 
         self.adapter_q = _make_R()
+        if getattr(provider, "attention_output_gate", False):
+            self.adapter_gate = _make_R()
         self.adapter_k = _make_R()
         self.adapter_v = _make_R()
+        adapter_names = ["q"]
+        if hasattr(self, "adapter_gate"):
+            adapter_names.append("gate")
+        adapter_names.extend(("k", "v"))
+        self._adapter_names = tuple(adapter_names)
+
+        head_size = provider.kv_channels or (provider.hidden_size // provider.num_attention_heads)
+        heads_per_group = provider.num_attention_heads // provider.num_query_groups
+        rows_per_group = (heads_per_group + 2) * head_size
+        if getattr(provider, "attention_output_gate", False):
+            rows_per_group += heads_per_group * head_size
+        global_packed_dim = provider.num_query_groups * rows_per_group
+        tp_group = getattr(orig_module, "tp_group", None) or getattr(orig_module, "_tp_group", None)
+        tp_size = get_pg_size(tp_group)
+        if global_packed_dim % tp_size != 0:
+            raise ValueError(f"linear_qkv global packed dim {global_packed_dim} is not divisible by TP={tp_size}")
+        self._packed_dim = global_packed_dim // tp_size
+        self._segments = tuple(self._qkv_weight_segments(self._packed_dim))
+        rotation_index = {name: index for index, name in enumerate(self._adapter_names)}
+        self.register_buffer(
+            "_segment_offsets",
+            torch.tensor([0, *(end for _, _, end in self._segments)], dtype=torch.int32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_rotation_ids",
+            torch.tensor([rotation_index[name] for name, _, _ in self._segments], dtype=torch.int32),
+            persistent=False,
+        )
         self._adapter_enabled = True
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         return _split_wrapper_sharded_state_dict(self, prefix, sharded_offsets, metadata)
 
-    def _packed_qkv_layout(self, packed_dim: int) -> tuple[int, int, int]:
-        """Infer the local packed-QKV layout from the tensor's packed width.
+    def _qkv_weight_segments(self, packed_dim: int) -> list[tuple[str, int, int]]:
+        """Return local contiguous row segments tagged with their logical adapter.
 
-        Megatron stores ``linear_qkv`` output rows sharded by tensor parallelism.
-        On Qwen3-30B-A3B with TP=4, for example, a local shard contains one GQA
-        group (8 Q heads + K + V), not all four global GQA groups.  The converter
-        helper splits global tensors, so CanonicalOFT needs a local split here.
+        MCore shards the globally interleaved QKV rows as one contiguous interval
+        per TP rank. Intersecting that interval with global projection spans keeps
+        partial Q/gate/K/V fragments separate without gathering.
         """
         cfg = self._provider
         head_num = cfg.num_attention_heads
         num_query_groups = cfg.num_query_groups
         head_size = cfg.kv_channels or (cfg.hidden_size // head_num)
         heads_per_group = head_num // num_query_groups
-
-        if packed_dim % head_size != 0:
-            raise ValueError(f"linear_qkv packed dim {packed_dim} must be divisible by head_size={head_size}")
-
         has_output_gate = getattr(cfg, "attention_output_gate", False)
-        units_per_group = (2 * heads_per_group + 2) if has_output_gate else (heads_per_group + 2)
-        packed_units = packed_dim // head_size
-        if packed_units % units_per_group != 0:
+        spans: list[tuple[str, int, int]] = []
+        cursor = 0
+        for _ in range(num_query_groups):
+            for slice_name, rows in (
+                ("q", heads_per_group * head_size),
+                ("gate", heads_per_group * head_size if has_output_gate else 0),
+                ("k", head_size),
+                ("v", head_size),
+            ):
+                if rows:
+                    spans.append((slice_name, cursor, cursor + rows))
+                    cursor += rows
+
+        tp_group = getattr(self.to_wrap, "tp_group", None) or getattr(self.to_wrap, "_tp_group", None)
+        tp_size = get_pg_size(tp_group)
+        tp_rank = get_pg_rank(tp_group)
+        if cursor % tp_size != 0 or packed_dim != cursor // tp_size:
             raise ValueError(
-                f"Cannot infer local QKV layout: packed_units={packed_units} is not divisible by "
-                f"units_per_group={units_per_group} (heads_per_group={heads_per_group}, "
-                f"num_query_groups={num_query_groups})."
+                f"linear_qkv local packed dim {packed_dim} does not match global packed dim "
+                f"{cursor} sharded across TP={tp_size}"
             )
 
-        local_query_groups = packed_units // units_per_group
-        if local_query_groups <= 0 or local_query_groups > num_query_groups:
-            raise ValueError(
-                f"Invalid local QKV group count {local_query_groups}; global num_query_groups={num_query_groups}"
-            )
-
-        return local_query_groups, heads_per_group, head_size
-
-    def _split_qkv_weight(self, W: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        local_query_groups, heads_per_group, head_size = self._packed_qkv_layout(W.shape[0])
-        in_features = W.shape[1]
-        has_output_gate = getattr(self._provider, "attention_output_gate", False)
-        units_per_group = (2 * heads_per_group + 2) if has_output_gate else (heads_per_group + 2)
-        qkv = W.reshape(local_query_groups, units_per_group, head_size, in_features)
-        q = qkv[:, :heads_per_group].reshape(-1, in_features)
-        if has_output_gate:
-            gate = qkv[:, heads_per_group : 2 * heads_per_group].reshape(-1, in_features)
-            q = torch.cat([q, gate], dim=0)
-        k = qkv[:, -2:-1].reshape(-1, in_features)
-        v = qkv[:, -1:].reshape(-1, in_features)
-        return q, k, v
-
-    def _interleave_qkv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Reassemble [Q,K,V] in Megatron's per-query-group interleaved layout."""
-        cfg = self._provider
-        head_num = cfg.num_attention_heads
-        num_query_groups = cfg.num_query_groups
-        head_size = cfg.kv_channels or (cfg.hidden_size // head_num)
-        heads_per_group = head_num // num_query_groups
-
-        has_output_gate = getattr(cfg, "attention_output_gate", False)
-        q_width = q.shape[-1] // 2 if has_output_gate else q.shape[-1]
-        local_head_num = q_width // head_size
-        local_query_groups = k.shape[-1] // head_size
-        if (
-            q_width % head_size != 0
-            or k.shape[-1] % head_size != 0
-            or v.shape[-1] % head_size != 0
-            or v.shape[-1] != k.shape[-1]
-            or local_query_groups <= 0
-            or local_head_num != local_query_groups * heads_per_group
-        ):
-            raise ValueError(
-                f"Cannot interleave local QKV outputs: q={tuple(q.shape)}, k={tuple(k.shape)}, "
-                f"v={tuple(v.shape)}, head_size={head_size}, heads_per_group={heads_per_group}"
-            )
-
-        leading_shape = q.shape[:-1]
-        if has_output_gate:
-            q, gate = q.split(q_width, dim=-1)
-            gate = gate.reshape(-1, local_query_groups, heads_per_group, head_size)
-        q = q.reshape(-1, local_query_groups, heads_per_group, head_size)
-        k = k.reshape(-1, local_query_groups, 1, head_size)
-        v = v.reshape(-1, local_query_groups, 1, head_size)
-        pieces = [q, gate, k, v] if has_output_gate else [q, k, v]
-        return torch.cat(pieces, dim=2).reshape(*leading_shape, -1)
+        shard_start = tp_rank * packed_dim
+        shard_end = shard_start + packed_dim
+        local_segments: list[tuple[str, int, int]] = []
+        for slice_name, span_start, span_end in spans:
+            start = max(shard_start, span_start)
+            end = min(shard_end, span_end)
+            if start >= end:
+                continue
+            local_start = start - shard_start
+            local_end = end - shard_start
+            if local_segments and local_segments[-1][0] == slice_name and local_segments[-1][2] == local_start:
+                previous_name, previous_start, _ = local_segments[-1]
+                local_segments[-1] = (previous_name, previous_start, local_end)
+            else:
+                local_segments.append((slice_name, local_start, local_end))
+        return local_segments
 
     def _fused_fast_path_supported(self) -> bool:
-        """Q/K/V rotation banks must agree on dtype, block_size, num_blocks."""
-        return _oft_fast_path_supported([self.adapter_q, self.adapter_k, self.adapter_v])
+        """All logical rotation banks must share the segmented-kernel contract."""
+        return _oft_fast_path_supported([getattr(self, f"adapter_{name}") for name in self._adapter_names])
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
         # Quantized fused base: dequantize once (the same cost the retired
@@ -1562,7 +1560,7 @@ class OFTLinearSplitQKV(nn.Module):
             return self._forward_with_weight(x, self.to_wrap.weight)
         w_compute, rebuild = dequant
         try:
-            with _single_weight_dequant_hooks(w_compute.data_ptr(), rebuild):
+            with _single_weight_dequant_hooks(w_compute.untyped_storage().data_ptr(), rebuild):
                 if not self._adapter_enabled:
                     return _fused_base_linear(self.to_wrap, x.contiguous(), w_compute)
                 return self._forward_with_weight(x, w_compute)
@@ -1570,46 +1568,35 @@ class OFTLinearSplitQKV(nn.Module):
             del w_compute
 
     def _forward_with_weight(self, x: torch.Tensor, W: torch.Tensor):
-        W_q, W_k, W_v = self._split_qkv_weight(W)
-
         x = _prepare_split_column_parallel_input(self.to_wrap, x).contiguous()
         bias = getattr(self.to_wrap, "bias", None)
+        if W.shape[0] != self._packed_dim:
+            raise ValueError(
+                f"linear_qkv local packed dim {W.shape[0]} does not match configured dim {self._packed_dim}"
+            )
+        adapters = [getattr(self, f"adapter_{name}") for name in self._adapter_names]
 
         if self._fused_fast_path_supported():
-            R = _compute_oft_rotation_bank([self.adapter_q, self.adapter_k, self.adapter_v])
-            # Match eager OFTRotationModule.forward dtype contract: rotation runs
-            # in oft_r.dtype, then the result is cast back to x.dtype.
-            required_dtype = x.dtype
-            if R.dtype != x.dtype:
-                x_for_einsum = x.to(R.dtype)
+            R = _compute_oft_rotation_bank(adapters)
+            if segmented_oft_linear is not None:
+                out = segmented_oft_linear(
+                    x,
+                    W,
+                    R,
+                    self._segment_offsets,
+                    self._rotation_ids,
+                )
             else:
-                x_for_einsum = x
-            x_stack = _apply_precomputed_oft_rotation_to_x(x_for_einsum, R).to(required_dtype)
-            # x_stack: (3, M, K). Slot 0 is Q (Q_out != K_out under GQA); slots
-            # 1-2 are K and V which share the per-group KV dim. W_k and W_v are
-            # *not* contiguous halves of W (they come from _split_qkv_weight's
-            # reshape-and-slice over the per-group-interleaved layout), so the
-            # KV bmm must use torch.stack — there is no zero-copy view path here.
-            out_q = F.linear(x_stack[0], W_q)
-            if W_k.shape[0] == W_v.shape[0]:
-                W_kv_stack = torch.stack([W_k, W_v], dim=0)
-                kv_out = _batched_equal_output_linear_with_bias(x_stack[1:3], W_kv_stack, None)
-                out_k, out_v = kv_out.chunk(2, dim=-1)
-            else:
-                # Defensive fallback: should not happen under canonical Megatron
-                # GQA layouts, but preserves correctness if a non-GQA exotic
-                # config emits unequal K and V output sizes.
-                out_k = F.linear(x_stack[1], W_k)
-                out_v = F.linear(x_stack[2], W_v)
-            out = self._interleave_qkv(out_q, out_k, out_v)
+                required_dtype = x.dtype
+                x_for_einsum = x.to(R.dtype) if R.dtype != x.dtype else x
+                x_stack = _apply_precomputed_oft_rotation_to_x(x_for_einsum, R).to(required_dtype)
+                rotated_inputs = {name: x_stack[index] for index, name in enumerate(self._adapter_names)}
+                outputs = [F.linear(rotated_inputs[name], W[start:end]) for name, start, end in self._segments]
+                out = torch.cat(outputs, dim=-1)
         else:
-            x_q = self.adapter_q(x)
-            x_k = self.adapter_k(x)
-            x_v = self.adapter_v(x)
-            out_q = F.linear(x_q, W_q)
-            out_k = F.linear(x_k, W_k)
-            out_v = F.linear(x_v, W_v)
-            out = self._interleave_qkv(out_q, out_k, out_v)
+            rotated_inputs = {name: getattr(self, f"adapter_{name}")(x) for name in self._adapter_names}
+            outputs = [F.linear(rotated_inputs[name], W[start:end]) for name, start, end in self._segments]
+            out = torch.cat(outputs, dim=-1)
 
         if bias is not None and not getattr(self.to_wrap, "skip_bias_add", False):
             return out + bias, None
@@ -1940,14 +1927,7 @@ class CanonicalOFT(OrbitPEFTMixin, PEFT, ModuleMatcher):
 
 @dataclass
 class CanonicalOFTMerge(OrbitPEFTMixin, PEFT):
-    """Folds per-projection R's into the fused W_qkv / W_fc1.
-
-    ``split_qkv_weights`` returns a row-gather (built via
-    ``torch.cat([torch.arange(...)])`` — see ``param_mapping.py:2639``), so it
-    is *not* a contiguous view of W_qkv. We compute the merged slices
-    out-of-place and re-interleave back into ``W_qkv.data`` via the same
-    per-group layout ``_interleave_qkv`` uses at forward time.
-    """
+    """Folds each projection's rotation into its local fused-weight row spans."""
 
     @torch.no_grad()
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
@@ -1963,33 +1943,15 @@ class CanonicalOFTMerge(OrbitPEFTMixin, PEFT):
     @torch.no_grad()
     def _merge_qkv(wrapper: OFTLinearSplitQKV) -> None:
         W = wrapper.to_wrap.weight
-        W_q, W_k, W_v = wrapper._split_qkv_weight(W)
         # OFTRotationModule.forward applies rotation as ``x @ R``. For
         # ``F.linear(x, W_merged) == F.linear(x @ R, W)`` we need
         # ``W_merged = W @ R.T`` (so ``x @ W_merged.T = x @ R @ W.T``).
-        R_q = wrapper.adapter_q.get_delta_weight().to(W.device, W.dtype)
-        R_k = wrapper.adapter_k.get_delta_weight().to(W.device, W.dtype)
-        R_v = wrapper.adapter_v.get_delta_weight().to(W.device, W.dtype)
-
-        W_q_merged = W_q @ R_q.T
-        W_k_merged = W_k @ R_k.T
-        W_v_merged = W_v @ R_v.T
-
-        local_query_groups, heads_per_group, head_size = wrapper._packed_qkv_layout(W.shape[0])
-        local_head_num = local_query_groups * heads_per_group
-        in_features = W.shape[1]
-
-        W_q_merged = W_q_merged.reshape(local_head_num, head_size, in_features)
-        W_k_merged = W_k_merged.reshape(local_query_groups, head_size, in_features)
-        W_v_merged = W_v_merged.reshape(local_query_groups, head_size, in_features)
-
-        chunks = []
-        for i in range(local_query_groups):
-            chunks.append(W_q_merged[i * heads_per_group : (i + 1) * heads_per_group])
-            chunks.append(W_k_merged[i : i + 1])
-            chunks.append(W_v_merged[i : i + 1])
-        W_new = torch.cat(chunks, dim=0).reshape(-1, in_features)
-        wrapper.to_wrap.weight.data.copy_(W_new)
+        rotations = {
+            name: getattr(wrapper, f"adapter_{name}").get_delta_weight().to(W.device, W.dtype)
+            for name in wrapper._adapter_names
+        }
+        for name, start, end in wrapper._qkv_weight_segments(W.shape[0]):
+            W[start:end].copy_(W[start:end] @ rotations[name].T)
 
     @staticmethod
     @torch.no_grad()

@@ -436,12 +436,8 @@ def build_int4_direct_model_state_dict(
             add_tensor_entry(
                 model_state, f"{task.param_name}{INT4_PACKED_SUFFIX}", packed, spill_manager=spill_manager
             )
-            add_tensor_entry(
-                model_state, f"{task.param_name}{INT4_SCALE_SUFFIX}", scale, spill_manager=spill_manager
-            )
-            add_tensor_entry(
-                model_state, f"{task.param_name}{INT4_SHAPE_SUFFIX}", shape, spill_manager=spill_manager
-            )
+            add_tensor_entry(model_state, f"{task.param_name}{INT4_SCALE_SUFFIX}", scale, spill_manager=spill_manager)
+            add_tensor_entry(model_state, f"{task.param_name}{INT4_SHAPE_SUFFIX}", shape, spill_manager=spill_manager)
             num_int4 += 1
         else:
             hf_weights = int4_bridge.maybe_modify_loaded_hf_weight(

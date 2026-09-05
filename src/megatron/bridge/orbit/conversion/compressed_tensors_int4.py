@@ -67,7 +67,11 @@ import torch
 
 from megatron.bridge.orbit.quant.int4_utils import (
     INT4_PACKED_SUFFIX as _PACKED_SUFFIX,
+)
+from megatron.bridge.orbit.quant.int4_utils import (
     INT4_SCALE_SUFFIX as _SCALE_SUFFIX,
+)
+from megatron.bridge.orbit.quant.int4_utils import (
     INT4_SHAPE_SUFFIX as _SHAPE_SUFFIX,
 )
 

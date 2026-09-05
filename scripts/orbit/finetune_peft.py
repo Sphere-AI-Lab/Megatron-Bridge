@@ -106,9 +106,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     oft.add_argument(
         "--oft-type",
         choices=("canonical_oft", "oft"),
-        default="canonical_oft",
-        help="canonical_oft (default): independent rotations per Q/K/V and per gate/up. "
-        "oft: the legacy shared-R class, one rotation for the whole fused projection.",
+        default="oft",
+        help="oft (default): one rotation for each matched fused projection. "
+        "canonical_oft: experimental independent rotations per Q/K/V and per gate/up.",
     )
     oft.add_argument("--block-size", type=int, default=32)
     oft.add_argument("--coft", action="store_true", default=False)

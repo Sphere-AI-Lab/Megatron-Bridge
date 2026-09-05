@@ -24,7 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
-from megatron.bridge.orbit.oft.triton_oft.sgemm_oft_r import OFT_SMEM_BUDGET, _PIPELINE_STAGES
+from megatron.bridge.orbit.oft.triton_oft.sgemm_oft_r import _PIPELINE_STAGES, OFT_SMEM_BUDGET
 
 
 # Same H100 shared-memory concern as the forward kernel (sgemm_oft_r.py): the
