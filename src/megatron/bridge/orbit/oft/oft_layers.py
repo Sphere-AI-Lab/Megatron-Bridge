@@ -49,10 +49,172 @@ _OFT_NVFP4_DEBUG_LIMIT_ENV = "MBRIDGE_OFT_NVFP4_DEBUG_LIMIT"
 _OFT_FP8_DEBUG_ENV = "MBRIDGE_OFT_FP8_DEBUG"
 _OFT_FP8_DEBUG_LIMIT_ENV = "MBRIDGE_OFT_FP8_DEBUG_LIMIT"
 _OFT_APPLIED_TRAP_ENV = "MEGATRON_OFT_APPLIED_TRAP"
+_OFT_DENSE_TRAIN_MATERIALIZATION_ENV = "MEGATRON_OFT_MATERIALIZE_DENSE"
 
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _oft_dense_train_materialization_enabled() -> bool:
+    return _env_flag(_OFT_DENSE_TRAIN_MATERIALIZATION_ENV)
+
+
+def _materialize_oft_weight(weight: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
+    """Fold a block-diagonal OFT rotation into a frozen dense weight.
+
+    ``OFTRotationModule`` applies ``x @ R`` and the base projection then applies
+    ``W``.  The equivalent dense projection is therefore ``W @ R.T``.  Keeping
+    ``R`` in block form avoids constructing a full ``K x K`` matrix.
+    """
+    if weight.ndim != 2 or rotation.ndim != 3:
+        raise ValueError(
+            "OFT dense materialization expects weight=(H,K) and "
+            f"rotation=(num_blocks,block,block), got {weight.shape} and {rotation.shape}"
+        )
+    num_blocks, block_size, block_size_ = rotation.shape
+    if block_size != block_size_ or weight.shape[1] != num_blocks * block_size:
+        raise ValueError(
+            f"Incompatible OFT dense materialization shapes: weight={weight.shape}, "
+            f"rotation={rotation.shape}"
+        )
+
+    weight_blocks = weight.reshape(weight.shape[0], num_blocks, block_size)
+    return torch.einsum("hrc,rkc->hrk", weight_blocks, rotation).reshape_as(weight)
+
+
+class _MaterializedOFTLinearBank(torch.autograd.Function):
+    """Dense-forward, adapter-only-backward OFT for one or more output slices.
+
+    Differentiating ``F.linear(x, materialized_weight)`` forms a full dense
+    effective-weight gradient just to propagate it to the rotations. This
+    function materializes only for forward; backward uses the original
+    ``x @ R -> linear(W)`` factorization to compute input and rotation gradients
+    without forming that dense weight gradient.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        rotations: torch.Tensor,
+        output_sizes: tuple[int, ...],
+    ) -> torch.Tensor:
+        output_sizes = tuple(int(size) for size in output_sizes)
+        if weight.requires_grad:
+            raise ValueError("OFT dense train materialization requires a frozen base weight")
+        if rotations.ndim != 4 or len(output_sizes) != rotations.shape[0]:
+            raise ValueError(
+                "OFT rotation bank must have one entry per output slice: "
+                f"rotations={rotations.shape}, output_sizes={output_sizes}"
+            )
+        if sum(output_sizes) != weight.shape[0]:
+            raise ValueError(
+                f"OFT output sizes {output_sizes} do not cover weight rows {weight.shape[0]}"
+            )
+
+        effective_weight = torch.cat(
+            [
+                _materialize_oft_weight(weight_slice, rotation)
+                for weight_slice, rotation in zip(
+                    weight.split(output_sizes, dim=0), rotations
+                )
+            ],
+            dim=0,
+        )
+        ctx.output_sizes = output_sizes
+        ctx.save_for_backward(x, weight, rotations)
+        return F.linear(x, effective_weight)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x, weight, rotations = ctx.saved_tensors
+        output_sizes = ctx.output_sizes
+        num_blocks = rotations.shape[1]
+        block_size = rotations.shape[2]
+        x_blocks = x.reshape(-1, num_blocks, block_size)
+
+        need_x = ctx.needs_input_grad[0]
+        need_rotations = ctx.needs_input_grad[2]
+        grad_x_blocks = torch.zeros_like(x_blocks) if need_x else None
+        grad_rotations = [] if need_rotations else None
+
+        for index, (grad_slice, weight_slice) in enumerate(
+            zip(
+                grad_output.split(output_sizes, dim=-1),
+                weight.split(output_sizes, dim=0),
+            )
+        ):
+            grad_rotated = F.linear(grad_slice, weight_slice.T)
+            grad_rotated_blocks = grad_rotated.reshape(-1, num_blocks, block_size)
+            if grad_x_blocks is not None:
+                grad_x_blocks.add_(
+                    torch.einsum(
+                        "mrc,rkc->mrk",
+                        grad_rotated_blocks,
+                        rotations[index],
+                    )
+                )
+            if grad_rotations is not None:
+                grad_rotations.append(
+                    torch.einsum(
+                        "mrk,mrc->rkc",
+                        x_blocks,
+                        grad_rotated_blocks,
+                    )
+                )
+
+        grad_x = grad_x_blocks.reshape_as(x) if grad_x_blocks is not None else None
+        grad_rotation_bank = (
+            torch.stack(grad_rotations, dim=0) if grad_rotations is not None else None
+        )
+        return grad_x, None, grad_rotation_bank, None
+
+
+def _materialized_oft_linear_bank(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rotations: torch.Tensor,
+    output_sizes: tuple[int, ...],
+) -> torch.Tensor:
+    return _MaterializedOFTLinearBank.apply(x, weight, rotations, output_sizes)
+
+
+def _can_materialize_oft_train(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rotations: torch.Tensor,
+) -> bool:
+    """Return whether the opt-in dense train path preserves this call's contract."""
+    return (
+        _oft_dense_train_materialization_enabled()
+        and isinstance(weight, torch.Tensor)
+        and isinstance(rotations, torch.Tensor)
+        and weight.ndim == 2
+        and rotations.ndim == 4
+        and not weight.requires_grad
+        and x.is_floating_point()
+        and x.dtype == weight.dtype == rotations.dtype
+        and x.device == weight.device == rotations.device
+        and x.shape[-1] == weight.shape[1]
+        and weight.shape[1] == rotations.shape[1] * rotations.shape[2]
+        and rotations.shape[2] == rotations.shape[3]
+    )
+
+
+_OFT_DENSE_TRAIN_MATERIALIZATION_LOGGED = False
+
+
+def _log_oft_dense_train_materialization_once() -> None:
+    global _OFT_DENSE_TRAIN_MATERIALIZATION_LOGGED
+    if _OFT_DENSE_TRAIN_MATERIALIZATION_LOGGED:
+        return
+    _OFT_DENSE_TRAIN_MATERIALIZATION_LOGGED = True
+    logger.warning(
+        "event=oft_dense_train_materialization_enabled env=%s",
+        _OFT_DENSE_TRAIN_MATERIALIZATION_ENV,
+    )
 
 
 def _oft_applied_trap_enabled() -> bool:
@@ -1151,8 +1313,85 @@ class OFTLinear(AdapterWrapper):
         )
         logger.warning("%s", message)
 
+    def _can_use_dense_train_materialization(
+        self,
+        x: torch.Tensor,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> bool:
+        if not _oft_dense_train_materialization_enabled() or not self._adapter_enabled:
+            return False
+        if args or kwargs or self._weight_names != ["weight"]:
+            return False
+        if self._base_fp8 or self._is_base_fp8() or self._base_int4 or self._base_nvfp4 or self._base_nvfp4_grouped:
+            return False
+        if (
+            hasattr(self.to_wrap, "weight_packed")
+            or hasattr(self.to_wrap, "weight_quantizer")
+            or (
+                hasattr(self.to_wrap, "_nvfp4_weight_scale")
+                and hasattr(self.to_wrap, "_nvfp4_weight_double_scale")
+            )
+        ):
+            return False
+        if (
+            self.adapter.coft
+            or self.adapter.block_share
+            or getattr(self.adapter.dropout, "p", 0.0) != 0.0
+            or self.adapter.is_expert
+        ):
+            return False
+
+        config = getattr(self.to_wrap, "config", None)
+        tp_size = getattr(
+            self.to_wrap,
+            "tp_size",
+            getattr(config, "tensor_model_parallel_size", 1),
+        )
+        if int(tp_size) != 1:
+            return False
+
+        weight = getattr(self.to_wrap, "weight", None)
+        adapter_parameter = next(self.adapter.parameters())
+        return (
+            isinstance(weight, torch.Tensor)
+            and weight.ndim == 2
+            and not weight.requires_grad
+            and x.dtype == weight.dtype == adapter_parameter.dtype
+            and x.device == weight.device == adapter_parameter.device
+        )
+
+    def _forward_dense_train_materialized(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        weight = self.to_wrap.weight
+        rotation = self.adapter._compute_rotation().unsqueeze(0)
+        if not _can_materialize_oft_train(x, weight, rotation):
+            raise RuntimeError("invalid OFT dense train materialization dispatch")
+
+        _log_oft_dense_train_materialization_once()
+        output = _materialized_oft_linear_bank(
+            x,
+            weight,
+            rotation,
+            (weight.shape[0],),
+        )
+        bias = _get_active_bias_tensor(self.to_wrap)
+        if getattr(self.to_wrap, "skip_bias_add", False) or getattr(
+            self.to_wrap, "te_return_bias", False
+        ):
+            return output, bias
+        if bias is not None:
+            output = output + bias
+        if not hasattr(self.to_wrap, "config"):
+            return output
+        return output, None
+
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
         _trap_oft_applied_bridge(self, "Linear")
+        if self._can_use_dense_train_materialization(x, args, kwargs):
+            return self._forward_dense_train_materialized(x.contiguous())
         if self._adapter_enabled:
             x = self.adapter(x.contiguous())
 

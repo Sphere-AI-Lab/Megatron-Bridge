@@ -47,10 +47,13 @@ from megatron.bridge.orbit.oft.oft_layers import (
     OFTLinear,
     OFTRotationModule,
     OFTVocabParallelEmbedding,
+    _can_materialize_oft_train,
     _clear_disabled_bias_parameters,
     _is_available_type_instance,
     _is_direct_fp8_runtime_weight,
+    _log_oft_dense_train_materialization_once,
     _make_expert_ep_sharded_tensor,
+    _materialized_oft_linear_bank,
     _module_bias_enabled,
     _prepare_raw_column_parallel_input,
     _validate_oft_hyperparameters,
@@ -474,20 +477,30 @@ class OFTLinearSplitFC1UpGate(nn.Module):
 
         if self._fused_fast_path_supported():
             R = _compute_oft_rotation_bank([self.adapter_gate, self.adapter_up])
-            # Match eager OFTRotationModule.forward dtype contract: rotation runs
-            # in oft_r.dtype, then the result is cast back to x.dtype. See
-            # oft_layers.py:649-651 and oft_layers.py:673.
-            required_dtype = x.dtype
-            if R.dtype != x.dtype:
-                x_for_einsum = x.to(R.dtype)
+            if (
+                W is self.to_wrap.weight
+                and not self.adapter_gate.is_expert
+                and _can_materialize_oft_train(x, W, R)
+            ):
+                _log_oft_dense_train_materialization_once()
+                assert W.shape[0] % 2 == 0
+                half = W.shape[0] // 2
+                out = _materialized_oft_linear_bank(x, W, R, (half, half))
             else:
-                x_for_einsum = x
-            x_stack = _apply_precomputed_oft_rotation_to_x(x_for_einsum, R).to(required_dtype)
-            # W is contiguous (2H, K) laid out as [gate; up]; the view is zero-copy
-            # because _split_output_weight returns the consecutive row halves.
-            assert W.shape[0] % 2 == 0
-            W_stack = W.view(2, W.shape[0] // 2, W.shape[1])
-            out = _batched_equal_output_linear_with_bias(x_stack, W_stack, None)
+                # Match eager OFTRotationModule.forward dtype contract: rotation runs
+                # in oft_r.dtype, then the result is cast back to x.dtype. See
+                # oft_layers.py:649-651 and oft_layers.py:673.
+                required_dtype = x.dtype
+                if R.dtype != x.dtype:
+                    x_for_einsum = x.to(R.dtype)
+                else:
+                    x_for_einsum = x
+                x_stack = _apply_precomputed_oft_rotation_to_x(x_for_einsum, R).to(required_dtype)
+                # W is contiguous (2H, K) laid out as [gate; up]; the view is zero-copy
+                # because _split_output_weight returns the consecutive row halves.
+                assert W.shape[0] % 2 == 0
+                W_stack = W.view(2, W.shape[0] // 2, W.shape[1])
+                out = _batched_equal_output_linear_with_bias(x_stack, W_stack, None)
         else:
             W_gate, W_up = self._split_output_weight(W)
             if self._adapter_names == self._logical_adapter_names:
@@ -1710,7 +1723,19 @@ class OFTLinearSplitQKV(nn.Module):
 
         if self._fused_fast_path_supported():
             R = _compute_oft_rotation_bank(adapters)
-            if segmented_oft_linear is not None:
+            if (
+                W is self.to_wrap.weight
+                and not self.adapter_q.is_expert
+                and _can_materialize_oft_train(x, W, R)
+            ):
+                _log_oft_dense_train_materialization_once()
+                # Keep the submission's local packed row order, including partial
+                # Q/K/V spans at TP shard boundaries. Repeated ids accumulate their
+                # gradients back into the same logical adapter bank.
+                segment_rotations = R.index_select(0, self._rotation_ids)
+                output_sizes = tuple(end - start for _, start, end in self._segments)
+                out = _materialized_oft_linear_bank(x, W, segment_rotations, output_sizes)
+            elif segmented_oft_linear is not None:
                 out = segmented_oft_linear(
                     x,
                     W,
